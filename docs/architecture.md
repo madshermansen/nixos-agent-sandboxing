@@ -62,7 +62,8 @@ Two things change from today:
   Mac. A program in the VM that tries any other destination gets no answer.
 - **The broker holds the keys.** It is a proxy that reads each request,
   checks it against `rules.yaml`, and swaps a placeholder for the real token
-  on the way out. The real token stays in the macOS Keychain.
+  on the way out. The real token stays in 1Password. The broker reads it
+  once when it starts, which asks for Touch ID, and keeps it in memory only.
 
 The rules live on the Mac, outside the VM, so the agent cannot change them.
 GitHub is the first service. Others can be added later as new rules.

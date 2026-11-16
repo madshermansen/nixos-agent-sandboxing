@@ -16,7 +16,7 @@ nixos-agent-sandboxing/
   vm/                NixOS config: headless, tools, proxy settings, restricted network, T3 server
   darwin/            nix-darwin module: the Linux builder, later the VM and broker as background services
   broker/
-    rules.yaml       destinations, placeholder-to-key mapping, allow/deny, refusal messages
+    rules.yaml       destinations, where each key comes from, allow/deny, refusal messages
     proxy.py         the mitmproxy script that applies rules.yaml
   tests/             checks run inside the VM, mostly "this must fail"
   docs/              setup, architecture, what it protects against, how to add a service
@@ -38,7 +38,7 @@ Each phase ends with a check that proves it works.
 | 1 | Linux builder through the repo's nix-darwin module. A minimal headless NixOS VM with open network, reachable by SSH from the Mac. T3 server in the VM, linked to the T3 app. | A T3 thread runs `uname` and prints Linux |
 | 2 | The real VM: tool list, Claude Code, persistent disk, no shared folders, a test repo cloned inside. Uses a temporary GitHub token. | The agent commits a change in the clone and pushes a branch |
 | 3 | Lock the network. The proxy on the Mac passes listed destinations through and adds no keys yet. | `curl https://example.com` fails in the VM. Claude and `git fetch` still work. |
-| 4 | GitHub through the proxy: token in Keychain, a placeholder in the VM, a key-adding rule. `git` in the VM uses HTTPS so the proxy can see it. Remove the temporary token. | The agent pushes a branch and opens a PR. A search of the VM finds no real token. |
+| 4 | GitHub through the proxy: token in 1Password, a placeholder in the VM, a key-adding rule. `git` in the VM uses HTTPS so the proxy can see it. Remove the temporary token. | The agent pushes a branch and opens a PR. A search of the VM finds no real token. |
 | 5 | GitHub limits: a list of allowed repos, and refusals for settings, secrets and repo deletion. | Requests to an unlisted repo are refused. So are changing repo settings and writing Actions secrets. |
 | 6 | Docs, start and stop commands for the background services, a log view, and Claude's built-in sandbox for local Mac threads | It is used for a normal working day |
 
@@ -51,6 +51,10 @@ After phase 4 there is a usable sandboxed agent. Phase 5 narrows what it can do,
 - **The proxy and large `git` pushes.** mitmproxy opening GitHub traffic may be slow or fragile. If so, the fallback is to keep a narrow GitHub token in the VM.
 - **Limiting pushes by branch.** A push reaches the proxy as one upload that is hard to read reliably. "No push to `main`" is better enforced by branch protection on GitHub than by the proxy.
 
+## Decisions
+
+- **Where the GitHub token is kept: 1Password.** The broker reads it once when it starts, which asks for Touch ID, and keeps it in memory only. Other programs on the Mac cannot read it silently, which they could from the Keychain. The cost is one prompt per broker start. `rules.yaml` names a command that prints the token, so someone else can use a different store without changing the broker.
+
 ## Open decisions
 
-- **Claude's own login.** Claude Code needs a credential too. Either it lives in the VM as the one credential held there, or the broker attaches it like the GitHub token. Decide before phase 3.
+- **Claude's own login.** Claude Code needs a credential too. Either it lives in the VM as the one credential held there, or the broker attaches it like the GitHub token. For now it is signed in inside the VM.

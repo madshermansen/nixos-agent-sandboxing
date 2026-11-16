@@ -133,5 +133,9 @@ Update this section when a phase is finished or a decision is made.
   Claude sign-in and the T3 pairing survive a restart, and `nix run .#stop`
   shuts the VM down cleanly in a few seconds. Still to do: a test repo and
   GitHub access.
+- **Decided:** the GitHub token is kept in 1Password. The broker reads it
+  once at start through a command named in `rules.yaml` and keeps it in
+  memory. It is never written to the repo, the VM, a Nix file or the Nix
+  store, which every program on the Mac can read.
 - **Open decision:** where Claude's own login lives. For now it is signed in
   inside the VM.

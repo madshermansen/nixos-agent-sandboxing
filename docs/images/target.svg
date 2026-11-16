@@ -59,8 +59,8 @@
   <text x="476" y="286" fill="#475569" font-size="13">placeholder out, real token in</text>
 
   <rect x="460" y="322" width="260" height="68" rx="8" fill="#ffffff" stroke="#64748b"/>
-  <text x="476" y="346" font-weight="600" fill="#0f172a">macOS Keychain</text>
-  <text x="476" y="366" fill="#475569" font-size="13">the real GitHub token</text>
+  <text x="476" y="346" font-weight="600" fill="#0f172a">1Password</text>
+  <text x="476" y="366" fill="#475569" font-size="13">real GitHub token, read at start</text>
   <line x1="590" y1="320" x2="590" y2="304" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
 
   <!-- VM to broker -->
