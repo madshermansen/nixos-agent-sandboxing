@@ -75,7 +75,7 @@ GitHub is the first service. Others can be added later as new rules.
 | [`flake.nix`](../flake.nix) | The entry point: the VM, the two commands, and the Mac module |
 | [`vm/default.nix`](../vm/default.nix) | The VM's system: services, tools, ports |
 | [`vm/t3.nix`](../vm/t3.nix) | The T3 server, pinned to a version |
-| [`vm/host-scripts.nix`](../vm/host-scripts.nix) | The commands behind `nix run .#vm`, `.#stop`, `.#ssh` and `.#pair` |
+| [`darwin/commands.nix`](../darwin/commands.nix) | The commands behind `nix run .#vm`, `.#stop`, `.#ssh` and `.#pair` |
 | [`darwin/default.nix`](../darwin/default.nix) | What the Mac itself needs, as a nix-darwin module |
 | `broker/` | Planned: the proxy and its rules |
 | `tests/` | Planned: checks run inside the VM |

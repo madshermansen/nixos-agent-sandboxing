@@ -12,7 +12,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
   it goes in `darwin/` as a nix-darwin module, and a personal `nix-config`
   only imports that module.
 - **No secrets and no personal keys in the repo.** Keys are generated on the
-  machine or read from the Keychain. The VM must never hold a real cloud or
+  machine or read from a password manager. The VM must never hold a real cloud or
   GitHub token once the broker exists.
 - **Keep it generic.** No names of private projects, clusters or companies.
 - **Write for a reader who is new to the project.** Docs and comments use
@@ -30,7 +30,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `flake.nix` | Entry point: the VM, `nix run` commands, the Mac module |
 | `vm/default.nix` | The VM's NixOS configuration |
 | `vm/t3.nix` | The T3 server package, pinned by version and checksum |
-| `vm/host-scripts.nix` | The Mac-side commands behind `nix run .#vm`, `.#stop`, `.#ssh` and `.#pair` |
+| `darwin/commands.nix` | The Mac-side commands behind `nix run .#vm`, `.#stop`, `.#ssh` and `.#pair` |
 | `darwin/default.nix` | nix-darwin module for the Mac |
 | `docs/` | Setup, architecture, diagrams |
 

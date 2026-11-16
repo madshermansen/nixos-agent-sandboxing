@@ -9,13 +9,15 @@
       hostSystem = "aarch64-darwin";
       hostPkgs = nixpkgs.legacyPackages.${hostSystem};
 
-      # Ports on the Mac that lead into the VM. Both listen on localhost only.
+      # Ports on the Mac, all listening on localhost only. `ssh` and `t3` lead
+      # into the VM. `broker` is the proxy that is the VM's only way out.
       ports = {
         ssh = 2222;
         t3 = 3774;
+        broker = 8474;
       };
 
-      hostScripts = hostPkgs.callPackage ./vm/host-scripts.nix {
+      hostScripts = hostPkgs.callPackage ./darwin/commands.nix {
         inherit ports;
         vm = self.nixosConfigurations.agent-vm.config.system.build.vm;
       };
