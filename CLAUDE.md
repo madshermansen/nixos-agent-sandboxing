@@ -30,7 +30,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `flake.nix` | Entry point: the VM, `nix run` commands, the Mac module |
 | `vm/default.nix` | The VM's NixOS configuration |
 | `vm/t3.nix` | The T3 server package, pinned by version and checksum |
-| `vm/host-scripts.nix` | The Mac-side commands behind `nix run .#vm` and `.#ssh` |
+| `vm/host-scripts.nix` | The Mac-side commands behind `nix run .#vm`, `.#ssh` and `.#pair` |
 | `darwin/default.nix` | nix-darwin module for the Mac |
 | `docs/` | Setup, architecture, diagrams |
 
@@ -40,6 +40,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 nix run .#vm                 # build if needed, then start the VM in this terminal
 nix run .#ssh                # shell in the VM as `agent`
 nix run .#ssh -- <command>   # one command in the VM
+nix run .#pair               # add the VM to the T3 app on the Mac
 nix build .#vm --no-link     # build only
 nix fmt                      # format the Nix files; run before committing
 ```
@@ -65,7 +66,13 @@ nix fmt                      # format the Nix files; run before committing
   `sharedDirectories` are deliberate. Do not add a shared folder to move a
   file; use SSH.
 - **The `agent` user has no `sudo`.** Add tools to `environment.systemPackages`
-  or use `nix shell`.
+  or use `nix shell`. It also cannot power the VM off; stop it from the Mac.
+- **A full VM build takes about 20 minutes.** The default Linux builder does
+  one job at a time. Give background builds a long time limit.
+- **Two ways to connect T3.** `nix run .#pair` adds the VM to the T3 app, so
+  the user can start threads in it. `t3 environment link` lets agents on the
+  Mac hand work to the VM, and needs Linked environments turned on under
+  Settings → Labs in the app.
 
 ## Git
 
@@ -78,7 +85,9 @@ nix fmt                      # format the Nix files; run before committing
 Update this section when a phase is finished or a decision is made.
 
 - **Phase 0, the repo:** done.
-- **Phase 1, the VM and the T3 link:** the VM is written. Booting it, the
-  Claude sign-in and the T3 link are not yet verified.
+- **Phase 1, the VM and the T3 link:** the VM boots, SSH works, the T3
+  server runs, and the T3 app on the Mac is paired with it. Checked in the
+  VM: no shared folders, no `sudo`, open internet. Still to verify: a thread
+  that runs `uname` in the VM, which needs the Claude sign-in.
 - **Open decision:** where Claude's own login lives. For now it is signed in
   inside the VM.

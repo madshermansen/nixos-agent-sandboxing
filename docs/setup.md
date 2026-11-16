@@ -55,8 +55,9 @@ From a clone of this repo:
 nix run .#vm
 ```
 
-The first run builds the VM, which takes several minutes. Later runs start in
-seconds unless the VM's configuration changed.
+The first run builds the VM, which takes about 20 minutes because the Linux
+builder does one job at a time. Later runs boot in under a minute unless the
+VM's configuration changed.
 
 The terminal becomes the VM's console, logged in as `agent`. Press `Ctrl-A`
 then `X` to stop the VM.
@@ -74,15 +75,23 @@ back. The sign-in is stored on the VM's disk, so this is done once.
 
 ## 4. Link the VM to T3 Code
 
-Ask the VM's T3 server for a pairing code, then give it to the T3 on the Mac:
+```sh
+nix run .#pair
+```
+
+This asks the VM's T3 server for a one-time pairing code and opens it in the
+T3 app. The VM now appears in the app as a second environment, named
+`agent-vm`. A thread started there runs inside the VM.
+
+The pairing is stored on the VM's disk and lasts 30 days.
+
+To also let agents on the Mac hand work to the VM, turn on Linked
+environments under Settings → Labs in the T3 app, then run:
 
 ```sh
 nix run .#ssh -- t3 auth pairing create
 t3 environment link http://127.0.0.1:3774 --pairing-code <code>
 ```
-
-The VM now appears in the T3 app as a second environment. A thread started
-there runs inside the VM.
 
 ## Day to day
 
@@ -90,6 +99,7 @@ there runs inside the VM.
 | --- | --- |
 | Start the VM | `nix run .#vm` |
 | Open a shell in it | `nix run .#ssh` |
+| Add it to the T3 app | `nix run .#pair` |
 | Run one command in it | `nix run .#ssh -- <command>` |
 | Read the T3 server's log | `nix run .#ssh -- journalctl -u t3 -e` |
 | Stop the VM | `Ctrl-A` then `X` in its terminal |
