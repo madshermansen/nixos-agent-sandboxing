@@ -1,7 +1,9 @@
 # nixos-agent-sandboxing
 
-A headless NixOS VM for running coding agents from T3 Code on a Mac, and
-(planned) a broker on the Mac that holds the keys so the VM never does.
+A headless NixOS VM for running coding agents from T3 Code on a Mac. Its
+network is locked: the only way out is a broker on the Mac, which passes on
+listed destinations. Planned: the broker also holds the keys, so the VM never
+does.
 
 Read [PLAN.md](PLAN.md) for the phases and [docs/architecture.md](docs/architecture.md)
 for how the parts fit. The current phase is recorded at the bottom of this file.
@@ -28,17 +30,24 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | Path | Contents |
 | --- | --- |
 | `flake.nix` | Entry point: the VM, `nix run` commands, the Mac module |
-| `vm/default.nix` | The VM's NixOS configuration |
+| `vm/default.nix` | The VM's NixOS configuration, including the network lock |
 | `vm/t3.nix` | The T3 server package, pinned by version and checksum |
-| `darwin/commands.nix` | The Mac-side commands behind `nix run .#vm`, `.#stop`, `.#ssh` and `.#pair` |
+| `vm/agent-instructions.md` | What the agent in the VM is told about the sandbox; installed as `/etc/claude-code/CLAUDE.md` |
+| `broker/rules.yaml` | The destinations the VM may reach |
+| `broker/proxy.py` | The broker: a mitmproxy script that applies the rules |
+| `darwin/commands.nix` | The Mac-side commands behind every `nix run .#…` |
 | `darwin/default.nix` | nix-darwin module for the Mac |
+| `tests/network-lock.sh` | Checks run inside the VM by `nix run .#check` |
 | `docs/` | Setup, architecture, diagrams |
 
 ## Commands
 
 ```sh
-nix run .#vm                 # build if needed, then start the VM in this terminal
-nix run .#stop               # shut the VM down cleanly
+nix run .#vm                 # build if needed, start the broker, then the VM in this terminal
+nix run .#stop               # shut the VM down cleanly and stop the broker
+nix run .#check              # run tests/network-lock.sh inside the VM
+nix run .#logs               # follow the broker's log
+nix run .#broker             # run the broker in this terminal, replacing the background one
 nix run .#ssh                # shell in the VM as `agent`
 nix run .#ssh -- <command>   # one command in the VM
 nix run .#pair               # add the VM to the T3 app on the Mac
@@ -58,6 +67,36 @@ nix run .#ssh -- 't3 thread start --wait --provider claudeAgent \
 ```
 
 The reply should name Linux and the host `agent-vm`.
+
+## The network lock and the broker
+
+- **The VM reaches only the broker.** QEMU's restricted mode drops all other
+  traffic, including name lookups and the Mac itself. `10.0.2.100:3128` in
+  the VM is forwarded to the broker on the Mac's `localhost:8474`.
+- **Rules are fixed when the command is built** and read once at broker
+  start. After editing `broker/rules.yaml`, restart the VM, or run
+  `nix run .#broker` to replace the running broker.
+- **The broker fails closed.** A missing or invalid rules file stops it from
+  starting, and then the VM is not started either. Keep it that way.
+- **A refusal is a 403 on the tunnel.** Programs show `CONNECT tunnel failed,
+  response 403`; `curl -v` shows the broker's text. In curl's `-w` format the
+  status is `%{http_connect}`, not `%{http_code}`.
+- **`nix shell` does not work in the VM,** because Nix's servers are not
+  listed. Tools go in `environment.systemPackages`.
+- **Keep `mcp-proxy.anthropic.com` off the list.** It leads to the
+  connectors of the signed-in Claude account, which would give the agent the
+  user's other services.
+- **Every listed host is a place data can be sent.** Add one only when a
+  task needs it, with a `note` saying why.
+- **Log lines** are `time event host port how [reason]`, with the event one
+  of `started`, `allowed`, `refused`, `failed`. Never log paths, headers or
+  bodies.
+- **mitmdump ignores an unknown `--set` option,** so the rules path is passed
+  as the `AGENT_BROKER_RULES` variable.
+- **State files** in `~/.local/state/agent-vm`: `disk.qcow2`, `ssh_key`,
+  `qemu.pid`, `qmp.sock`, `broker.pid`, `broker.log`, `broker/`, `console.log`.
+- **The broker runs with the user's rights on the Mac** and is the one Mac
+  program the VM can talk to. Treat everything it receives as hostile.
 
 ## Things that are easy to get wrong
 
@@ -79,9 +118,9 @@ The reply should name Linux and the host `agent-vm`.
 - **Nothing is shared with the Mac.** `useNixStoreImage` and the empty
   `sharedDirectories` are deliberate. Do not add a shared folder to move a
   file; use SSH.
-- **The `agent` user has no `sudo`.** Add tools to `environment.systemPackages`
-  or use `nix shell`. It also cannot power the VM off; stop it from the Mac
-  with `nix run .#stop`.
+- **The `agent` user has no `sudo`.** Add tools to
+  `environment.systemPackages`. It also cannot power the VM off; stop it from
+  the Mac with `nix run .#stop`.
 - **`nix run .#vm` holds its terminal.** To start the VM from a tool call,
   detach it and send the console to a file:
   `nohup nix run .#vm > ~/.local/state/agent-vm/console.log 2>&1 < /dev/null &`.
@@ -95,6 +134,15 @@ The reply should name Linux and the host `agent-vm`.
   the user can start threads in it. `t3 environment link` lets agents on the
   Mac hand work to the VM, and needs Linked environments turned on under
   Settings → Labs in the app.
+
+## How work is done
+
+- **One pull request per phase or change,** on its own branch. Do not commit
+  to `main` directly.
+- **A separate agent reviews each pull request** before it is merged. Give it
+  the diff and the goal, not your own conclusions.
+- **Merge only when** the review's findings are fixed and the phase's check
+  has been run in the VM. Put the check's result in the pull request.
 
 ## Git
 
@@ -131,8 +179,13 @@ Update this section when a phase is finished or a decision is made.
 - **Phase 2, the real VM:** partly done ahead of time: Claude Code, the tool
   list, the VM's own disk and no shared folders. Verified: the disk, the
   Claude sign-in and the T3 pairing survive a restart, and `nix run .#stop`
-  shuts the VM down cleanly in a few seconds. Still to do: a test repo and
-  GitHub access.
+  shuts the VM down cleanly in a few seconds. The temporary GitHub token in
+  the plan was skipped, so no token has been in the VM.
+- **Phase 3, the network lock:** done. `nix run .#check` passes all checks,
+  and a T3 thread in the locked VM reached Claude and was refused
+  `example.com`.
+- **Next, phase 4:** GitHub through the broker, with the token read from
+  1Password. The repo the agent may push to is this one.
 - **Decided:** the GitHub token is kept in 1Password. The broker reads it
   once at start through a command named in `rules.yaml` and keeps it in
   memory. It is never written to the repo, the VM, a Nix file or the Nix

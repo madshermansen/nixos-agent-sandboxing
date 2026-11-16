@@ -3,21 +3,26 @@
 A headless NixOS VM for running coding agents from T3 Code on a Mac.
 
 An agent can be tricked by what it reads, or make a mistake. Here it works in
-a machine of its own that shares nothing with the Mac. The plan is for a
-broker on the Mac to hold the keys and attach them to outgoing requests, so
-the VM never holds one. Only the VM exists so far.
+a machine of its own that shares nothing with the Mac. Its network is locked:
+the only way out is a broker on the Mac, which passes on a short list of
+destinations and refuses the rest.
 
-![The Mac, the agent VM inside it, and the internet](docs/images/vm-today.svg)
+The plan is for the broker to also hold the keys and attach them to outgoing
+requests, so the VM never holds one. That part is not built yet.
+
+![The Mac, the agent VM inside it, the broker, and the internet](docs/images/vm-today.svg)
 
 ## Quick start
 
 With the Linux builder on (see [setup](docs/setup.md)):
 
 ```sh
-nix run .#vm     # start the VM; it keeps this terminal as its console
-nix run .#stop   # shut it down cleanly, from another terminal
+nix run .#vm     # start the VM and its broker; the terminal becomes the console
+nix run .#stop   # shut both down cleanly, from another terminal
 nix run .#ssh    # open a shell in the VM as the `agent` user
 nix run .#pair   # add the VM to the T3 app as an environment
+nix run .#logs   # watch which destinations the VM asks for
+nix run .#check  # test the network lock from inside the VM
 ```
 
 Claude also needs a one-time sign-in inside the VM. The steps are in

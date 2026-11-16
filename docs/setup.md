@@ -59,9 +59,10 @@ The first run builds the VM, which takes about 20 minutes because the Linux
 builder does one job at a time. Later runs boot in under a minute unless the
 VM's configuration changed.
 
-The terminal becomes the VM's console, logged in as `agent`. To stop the VM,
-run `nix run .#stop` in another terminal. It shuts the system down cleanly,
-which takes a few seconds.
+This also starts the broker, the proxy that is the VM's only way out, in the
+background. The terminal becomes the VM's console, logged in as `agent`. To
+stop both, run `nix run .#stop` in another terminal. It shuts the system down
+cleanly, which takes a few seconds.
 
 ## 3. Sign in to Claude
 
@@ -103,11 +104,35 @@ t3 environment link http://127.0.0.1:3774 --pairing-code <code>
 | Add it to the T3 app | `nix run .#pair` |
 | Run one command in it | `nix run .#ssh -- <command>` |
 | Read the T3 server's log | `nix run .#ssh -- journalctl -u t3 -e` |
-| Stop the VM | `nix run .#stop` |
+| Watch what the VM asks the broker for | `nix run .#logs` |
+| Test the network lock | `nix run .#check` |
+| Stop the VM and the broker | `nix run .#stop` |
 | Start over with a clean VM | Stop it, then delete `~/.local/state/agent-vm` |
 
 Starting over removes everything in `/home/agent`, including the Claude
 sign-in, and the link to T3 has to be made again.
+
+## Allowing a destination
+
+The VM can reach only the hosts listed in
+[`broker/rules.yaml`](../broker/rules.yaml). When the agent needs another one,
+it gets `403 Refused by the sandbox broker`, and `nix run .#logs` shows a
+`refused` line with the host name.
+
+To allow it, add an entry with the exact host name and a note on why:
+
+```yaml
+  - host: objects.githubusercontent.com
+    note: Downloads of GitHub release files.
+```
+
+Then restart the broker. `nix run .#vm` does that when it starts the VM. To
+apply the change while the VM keeps running, run `nix run .#broker` in a
+terminal; it takes over from the background broker and shows the log there.
+When you end it, the VM has no way out until the next start.
+
+Every host on the list is a place the agent can send data to, so add only
+what a task needs.
 
 ## Updating T3
 
@@ -117,6 +142,14 @@ When the app updates, change the version and checksum in
 `linux-arm64` in the release's `SHA256SUMS` file on GitHub.
 
 ## Problems
+
+**A program in the VM reports "CONNECT tunnel failed, response 403".**
+The broker refused the destination. `nix run .#logs` shows which host it was;
+see "Allowing a destination" above.
+
+**`nix shell` or `nix run` fails inside the VM.**
+Nix's download servers are not on the list of destinations. Add tools to
+`environment.systemPackages` in `vm/default.nix` and restart the VM.
 
 **The build stops with "a 'aarch64-linux' with features {} is required".**
 The Linux builder is not on. Check that step 1 was applied:
