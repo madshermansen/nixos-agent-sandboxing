@@ -45,6 +45,19 @@ nix build .#vm --no-link     # build only
 nix fmt                      # format the Nix files; run before committing
 ```
 
+## Checking that T3 and Claude work in the VM
+
+This starts a thread on the VM's T3 server and waits for the reply. A project
+has no default model, so the provider and model must be given:
+
+```sh
+nix run .#ssh -- 't3 project add ~/sandbox-test'    # once
+nix run .#ssh -- 't3 thread start --wait --provider claudeAgent \
+  --model claude-haiku-5-5 ~/sandbox-test "Run uname -a and reply with its output."'
+```
+
+The reply should name Linux and the host `agent-vm`.
+
 ## Things that are easy to get wrong
 
 - **Flakes ignore untracked files.** `git add` a new file before building, or
@@ -85,9 +98,13 @@ nix fmt                      # format the Nix files; run before committing
 Update this section when a phase is finished or a decision is made.
 
 - **Phase 0, the repo:** done.
-- **Phase 1, the VM and the T3 link:** the VM boots, SSH works, the T3
-  server runs, and the T3 app on the Mac is paired with it. Checked in the
-  VM: no shared folders, no `sudo`, open internet. Still to verify: a thread
-  that runs `uname` in the VM, which needs the Claude sign-in.
+- **Phase 1, the VM and the T3 link:** done. The VM boots, SSH works, the
+  T3 app on the Mac is paired with it, and a T3 thread in the VM ran `uname`
+  and printed Linux. Checked in the VM: no shared folders, no `sudo`, open
+  internet.
+- **Phase 2, the real VM:** partly done ahead of time: Claude Code, the tool
+  list, the VM's own disk and no shared folders. Still to do: a test repo
+  cloned with a temporary GitHub token, and a check that the disk, the
+  Claude sign-in and the T3 pairing survive a restart.
 - **Open decision:** where Claude's own login lives. For now it is signed in
   inside the VM.
