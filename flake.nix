@@ -30,10 +30,16 @@
       # What the Mac itself needs, for import into a nix-darwin configuration.
       darwinModules.default = ./darwin;
 
-      # `nix run .#vm` starts the VM, `nix run .#ssh` opens a shell in it,
-      # and `nix run .#pair` adds it to the T3 app.
+      # `nix run .#vm` starts the VM and `nix run .#stop` shuts it down,
+      # `nix run .#ssh` opens a shell in it, and `nix run .#pair` adds it to
+      # the T3 app.
       packages.${hostSystem} = {
-        inherit (hostScripts) vm ssh pair;
+        inherit (hostScripts)
+          vm
+          stop
+          ssh
+          pair
+          ;
         default = hostScripts.vm;
       };
 

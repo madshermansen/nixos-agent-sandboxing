@@ -59,8 +59,9 @@ The first run builds the VM, which takes about 20 minutes because the Linux
 builder does one job at a time. Later runs boot in under a minute unless the
 VM's configuration changed.
 
-The terminal becomes the VM's console, logged in as `agent`. Press `Ctrl-A`
-then `X` to stop the VM.
+The terminal becomes the VM's console, logged in as `agent`. To stop the VM,
+run `nix run .#stop` in another terminal. It shuts the system down cleanly,
+which takes a few seconds.
 
 ## 3. Sign in to Claude
 
@@ -102,7 +103,7 @@ t3 environment link http://127.0.0.1:3774 --pairing-code <code>
 | Add it to the T3 app | `nix run .#pair` |
 | Run one command in it | `nix run .#ssh -- <command>` |
 | Read the T3 server's log | `nix run .#ssh -- journalctl -u t3 -e` |
-| Stop the VM | `Ctrl-A` then `X` in its terminal |
+| Stop the VM | `nix run .#stop` |
 | Start over with a clean VM | Stop it, then delete `~/.local/state/agent-vm` |
 
 Starting over removes everything in `/home/agent`, including the Claude

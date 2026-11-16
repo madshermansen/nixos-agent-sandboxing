@@ -18,7 +18,7 @@ describes what runs today first, and the target design after it.
 | T3 server | VM | Receives threads from the app and starts Claude Code for each one. A system service, started at boot. |
 | Claude Code | VM | The agent. It runs as the `agent` user, which has no `sudo`. |
 | SSH server | VM | A shell for you, for signing in to Claude and for debugging. |
-| State folder | Mac | `~/.local/state/agent-vm` holds the VM's disk and the SSH key that reaches it. |
+| State folder | Mac | `~/.local/state/agent-vm` holds the VM's disk and the SSH key that reaches it. While the VM runs it also holds QEMU's control socket, which the stop command uses. |
 | Linux builder | Mac | A small NixOS VM that builds Linux packages. It is needed to build the agent VM, and plays no part while the agent VM runs. |
 
 ### What crosses the line between the Mac and the VM
@@ -74,7 +74,7 @@ GitHub is the first service. Others can be added later as new rules.
 | [`flake.nix`](../flake.nix) | The entry point: the VM, the two commands, and the Mac module |
 | [`vm/default.nix`](../vm/default.nix) | The VM's system: services, tools, ports |
 | [`vm/t3.nix`](../vm/t3.nix) | The T3 server, pinned to a version |
-| [`vm/host-scripts.nix`](../vm/host-scripts.nix) | `nix run .#vm` and `nix run .#ssh` |
+| [`vm/host-scripts.nix`](../vm/host-scripts.nix) | The commands behind `nix run .#vm`, `.#stop`, `.#ssh` and `.#pair` |
 | [`darwin/default.nix`](../darwin/default.nix) | What the Mac itself needs, as a nix-darwin module |
 | `broker/` | Planned: the proxy and its rules |
 | `tests/` | Planned: checks run inside the VM |

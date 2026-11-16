@@ -14,7 +14,8 @@ the VM never holds one. Only the VM exists so far.
 With the Linux builder on (see [setup](docs/setup.md)):
 
 ```sh
-nix run .#vm     # start the VM; Ctrl-A then X stops it
+nix run .#vm     # start the VM; it keeps this terminal as its console
+nix run .#stop   # shut it down cleanly, from another terminal
 nix run .#ssh    # open a shell in the VM as the `agent` user
 nix run .#pair   # add the VM to the T3 app as an environment
 ```

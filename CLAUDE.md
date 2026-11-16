@@ -30,7 +30,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `flake.nix` | Entry point: the VM, `nix run` commands, the Mac module |
 | `vm/default.nix` | The VM's NixOS configuration |
 | `vm/t3.nix` | The T3 server package, pinned by version and checksum |
-| `vm/host-scripts.nix` | The Mac-side commands behind `nix run .#vm`, `.#ssh` and `.#pair` |
+| `vm/host-scripts.nix` | The Mac-side commands behind `nix run .#vm`, `.#stop`, `.#ssh` and `.#pair` |
 | `darwin/default.nix` | nix-darwin module for the Mac |
 | `docs/` | Setup, architecture, diagrams |
 
@@ -38,6 +38,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 
 ```sh
 nix run .#vm                 # build if needed, then start the VM in this terminal
+nix run .#stop               # shut the VM down cleanly
 nix run .#ssh                # shell in the VM as `agent`
 nix run .#ssh -- <command>   # one command in the VM
 nix run .#pair               # add the VM to the T3 app on the Mac
@@ -79,7 +80,15 @@ The reply should name Linux and the host `agent-vm`.
   `sharedDirectories` are deliberate. Do not add a shared folder to move a
   file; use SSH.
 - **The `agent` user has no `sudo`.** Add tools to `environment.systemPackages`
-  or use `nix shell`. It also cannot power the VM off; stop it from the Mac.
+  or use `nix shell`. It also cannot power the VM off; stop it from the Mac
+  with `nix run .#stop`.
+- **`nix run .#vm` holds its terminal.** To start the VM from a tool call,
+  detach it and send the console to a file:
+  `nohup nix run .#vm > ~/.local/state/agent-vm/console.log 2>&1 < /dev/null &`.
+  Then wait for SSH with `until nix run .#ssh -- true; do sleep 2; done`,
+  which takes about a minute.
+- **Two QEMU processes may be running.** The Linux builder is one too. Never
+  stop the VM with a broad `pkill qemu`; use `nix run .#stop`.
 - **A full VM build takes about 20 minutes.** The default Linux builder does
   one job at a time. Give background builds a long time limit.
 - **Two ways to connect T3.** `nix run .#pair` adds the VM to the T3 app, so
@@ -120,8 +129,9 @@ Update this section when a phase is finished or a decision is made.
   and printed Linux. Checked in the VM: no shared folders, no `sudo`, open
   internet.
 - **Phase 2, the real VM:** partly done ahead of time: Claude Code, the tool
-  list, the VM's own disk and no shared folders. Still to do: a test repo
-  cloned with a temporary GitHub token, and a check that the disk, the
-  Claude sign-in and the T3 pairing survive a restart.
+  list, the VM's own disk and no shared folders. Verified: the disk, the
+  Claude sign-in and the T3 pairing survive a restart, and `nix run .#stop`
+  shuts the VM down cleanly in a few seconds. Still to do: a test repo and
+  GitHub access.
 - **Open decision:** where Claude's own login lives. For now it is signed in
   inside the VM.
