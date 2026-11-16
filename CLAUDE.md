@@ -89,9 +89,26 @@ The reply should name Linux and the host `agent-vm`.
 
 ## Git
 
+- Commit messages follow [Conventional Commits](https://www.conventionalcommits.org)
+  with an emoji after the colon: `type(scope): emoji subject`. The scope is
+  optional. The subject is short and imperative, and a body explains the
+  reason when it is not obvious.
+
+  | Type | Emoji | Use for |
+  | --- | --- | --- |
+  | `feat` | ✨ | A new capability |
+  | `fix` | 🐛 | A bug fix |
+  | `docs` | 📝 | Documentation only |
+  | `refactor` | ♻️ | A change that keeps behaviour the same |
+  | `test` | ✅ | Tests and checks |
+  | `chore` | 🔧 | Config, tooling, dependency updates |
+  | `ci` | 👷 | CI |
+  | `perf` | ⚡ | Faster or lighter |
+
+  A more specific emoji is fine when it fits better, such as 🔒 for a
+  security change. Examples: `feat(vm): ✨ add a command that pairs the VM with T3`,
+  `docs: 📝 describe the network lock`.
 - Commits are signed through 1Password, which may ask the user to approve.
-- Use short imperative commit subjects, with a body when the reason is not
-  obvious.
 
 ## Status
 
