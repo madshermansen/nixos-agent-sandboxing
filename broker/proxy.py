@@ -197,7 +197,7 @@ class Broker:
             "\n"
             "This machine is a sandbox. It reaches the internet only through a\n"
             "broker on the host, and the broker passes on only the destinations\n"
-            "listed in broker/rules.yaml of the nixos-agent-sandboxing repo on\n"
+            "listed in broker/rules.yaml of the nixt3 repo on\n"
             "the host. Trying again, or trying another tool, will not help.\n"
             "\n"
             "If the task needs this destination, tell the user. They can add\n"

@@ -11,7 +11,7 @@ GitHub is the only service for now. Other services can be added later as new rul
 Everything lives in one repo, so the VM, the broker and the rules are versioned together and others can reuse them. That includes what the Mac itself needs, which is a nix-darwin module in `darwin/`.
 
 ```
-nixos-agent-sandboxing/
+nixt3/
   flake.nix          the VM, the Mac module, and the commands to start and reach the VM
   vm/                NixOS config: headless, tools, proxy settings, restricted network, T3 server
   darwin/            nix-darwin module: the Linux builder, later the VM and broker as background services

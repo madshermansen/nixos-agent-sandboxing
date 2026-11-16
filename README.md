@@ -1,4 +1,6 @@
-# nixos-agent-sandboxing
+# nixt3
+
+Pronounced "nixty-three": Nix plus T3.
 
 A headless NixOS VM for running coding agents from T3 Code on a Mac.
 

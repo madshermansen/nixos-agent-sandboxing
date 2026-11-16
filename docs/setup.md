@@ -17,12 +17,12 @@ your nix-darwin flake:
 
 ```nix
 {
-  inputs.agent-sandbox.url = "github:madshermansen/nixos-agent-sandboxing";
+  inputs.nixt3.url = "github:madshermansen/nixt3";
 
-  outputs = { nix-darwin, agent-sandbox, ... }: {
+  outputs = { nix-darwin, nixt3, ... }: {
     darwinConfigurations.my-mac = nix-darwin.lib.darwinSystem {
       modules = [
-        agent-sandbox.darwinModules.default
+        nixt3.darwinModules.default
         # ... your own modules
       ];
     };
@@ -30,11 +30,11 @@ your nix-darwin flake:
 }
 ```
 
-While the repo is private, Nix cannot fetch it from GitHub without a token.
-Point the input at a local clone instead:
+To use a local clone instead, for example while changing the module, point
+the input at it:
 
 ```nix
-inputs.agent-sandbox.url = "git+file:///Users/you/path/to/nixos-agent-sandboxing";
+inputs.nixt3.url = "git+file:///Users/you/path/to/nixt3";
 ```
 
 Apply it. This needs admin rights:
@@ -43,9 +43,8 @@ Apply it. This needs admin rights:
 sudo darwin-rebuild switch --flake .
 ```
 
-A local clone is read at the commit recorded in your `flake.lock`. After
-pulling changes to the module, run `nix flake update agent-sandbox` and apply
-again.
+Either way the module is read at the commit recorded in your `flake.lock`.
+To pick up changes to it, run `nix flake update nixt3` and apply again.
 
 ## 2. Start the VM
 

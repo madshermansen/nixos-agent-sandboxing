@@ -1,4 +1,6 @@
-# nixos-agent-sandboxing
+# nixt3
+
+Pronounced "nixty-three".
 
 A headless NixOS VM for running coding agents from T3 Code on a Mac. Its
 network is locked: the only way out is a broker on the Mac, which passes on
@@ -143,6 +145,19 @@ The reply should name Linux and the host `agent-vm`.
   the diff and the goal, not your own conclusions.
 - **Merge only when** the review's findings are fixed and the phase's check
   has been run in the VM. Put the check's result in the pull request.
+
+## When several agents work at once
+
+- **There is one VM and one broker,** in `~/.local/state/agent-vm`, on fixed
+  ports. Only one agent may stop, start or reconfigure them at a time.
+- **Take the VM before changing it:** `mkdir ~/.local/state/agent-vm/in-use`
+  succeeds for one agent only. If it fails, someone else has the VM; wait and
+  try again. Put a file in the folder saying who you are, and remove the
+  folder when you are done. Reading from the VM through `nix run .#ssh` needs
+  no turn, but expect it to restart under you.
+- **Each agent works in its own checkout** on its own branch, and opens its
+  own pull request. Keep to the files your task names, so pull requests do
+  not collide.
 
 ## Git
 

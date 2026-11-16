@@ -1,5 +1,5 @@
 {
-  description = "A NixOS VM for coding agents, and a broker on the Mac that holds their keys";
+  description = "nixt3: a locked-down NixOS VM for coding agents on a Mac, and a broker that is its only way out";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
