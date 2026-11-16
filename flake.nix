@@ -32,15 +32,20 @@
       # What the Mac itself needs, for import into a nix-darwin configuration.
       darwinModules.default = ./darwin;
 
-      # `nix run .#vm` starts the VM and `nix run .#stop` shuts it down,
-      # `nix run .#ssh` opens a shell in it, and `nix run .#pair` adds it to
-      # the T3 app.
+      # `nix run .#vm` starts the VM and its broker, and `nix run .#stop`
+      # shuts both down. `nix run .#ssh` opens a shell in the VM, and
+      # `nix run .#pair` adds it to the T3 app. `nix run .#broker` runs the
+      # broker alone, in the terminal. `nix run .#logs` follows the broker's
+      # log, and `nix run .#check` tests the network lock from inside the VM.
       packages.${hostSystem} = {
         inherit (hostScripts)
           vm
           stop
           ssh
           pair
+          broker
+          logs
+          check
           ;
         default = hostScripts.vm;
       };

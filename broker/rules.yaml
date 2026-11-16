@@ -1,0 +1,49 @@
+# The destinations the agent VM may reach.
+#
+# The VM has no internet access of its own. Every connection it makes goes to
+# the broker, a proxy on the Mac, and the broker passes on only what is listed
+# here. Everything else is refused with a message that names this file.
+#
+# The file lives on the Mac, outside the VM, so the agent cannot change it.
+# The broker reads it once when it starts. After a change, restart the broker:
+# `nix run .#vm` does that when it starts the VM, and `nix run .#broker` in a
+# second terminal does it while the VM keeps running.
+#
+# Each entry has:
+#
+#   host   One exact host name. There are no wildcards, so `github.com` does
+#          not cover `api.github.com`; list each name the VM needs. Upper and
+#          lower case are treated the same.
+#   note   A few words on why the VM needs it. Required, so that nobody has to
+#          guess later whether an entry can be removed.
+#   ports  Optional. The ports allowed on that host. Without it, only 443
+#          (HTTPS) is allowed.
+#
+# Example with a port list:
+#
+#   - host: example.org
+#     note: Why the VM needs this.
+#     ports: [443, 8443]
+#
+# An entry is a small block of named values so that later phases can add to it
+# without changing what is already here: where the key for a destination comes
+# from, and which actions on it are refused. The broker rejects a key it does
+# not know, so a typing mistake stops it at start instead of being ignored.
+#
+# If this file is missing or has a mistake in it, the broker refuses to start.
+# It never falls back to letting everything through.
+
+destinations:
+  # Claude Code.
+  - host: api.anthropic.com
+    note: Claude Code sends its requests to the model here.
+  - host: claude.ai
+    note: Claude Code signs in with a Claude account here.
+  - host: platform.claude.com
+    note: Claude Code signs in with a Claude Console account here.
+
+  # GitHub.
+  - host: github.com
+    note: git over HTTPS (clone, fetch, push).
+  - host: api.github.com
+    note: The GitHub API, used by the gh command.
