@@ -131,6 +131,7 @@ t3 environment link http://127.0.0.1:3774 --pairing-code <code>
 | Task | Command |
 | --- | --- |
 | Start the VM | `nix run .#vm` |
+| See whether everything is up | `nix run .#status` |
 | Open a shell in it | `nix run .#ssh` |
 | Add it to the T3 app | `nix run .#pair` |
 | Run one command in it | `nix run .#ssh -- <command>` |
@@ -140,10 +141,54 @@ t3 environment link http://127.0.0.1:3774 --pairing-code <code>
 | Test GitHub end to end with the real token | `nix run .#ssh -- bash -s < tests/github-live.sh` |
 | Test the token swap without a VM or a token | `tests/github-broker.sh` |
 | Stop the VM and the broker | `nix run .#stop` |
+| Start a clean VM for one task, keeping the sign-in and the link to T3 | `nix run .#vm-fresh` |
+| Bring the T3 server in the VM to the T3 app's version | `nix run .#update-t3` |
 | Start over with a clean VM | Stop it, then delete `~/.local/state/agent-vm` |
 
 Starting over removes everything in `/home/agent`, including the Claude
 sign-in, and the link to T3 has to be made again.
+
+### Is it working?
+
+`nix run .#status` answers on one screen: whether the VM and the broker run
+and for how long, whether SSH and the T3 server answer, whether the T3
+server is the version of the T3 app, whether Claude is signed in, whether the
+tokens file is in order, whether an agent holds the VM, what the broker
+refused last, and how large the disk and the logs are. It changes nothing
+and takes about a second.
+
+A line marked `FAIL` is something that should be up and is not. A line marked
+`warn` works today but wants attention. The command ends with status 0 when
+everything is up, 1 when a line says `FAIL`, and 2 when the VM is simply not
+running, so a script can wait for the VM with it.
+
+### A throwaway run
+
+`nix run .#vm-fresh` starts the VM from its disk as it is now, so Claude is
+signed in and T3 is paired, and discards everything written during that run
+when the VM stops: cloned repos, T3's threads, changed settings. The normal
+disk is not changed. Nothing is built, so it starts as fast as the normal
+VM. Stop it with `nix run .#stop` as usual; every other command works on it
+too, and `nix run .#status` says which kind is running.
+
+Things to know:
+
+- It cannot run beside the normal VM. Stop that one first.
+- What you want to keep from a throwaway run has to leave it before it
+  stops, for example as a pushed branch.
+- The T3 app on the Mac may still list threads from a throwaway run. The
+  server no longer has them.
+- If Claude renews its sign-in during a throwaway run, the renewal is
+  discarded with the rest. Should the normal VM then ask you to sign in
+  again, do so. This has not been seen to happen.
+
+### The logs
+
+`broker.log` and `console.log` in the state folder are kept from growing
+without end. When one is larger than 5 MiB at a start, it is moved aside as
+`broker.log.1`, and up to three such older parts are kept. This happens at a
+start only, because a running broker cannot be told to switch files; a log
+can pass the limit during a long run, and `nix run .#status` then says so.
 
 ## Allowing a destination
 
@@ -181,8 +226,20 @@ again.
 ## Updating T3
 
 The T3 server in the VM should be the same version as the T3 app on the Mac.
-When the app updates, change the version and checksum in
-[`vm/t3.nix`](../vm/t3.nix) and restart the VM. The checksum is the line for
+`nix run .#status` warns when they differ. When the app has updated, run this
+in your clone of the repo:
+
+```sh
+nix run .#update-t3
+```
+
+It reads the app's version, fetches the checksum of that release from
+GitHub, and writes both into [`vm/t3.nix`](../vm/t3.nix). Then restart the
+VM (`nix run .#stop`, `nix run .#vm`); that start builds the VM anew. Commit
+the change to keep it. To pin another version than the app's, name it:
+`nix run .#update-t3 -- 0.1.8`.
+
+By hand it is the same two values: the version, and the line for
 `linux-arm64` in the release's `SHA256SUMS` file on GitHub.
 
 ## Problems
@@ -213,6 +270,10 @@ those on. Remove it; `git` and `gh` in the VM need no login of their own.
 The VM trusts the broker's certificate only when it was started with
 `nix run .#vm`, which hands the certificate over. If the broker's folder in
 the state folder was deleted while the VM ran, restart the VM.
+
+**`nix run .#vm` says "a VM is running or starting".**
+Only one VM can use the disk at a time, the normal one or a throwaway run.
+`nix run .#status` shows which one runs; `nix run .#stop` stops it.
 
 **`nix shell` or `nix run` fails inside the VM.**
 Nix's download servers are not on the list of destinations. Add tools to

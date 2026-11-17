@@ -364,25 +364,39 @@ the Mac. Nothing in this repo tests for that or limits it.
 
 ### A start with extra QEMU options
 
-The network option is fixed in `vm/default.nix`, and the start script no
-longer reads `QEMU_NET_OPTS`. Two other ways in remain:
+The network option is fixed in `vm/default.nix`, and the start script does
+not read `QEMU_NET_OPTS`. One way in remains:
 
-- The start script passes the variable `QEMU_OPTS` to QEMU.
-- `nix run .#vm -- <options>` passes its arguments to QEMU.
+- `nix run .#vm -- <options>` passes its arguments to QEMU, and so does
+  `nix run .#vm-fresh -- <options>`. They can add a shared folder, or a
+  second network card that is not restricted. A program in the VM cannot
+  set them; you type them. The start command prints a line that names them.
 
-Either can add a shared folder, or a second network card that is not
-restricted. A program in the VM cannot set them. A value left over in your
-shell can. Seen by hand in the generated start script on 2026-11-17.
+Closed since this page was first written: the variables `QEMU_OPTS` and
+`NIXPKGS_QEMU_KERNEL_*`, which the generated start script reads. One left
+over in a shell could add an option or boot another kernel. The start
+command now drops them and says so. `QEMU_KERNEL_PARAMS` is set by the start
+command itself, so a value from the shell never reaches the VM. `TMPDIR` and
+`USE_TMPDIR` are still read; they only choose where the copy of the Nix
+store is put on the Mac. Checked on 2026-11-17: a start with `QEMU_OPTS`
+set printed the note, and the option was not on QEMU's command line.
 
 ### SSH reads your own configuration
 
-`nix run .#ssh` starts `ssh` without `-F none`, so your `~/.ssh/config`
-applies to the VM as well. Lines under `Host *` are the ones to look for:
+Closed since this page was first written. `nix run .#ssh`, and with it
+`nix run .#pair`, `.#check` and `.#status`, start `ssh` with `-F none`, so
+neither your `~/.ssh/config` nor the system's applies to the VM. Before, a
+line under `Host *` there did:
 
 - `RemoteForward` opens a port in the VM that leads back to the Mac.
 - `SendEnv` sends variables from your shell into the VM.
-- `ForwardAgent` offers your SSH agent to the VM. The command sets
-  `IdentityAgent=none`; whether that also stops forwarding was not tested.
+- `ForwardAgent` offers your SSH agent to the VM.
+
+What remains is what you type yourself: `nix run .#ssh -- -A` or `-R ...`
+still forwards, because it is asked for. Checked on 2026-11-17 by asking
+`ssh` for its settings (`-G`): the command's ssh has no forward, no
+`SendEnv` and `ForwardAgent no`, where a configuration file with those
+lines under `Host *` set every one of them when ssh was allowed to read it.
 
 ### Wearing out the Mac
 
@@ -391,7 +405,12 @@ applies to the VM as well. Lines under `Host *` are the ones to look for:
   can use up the processes your account may run, until the VM is stopped.
   The broker's limit of 256 connections does not stop the helpers from being
   started.
-- The broker's log grows by one line per request and nothing trims it.
+- The broker's log grows by one line per request. It is moved aside when it
+  is larger than 5 MiB, and three older parts are kept, but only when the
+  broker is started. During one run nothing trims it, so a program in the
+  VM that asks in a loop can fill the Mac's disk until the VM is stopped.
+  The same goes for `console.log`, which the `agent` user can write to.
+  `nix run .#status` shows the size of both.
 - The VM itself is bounded: 4 cores, 8 GB of memory and a 40 GB disk, set in
   `vm/default.nix`.
 
@@ -496,7 +515,10 @@ And these, which no test can show:
 - Put in the VM only the code the task needs.
 - Stop the broker when you do not use the VM: `nix run .#stop`. The token is
   within reach of every program on the Mac only while it runs.
-- Start the VM from a clean shell, without `QEMU_OPTS` set.
+- Read the line the start command prints when you pass options to QEMU
+  after `--`, and pass none that share a folder or add a network card.
+- Look at `nix run .#status` now and then: it shows what was refused last
+  and how large the logs have grown.
 - Read what the agent produced before you run it on the Mac or merge it.
 - Watch `nix run .#logs` now and then. A `refused` line for a host you do
   not know, or with the reason `other-login`, is worth a look.
