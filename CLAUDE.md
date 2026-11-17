@@ -48,6 +48,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `tests/github-live.sh` | The round trip with a real token, run inside the VM |
 | `tests/unit/` | pytest files for the broker's decisions; no network needed |
 | `tests/default.nix` | What `nix flake check`, `nix develop` and `nix run .#test-broker` are made of |
+| `.github/workflows/ci.yml` | CI: runs `nix flake check` and `nix run .#test-broker` on pull requests and on `main` |
 | `docs/` | Setup, architecture, diagrams |
 
 ## Commands
@@ -236,6 +237,10 @@ The reply should name Linux and the host `agent-vm`.
 - **`proxy.py` cannot be imported in a test:** its last line starts the
   broker. Use the `proxy` fixture in `tests/unit/conftest.py`, which loads
   the file without that line.
+- **CI runs both on every pull request,** on a Mac runner with no Linux
+  builder and no secrets. It cannot run the checks inside the VM, so a
+  green run does not replace `nix run .#check`. Actions in the workflow are
+  pinned by commit; keep it that way.
 - **Keep the broker test off the internet.** It uses a stand-in server on
   the same machine. GitHub allows 60 requests an hour without a login.
 - **One check in `tests/github-broker.sh` fails about one run in three:**

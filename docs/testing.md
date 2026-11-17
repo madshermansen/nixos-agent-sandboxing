@@ -158,6 +158,25 @@ VM:
 - **The VM builds and starts at all.** Layer 1 only checks that its
   configuration makes sense, without building it.
 
+## CI
+
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs layers 1 and
+2 on GitHub, for every pull request and every push to `main`:
+`nix flake check`, then `nix run .#test-broker`. The machine is a Mac with
+an Apple Silicon chip and no Linux builder, so a green run also shows that
+the checks build no part of the VM.
+
+It cannot run layer 3: there is no VM there, and no token. A green run in
+CI does not replace `nix run .#check`.
+
+The workflow uses no secrets and may only read the repo. It runs on
+`pull_request`, so a pull request from a fork gets the same read-only
+treatment. Each action it uses is named by its exact commit.
+
+Because of the check described under "Known to fail now and then", CI tries
+the broker test again, up to three times, when that check is the only
+failure. Any other failure fails the run at once.
+
 ## Working on the tests
 
 ```sh

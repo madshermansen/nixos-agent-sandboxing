@@ -1,0 +1,81 @@
+# Runs the tests that need no VM, on every pull request and on every push to
+# main. docs/testing.md says what they cover, and what only the check inside
+# the VM can prove.
+#
+# The job runs on a Mac with an Apple Silicon chip, like the machine nixt3 is
+# made for. It has no Linux builder, so it also proves that nothing in the
+# checks builds a part of the VM.
+#
+# It is safe for pull requests from forks: it runs on `pull_request`, never on
+# `pull_request_target`, so code from a fork gets a token that can only read
+# this repo, and no secrets. The workflow uses no secrets at all.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# All the job may do with the repo is read it.
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request replaces the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # Named so that GitHub adds `-o pipefail`: a step fails when any part of
+    # a pipeline in it fails.
+    shell: bash
+
+jobs:
+  checks:
+    name: Checks that need no VM
+    # macOS 15 on Apple Silicon (arm64).
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      # Each action is named by the exact commit it was at, not by a version
+      # tag, because a tag can later be moved to other code.
+      - name: Check out the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not leave the job's token in the checkout's git settings.
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+
+      # Formatting, shellcheck, the Python checks, every unit test, the
+      # Mac-side commands, and whether the VM's configuration still makes
+      # sense. -L prints the output of each check.
+      - name: nix flake check
+        run: nix flake check -L
+
+      # A real broker against a stand-in server on this machine. Nothing in
+      # it leaves the runner.
+      #
+      # One check in tests/github-broker.sh, "a first TLS message that never
+      # ends: logged", fails about one run in three for a reason that lies in
+      # the test and not in the broker (docs/testing.md, "Known to fail now
+      # and then"). So a run in which that check alone failed is tried
+      # again, up to three times. Any other failure fails the job at once.
+      # Remove the loop when that check is fixed.
+      - name: Check the broker against a stand-in server
+        run: |
+          known='  FAIL  a first TLS message that never ends: logged'
+          output=$(mktemp)
+          for attempt in 1 2 3; do
+            echo "Attempt $attempt"
+            if nix run .#test-broker | tee "$output"; then
+              exit 0
+            fi
+            if [ "$(grep -c '^  FAIL' "$output")" != 1 ] || ! grep -qxF "$known" "$output"; then
+              exit 1
+            fi
+            echo "Only the check that is known to fail now and then failed."
+          done
+          exit 1
