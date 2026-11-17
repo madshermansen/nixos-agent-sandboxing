@@ -167,6 +167,14 @@ def names_the_host(
 # by a header.
 DROPPED_HEADERS = frozenset(
     {
+        # About the connection to the next server, not about the request.
+        # `Proxy-Connection` and `Keep-Alive` can name or change what that
+        # server keeps, and `TE` asks it for lines after the body. Neither
+        # git nor gh sends them.
+        "keep-alive",
+        "proxy-connection",
+        "te",
+        # Claims about who sent the request and for which host.
         "forwarded",
         "x-host",
         "x-http-method",
@@ -198,6 +206,32 @@ def connection_is_plain(values: list[str]) -> bool:
     values are accepted.
     """
     return all(value.strip().lower() in ("close", "keep-alive") for value in values)
+
+
+# What a header may consist of: for its name, the visible ASCII characters;
+# for its value, those and the space and the tab.
+HEADER_NAME = re.compile(r"[\x21-\x7e]+")
+HEADER_VALUE = re.compile(r"[\t\x20-\x7e]*")
+
+
+def headers_are_plain(headers: list[tuple[str, str]]) -> bool:
+    """Whether every header is made of plain ASCII, name and value.
+
+    `headers` holds each header as it was sent, one character per byte.
+
+    A header value is passed on to GitHub byte for byte, but programs
+    disagree about bytes outside plain ASCII. The policy reads a value after
+    removing what Python counts as white space around it, and that is more
+    than HTTP's space and tab: it includes the bytes 0x1c to 0x1f, 0x85 and
+    0xa0. So `Content-Type: application/json` followed by the byte 0xa0 was
+    read as `application/json`, and sent on with the byte. What GitHub makes
+    of such a header nobody here knows. No real program sends one, so a
+    request with one is refused.
+    """
+    return all(
+        HEADER_NAME.fullmatch(name) and HEADER_VALUE.fullmatch(value)
+        for name, value in headers
+    )
 
 
 def reads_body(

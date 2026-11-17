@@ -31,7 +31,7 @@
 
 set -u
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 placeholder="nixt3-placeholder-not-a-real-token"
 standin_token="made-up-token-for-the-broker-test"
@@ -175,6 +175,7 @@ class Handler(BaseHTTPRequestHandler):
                     name.lower()
                     for name in self.headers.keys()
                     if name.lower().startswith(("x-", "forwarded"))
+                    or name.lower() in ("proxy-connection", "keep-alive", "te")
                 ),
                 "body_size": size,
                 "body_sha256": digest,
@@ -210,10 +211,15 @@ completed() { cat "$work/count.completed" 2>/dev/null || echo 0; }
 # prove. It changes one thing: the address the connection goes to. A
 # connection to anything but GitHub's two names is refused here, so that a
 # mistake in this test cannot reach the internet.
+#
+# Both helper scripts read what they need from files in their own folder.
+# They cannot be told through the environment: the broker starts mitmproxy
+# with an environment of its own.
 cat >"$work/redirect.py" <<'EOF'
 import os
 
-STAND_IN = ("127.0.0.1", int(os.environ["BROKER_TEST_STAND_IN"]))
+HERE = os.path.dirname(os.path.abspath(__file__))
+STAND_IN = ("127.0.0.1", int(open(os.path.join(HERE, "stand-in-port")).read()))
 GITHUB = {("github.com", 443), ("api.github.com", 443)}
 
 
@@ -237,13 +243,24 @@ EOF
 cat >"$work/inject.py" <<'EOF'
 import gc, logging, os, sys
 
-CONTROL = os.environ["BROKER_TEST_FAIL"]
+from mitmproxy import ctx
+
+CONTROL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fail")
+changed = False
 
 
 def maybe_fail():
     try:
         hook = open(CONTROL).read().strip()
     except OSError:
+        return
+    if hook == "change-a-setting":
+        # Turn on, while the broker runs, a setting that rewrites requests:
+        # here, one that adds a header to each. Once is enough.
+        global changed
+        if not changed:
+            changed = True
+            ctx.options.update(modify_headers=["/~q/X-Added-By-A-Setting/after-the-start"])
         return
     if hook == "scrub-probe":
         # Write the token to the log the way mitmproxy or Python would,
@@ -279,6 +296,35 @@ class BreakableSet(set):
 
 broker = next(thing for thing in gc.get_objects() if type(thing).__name__ == "Broker")
 swap = sys.modules["swap"]
+
+# "stream-first": before the broker is asked about a request, switch on the
+# passing-on of its body in pieces, as mitmproxy itself does for a body
+# larger than its `stream_large_bodies`. mitmproxy then sends the request's
+# first lines to the server at once, unless the broker switches it off again.
+asked = type(broker).requestheaders
+
+
+def stream_first(self, flow):
+    try:
+        mode = open(CONTROL).read().strip()
+    except OSError:
+        mode = ""
+    if mode == "stream-first":
+        flow.request.stream = True
+    return asked(self, flow)
+
+
+type(broker).requestheaders = stream_first
+
+# "settings-file-at-start": put a settings file into mitmproxy's folder now,
+# after the broker's check at start has passed and before mitmproxy is up.
+try:
+    at_start = open(CONTROL).read().strip()
+except OSError:
+    at_start = ""
+if at_start == "settings-file-at-start":
+    with open(os.path.join(os.path.expanduser(ctx.options.confdir), "config.yaml"), "w") as file:
+        file.write("# put here by the test\n")
 type(broker).refusal = breakable(type(broker).refusal)
 sys.modules["github_request"].plan = breakable(sys.modules["github_request"].plan)
 swap.names_the_host = breakable(swap.names_the_host)
@@ -424,6 +470,38 @@ elif kind == "requests":
             print(status, "arrived with the token")
         else:
             print(status, "arrived without a login")
+elif kind == "odd-headers":
+    # One request each, with a header that holds a byte outside plain ASCII.
+    # megabytes is not used. Prints "refused" or "arrived" for each.
+    import json
+
+    placeholder = sys.argv[7]
+    cases = [
+        b"Content-Type: application/json\xa0",
+        b"Content-Encoding: \xa0",
+        b"X-Nul: a\x00b",
+        b"X-High: \xff\xfe",
+        b"X-Accent: caf\xc3\xa9",
+        b"X-Unit-Separator: a\x1fb",
+    ]
+    for case in cases:
+        connection = tunnel()
+        connection.settimeout(15)
+        body = b'{"body":"x"}'
+        connection.sendall(
+            f"POST /repos/madshermansen/nixt3/issues/7/comments HTTP/1.1\r\nHost: {host}\r\n"
+            f"Authorization: token {placeholder}\r\nContent-Length: {len(body)}\r\n".encode()
+            + (b"" if case.lower().startswith(b"content-type") else b"Content-Type: application/json\r\n")
+            + case
+            + b"\r\n\r\n"
+            + body
+        )
+        try:
+            answer = connection.recv(4096)
+        except (OSError, ssl.SSLError):
+            answer = b""
+        print("arrived" if b"body_sha256" in answer else "refused")
+        connection.close()
 elif kind.startswith("hidden-"):
     # A header hidden from the broker inside the value of another one: on a
     # continuation line (a line that starts with a space), or after a lone
@@ -575,13 +653,33 @@ fi
 # unless a variable names other ones. What is in `extra` is added to
 # mitmproxy's arguments. Every broker started here sends its
 # connections to the stand-in.
+# Every broker in this test is started from a shell that has these set, as
+# a developer's shell might. Each changes what mitmproxy, Python or the TLS
+# library does, or makes them write somewhere, if it reaches them: the
+# first two make mitmproxy write the keys of every encrypted connection to a
+# file. The broker's start command must pass none of them on, so the test
+# must pass as if they were not there, and the two files must not appear.
+hostile_environment=(
+  SSLKEYLOGFILE="$work/keys.log"
+  MITMPROXY_SSLKEYLOGFILE="$work/keys-too.log"
+  HTTPS_PROXY="http://127.0.0.1:9"
+  https_proxy="http://127.0.0.1:9"
+  ALL_PROXY="http://127.0.0.1:9"
+  SSL_CERT_FILE="/dev/null"
+  SSL_CERT_DIR="/var/empty"
+  NIX_SSL_CERT_FILE="/dev/null"
+  OPENSSL_CONF="$work/no-such-openssl.cnf"
+  PYTHONWARNINGS="error"
+  MITMPROXY_DEBUG_EXIT="1"
+)
+printf '%s' "$server_port" >"$work/stand-in-port"
+
 extra=()
 start_broker() {
   local log=$1
   shift
   env -u AGENT_BROKER_RULES AGENT_VM_STATE="$work/state" \
-    AGENT_BROKER_TOKENS="$work/tokens.yaml" BROKER_TEST_FAIL="$work/fail" \
-    BROKER_TEST_STAND_IN="$server_port" "$@" \
+    AGENT_BROKER_TOKENS="$work/tokens.yaml" "${hostile_environment[@]}" "$@" \
     "$broker" --listen-port "$broker_port" --scripts "$work/redirect.py" --scripts "$work/inject.py" \
     --set ssl_verify_upstream_trusted_ca="$work/ca.pem" ${extra[@]+"${extra[@]}"} >"$log" 2>&1 &
   broker_pid=$!
@@ -697,6 +795,60 @@ extra=()
 # broker's check runs. It must stay empty.
 if [ -s "$work/flows" ]; then fail "nothing was written to the traffic file"; else pass "nothing was written to the traffic file"; fi
 
+# The environment. The start command gives mitmproxy an environment of its
+# own, so a variable in the shell does not reach it (the brokers above and
+# below are all started with a hostile one). Here mitmproxy is started by
+# hand, the way the start command does, but with the shell's environment:
+# the broker itself must then refuse.
+run=$(grep -o '/nix/store/[a-z0-9]*-agent-vm-broker-run/bin/agent-vm-broker-run' "$broker" | head -n 1)
+mitmdump=$(grep -o '/nix/store/[^ "]*/bin/mitmdump' "$run" | head -n 1)
+proxy_script=$(grep -o '/nix/store/[^ "]*-broker/proxy.py' "$run" | head -n 1)
+# by_hand <variable=value> [size]: starts mitmproxy with the broker's script
+# and that one variable more, and with `stream_large_bodies` set to the size
+# if one is given. Prints what it said.
+by_hand() {
+  /usr/bin/env -i PYTHONUNBUFFERED=1 AGENT_BROKER_RULES="${proxy_script%proxy.py}rules.yaml" "$1" \
+    "$mitmdump" --listen-host 127.0.0.1 --listen-port "$broker_port" --set confdir="$work/state-by-hand" \
+    --set connection_strategy=lazy --set flow_detail=0 --set termlog_verbosity=error --set onboarding=false \
+    --set stream_large_bodies="${2:-1m}" --set rawtcp=false --set http2=false --scripts "$proxy_script" 2>&1 &
+  local pid=$!
+  for _ in $(seq 100); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null
+    echo "IT STARTED"
+  fi
+  wait "$pid" 2>/dev/null
+}
+if [ -x "$mitmdump" ] && [ -f "$proxy_script" ]; then
+  for variable in SSLKEYLOGFILE MITMPROXY_SSLKEYLOGFILE PYTHONPATH OPENSSL_CONF HTTPS_PROXY SSL_CERT_FILE SOMETHING_ELSE; do
+    said=$(by_hand "$variable=$work/from-the-environment")
+    case "$said" in
+      *"IT STARTED"*) fail "started by hand with $variable set: the broker does not start" ;;
+      *"the variable \`$variable\` is set"*) pass "started by hand with $variable set: the broker does not start, and names it" ;;
+      *) fail "started by hand with $variable set: the broker does not start, and names it" ;;
+    esac
+  done
+  # Without any such variable the same start gets past this check, and stops
+  # at the next thing it lacks, the tokens.
+  case "$(by_hand PYTHONUNBUFFERED=1)" in
+    *"no tokens were handed over"*) pass "started by hand without one, it gets as far as asking for its tokens" ;;
+    *) fail "started by hand without one, it gets as far as asking for its tokens" ;;
+  esac
+  # The start command sets `stream_large_bodies`, and mitmproxy takes no
+  # second value for a setting, so only a start by hand can change it. Below
+  # that size mitmproxy would pass a body on before the broker has read it.
+  case "$(by_hand PYTHONUNBUFFERED=1 1k)" in
+    *'`stream_large_bodies` must be'*) pass "started by hand with stream_large_bodies=1k: the broker does not start, and says why" ;;
+    *) fail "started by hand with stream_large_bodies=1k: the broker does not start, and says why" ;;
+  esac
+else
+  fail "the test found mitmdump and the broker's script in the start command"
+fi
+if [ -e "$work/from-the-environment" ]; then fail "nothing was written where those variables pointed"; else pass "nothing was written where those variables pointed"; fi
+
 if port_open "$broker_port"; then fail "nothing listens after a failed start"; else pass "nothing listens after a failed start"; fi
 
 start_broker "$work/broker.log"
@@ -803,9 +955,6 @@ turned_away() {
     fail "$what"
   fi
 }
-
-# graphql <name>: the curl arguments for one of the GraphQL requests made above.
-graphql() { printf '%s\n' "--data-binary" "@$work/graphql/$1.json"; }
 
 echo "The swap:"
 
@@ -915,6 +1064,27 @@ case "$report" in
   *) fail "headers that claim another host or sender are left out" ;;
 esac
 
+# Headers about the connection to the next server. One of them can name
+# other headers for that server to drop.
+report=$(through --http1.1 "${login[@]}" -H "Proxy-Connection: Authorization" -H "Keep-Alive: timeout=5" \
+  -H "TE: trailers" -H "X-Harmless: stays" "$api/repos/$listed")
+case "$report" in
+  *'"x_headers": ["x-harmless"]'*) [ "$(printf '%s' "$report" | field authorization)" = "$with_token" ] &&
+    pass "Proxy-Connection, Keep-Alive and TE are left out" || fail "Proxy-Connection, Keep-Alive and TE are left out" ;;
+  *) fail "Proxy-Connection, Keep-Alive and TE are left out" ;;
+esac
+
+# A header with a byte outside plain ASCII. Programs disagree about such
+# bytes; the policy, for one, would read `application/json` followed by the
+# byte 0xa0 as `application/json`.
+before=$(count)
+outcome=$(python3 "$work/client.py" odd-headers "$broker_port" api.github.com 443 "$ca" 0 "$placeholder" 2>&1 | tr '\n' ' ')
+[ "$outcome" = "refused refused refused refused refused refused " ] && [ "$(count)" = "$before" ] &&
+  pass "six headers with a byte outside plain ASCII are refused, and none arrives" ||
+  fail "six headers with a byte outside plain ASCII are refused, and none arrives ($outcome)"
+logged " refused api.github.com 443 https POST /repos/$listed/issues/7/comments odd-header\$" &&
+  pass "such a header is logged as refused" || fail "such a header is logged as refused"
+
 turned_away "a header that asks for another method than the one sent is refused" method-override "asks for another method" \
   -H "X-HTTP-Method-Override: DELETE" "${json[@]}" --data-binary '{"body":"x"}' "$api/repos/$listed/issues/7/comments"
 
@@ -979,12 +1149,21 @@ through --http1.1 -D "$work/headers" "${login[@]}" "$api/repos/$unlisted" >"$wor
 # The gh commands that change something print the body of a 403 as one line
 # with every quote and line break escaped. They show cleanly what GraphQL
 # itself sends for a refusal: the status 200 and `errors` in place of data.
-through --http1.1 -D "$work/headers" "${login[@]}" "${json[@]}" $(graphql close-by-id) "$api/graphql" >"$work/answer"
+through --http1.1 -D "$work/headers" "${login[@]}" "${json[@]}" --data-binary "@$work/graphql/close-by-id.json" "$api/graphql" >"$work/answer"
 [ "$(answer_status)" = 200 ] && grep -qi "^content-type: application/json" "$work/headers" &&
   [ "$(graphql_error <"$work/answer" | cut -c1-32)" = '"Refused by the sandbox broker: ' ] &&
   [ "$(field data <"$work/answer")" = null ] &&
   pass "a refused GraphQL request is answered the way GraphQL reports an error" ||
   fail "a refused GraphQL request is answered the way GraphQL reports an error"
+
+# Only the GraphQL address itself is answered that way. A REST address that
+# merely has the word in it gets the 403 of the REST API.
+for address in "$api/repos/$unlisted/contents/graphql" "$api/repos/$unlisted/graphql" "$api/graphql/extra" "$api/graphqlx"; do
+  through --http1.1 -D "$work/headers" "${login[@]}" "$address" >"$work/answer"
+  [ "$(answer_status)" = 403 ] && [ "$(field message <"$work/answer" | cut -c1-32)" = '"Refused by the sandbox broker: ' ] &&
+    pass "a refusal for ${address#"$api"} is a 403, not the GraphQL answer" ||
+    fail "a refusal for ${address#"$api"} is a 403, not the GraphQL answer"
+done
 
 through --http1.1 -D "$work/headers" "${login[@]}" "$git/$unlisted/info/refs?service=git-upload-pack" >"$work/answer"
 [ "$(answer_status)" = 403 ] && grep -qi "^content-type: text/plain" "$work/headers" && head -n 1 "$work/answer" | grep -q "^Refused by the sandbox broker: " &&
@@ -1053,44 +1232,44 @@ turned_away "a part of the API nobody listed" not-recognised "" "$api/zen"
 # must not read an address in a way GitHub might not.
 turned_away "an address that climbs out of the listed repo with .." path-odd "" \
   --path-as-is "$api/repos/$listed/../../$unlisted"
-turned_away "the same with the dots encoded" path-odd "" "$api/repos/$listed/%2e%2e/%2e%2e/$unlisted"
+turned_away "the same with the dots encoded" path-odd "" --path-as-is "$api/repos/$listed/%2E%2E/%2E%2E/$unlisted"
 turned_away "a doubled slash" path-odd "" --path-as-is "$api/repos/madshermansen//nixt3"
 turned_away "an encoded keyword" not-recognised "" "$api/repos/$listed/%70ulls"
 
 echo "What may be sent to GitHub: GraphQL, which gh uses"
 
-arrives "read the listed repo" graphql-read "${json[@]}" $(graphql read-listed) "$api/graphql"
+arrives "read the listed repo" graphql-read "${json[@]}" --data-binary "@$work/graphql/read-listed.json" "$api/graphql"
 # The file has spaces and line breaks; what the policy writes out has none.
-case "$(through --http1.1 "${login[@]}" "${json[@]}" $(graphql read-listed) "$api/graphql")" in
+case "$(through --http1.1 "${login[@]}" "${json[@]}" --data-binary "@$work/graphql/read-listed.json" "$api/graphql")" in
   *'"body_start": "{\"query\":\"query {'*) pass "the request arrives written out afresh by the policy" ;;
   *) fail "the request arrives written out afresh by the policy" ;;
 esac
-arrives "ask who the token belongs to" graphql-read "${json[@]}" $(graphql who-am-i) "$api/graphql"
+arrives "ask who the token belongs to" graphql-read "${json[@]}" --data-binary "@$work/graphql/who-am-i.json" "$api/graphql"
 arrives "open a pull request in the listed repo, as gh pr create does" graphql-write \
-  "${json[@]}" $(graphql open-pull-request) "$api/graphql"
+  "${json[@]}" --data-binary "@$work/graphql/open-pull-request.json" "$api/graphql"
 
 turned_away "read a repo that is not listed" repo-not-listed "is not a repo the sandbox may use" \
-  "${json[@]}" $(graphql read-unlisted) "$api/graphql"
+  "${json[@]}" --data-binary "@$work/graphql/read-unlisted.json" "$api/graphql"
 turned_away "open a pull request in a repo that is not listed" graphql-id-not-listed "" \
-  "${json[@]}" $(graphql open-pull-request-elsewhere) "$api/graphql"
+  "${json[@]}" --data-binary "@$work/graphql/open-pull-request-elsewhere.json" "$api/graphql"
 turned_away "open a pull request from someone's fork" head-elsewhere "" \
-  "${json[@]}" $(graphql open-pull-request-from-a-fork) "$api/graphql"
+  "${json[@]}" --data-binary "@$work/graphql/open-pull-request-from-a-fork.json" "$api/graphql"
 turned_away "close a pull request by its id, as gh pr close does: refused, with the way on" graphql-by-id "gh api" \
-  "${json[@]}" $(graphql close-by-id) "$api/graphql"
+  "${json[@]}" --data-binary "@$work/graphql/close-by-id.json" "$api/graphql"
 turned_away "comment by a forged id that claims the listed repo" graphql-by-id "" \
-  "${json[@]}" $(graphql comment-by-forged-id) "$api/graphql"
+  "${json[@]}" --data-binary "@$work/graphql/comment-by-forged-id.json" "$api/graphql"
 turned_away "a query that walks from the listed repo to its owner's other repos" graphql-not-on-list "" \
-  "${json[@]}" $(graphql walk-to-the-owners-repos) "$api/graphql"
+  "${json[@]}" --data-binary "@$work/graphql/walk-to-the-owners-repos.json" "$api/graphql"
 turned_away "a query that walks from the listed repo to the repo it was forked from" graphql-not-on-list "" \
-  "${json[@]}" $(graphql walk-to-the-parent) "$api/graphql"
+  "${json[@]}" --data-binary "@$work/graphql/walk-to-the-parent.json" "$api/graphql"
 turned_away "a query for all the repos the token can see" graphql-not-on-list "" \
-  "${json[@]}" $(graphql my-repos) "$api/graphql"
+  "${json[@]}" --data-binary "@$work/graphql/my-repos.json" "$api/graphql"
 
 # `gh pr edit` reads who can be assigned before it changes anything, and is
 # refused at that read. The refusal has to name the way to make the change.
 turned_away "what gh pr edit reads first is refused, and the refusal names the gh api line for the change" \
   graphql-not-on-list "gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title=" \
-  "${json[@]}" $(graphql read-before-an-edit) "$api/graphql"
+  "${json[@]}" --data-binary "@$work/graphql/read-before-an-edit.json" "$api/graphql"
 
 echo "The request as it was sent, not a tidied view of it (none of the refused may reach the stand-in):"
 
@@ -1162,6 +1341,33 @@ else
   pass "no request with such a method was let through"
 fi
 
+echo "When mitmproxy has chosen to pass a body on unread before the broker is asked:"
+
+# mitmproxy does that by itself for a body larger than one of its settings,
+# and then sends the request's first lines to the server at once. The broker
+# pins that setting, and does not rely on it: whatever it refuses, or reads
+# first, it takes back from mitmproxy. The second script switches the
+# passing-on on for every request here, before the broker's code runs.
+echo stream-first >"$work/fail"
+before=$(count)
+answer=$(through --http1.1 "${login[@]}" "${json[@]}" --data-binary '{"body":"something to carry out"}' "$api/repos/$unlisted/issues/1/comments")
+case "$answer" in
+  *"nothing can be sent to it"*) [ "$(count)" = "$before" ] &&
+    pass "a refused change does not reach the server, also then" ||
+    fail "a refused change does not reach the server, also then (it arrived)" ;;
+  *) fail "a refused change does not reach the server, also then" ;;
+esac
+before=$(count)
+through --http1.1 -H "Authorization: token some-other-token" "${json[@]}" --data-binary '{"body":"x"}' "$api/repos/$listed/issues/7/comments" |
+  grep -q "not this sandbox's own" && [ "$(count)" = "$before" ] &&
+  pass "nor does a request with another login" || fail "nor does a request with another login"
+sum=$(printf '{"body":"hello broker"}' | shasum -a 256 | cut -d' ' -f1)
+report=$(through --http1.1 "${login[@]}" "${json[@]}" --data-binary '{ "body" : "hello broker" }' "$api/repos/$listed/issues/7/comments")
+[ "$(printf '%s' "$report" | field body_sha256)" = "\"$sum\"" ] && [ "$(printf '%s' "$report" | field authorization)" = "$with_token" ] &&
+  pass "an allowed change is still read first: it arrives as the policy wrote it out, with the token" ||
+  fail "an allowed change is still read first: it arrives as the policy wrote it out, with the token"
+: >"$work/fail"
+
 echo "A body the policy needs but cannot read (none may reach the stand-in):"
 
 turned_away "a compressed body" body-odd "compressed" \
@@ -1181,7 +1387,7 @@ cut_off() {
     [ "$(count)" = "$before" ] && pass "$what" || fail "$what"
   fi
 }
-cut_off "a GraphQL request sent in pieces" -H "Transfer-Encoding: chunked" $(graphql open-pull-request) "$api/graphql"
+cut_off "a GraphQL request sent in pieces" -H "Transfer-Encoding: chunked" --data-binary "@$work/graphql/open-pull-request.json" "$api/graphql"
 python3 -c 'import json, sys; json.dump({"body": "x" * 2_000_000}, sys.stdout)' >"$work/large.json"
 cut_off "a comment of 2 MB" --data-binary "@$work/large.json" "$api/repos/$listed/issues/7/comments"
 cut_off "a read with a body sent in pieces" -X GET -H "Transfer-Encoding: chunked" --data-binary '{"body":"x"}' "$api/repos/$listed"
@@ -1193,7 +1399,7 @@ echo "With 'other_repos: read-public': repos that are not listed may be read, wi
 
 # A second broker, with rules that differ in that one line.
 env -u AGENT_BROKER_RULES AGENT_VM_STATE="$work/state2" AGENT_BROKER_RULES="$work/read-public.yaml" \
-  AGENT_BROKER_TOKENS="$work/tokens.yaml" BROKER_TEST_FAIL="$work/fail" BROKER_TEST_STAND_IN="$server_port" \
+  AGENT_BROKER_TOKENS="$work/tokens.yaml" "${hostile_environment[@]}" \
   "$broker" --listen-port "$second_port" --scripts "$work/redirect.py" \
   --set ssl_verify_upstream_trusted_ca="$work/ca.pem" >"$work/second.log" 2>&1 &
 second_pid=$!
@@ -1249,13 +1455,96 @@ second -H "Authorization: token some-other-token" "$api/repos/$unlisted" | grep 
   pass "another token is still refused, not taken out" || fail "another token is still refused, not taken out"
 
 before=$(count)
-second "${login[@]}" "${json[@]}" $(graphql read-unlisted) "$api/graphql" | grep -q "Refused by the sandbox broker" && [ "$(count)" = "$before" ] &&
+second "${login[@]}" "${json[@]}" --data-binary "@$work/graphql/read-unlisted.json" "$api/graphql" | grep -q "Refused by the sandbox broker" && [ "$(count)" = "$before" ] &&
   pass "GraphQL, which needs the token, still refuses an unlisted repo" ||
   fail "GraphQL, which needs the token, still refuses an unlisted repo"
 
 if grep -q "$standin_token" "$work/second.log"; then fail "the token is not in the second broker's log"; else pass "the token is not in the second broker's log"; fi
 kill "$second_pid" 2>/dev/null
 second_pid=""
+
+echo "A setting that changes while the broker runs:"
+
+# A third broker, with helper scripts of its own, so that what is done to it
+# does not touch the one the other checks use.
+mkdir "$work/third"
+cp "$work/redirect.py" "$work/inject.py" "$work/stand-in-port" "$work/third/"
+third_port=$second_port
+# start_third <log file>: starts it; its id is in second_pid, so that it is
+# stopped with the test.
+start_third() {
+  env -u AGENT_BROKER_RULES AGENT_VM_STATE="$work/state3" AGENT_BROKER_TOKENS="$work/tokens.yaml" \
+    "${hostile_environment[@]}" \
+    "$broker" --listen-port "$third_port" --scripts "$work/third/redirect.py" --scripts "$work/third/inject.py" \
+    --set ssl_verify_upstream_trusted_ca="$work/ca.pem" >"$1" 2>&1 &
+  second_pid=$!
+}
+third() {
+  curl -s --max-time 20 --proxy "http://127.0.0.1:$third_port" \
+    --cacert "$work/state3/broker/mitmproxy-ca-cert.pem" --http1.1 "$@"
+}
+# gone <pid>: whether the process ends by itself within ten seconds.
+gone() {
+  for _ in $(seq 100); do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+: >"$work/third/fail"
+start_third "$work/third.log"
+main_pid=$broker_pid
+broker_pid=$second_pid
+if ! wait_for_port "$third_port"; then
+  echo "The third broker did not start:"
+  cat "$work/third.log"
+  exit 1
+fi
+broker_pid=$main_pid
+[ "$(third "${login[@]}" "$api/repos/$listed" | field authorization)" = "$with_token" ] &&
+  pass "before the change, a request goes through as usual" || fail "before the change, a request goes through as usual"
+
+# The second script now turns on a setting that adds a header to every
+# request, in the middle of the next request.
+echo change-a-setting >"$work/third/fail"
+before=$(count)
+report=$(third "${login[@]}" -H "X-Harmless: stays" "$api/repos/$listed" 2>&1)
+case "$report" in
+  *x-added-by-a-setting* | *body_sha256*) fail "the request under way when a setting changed does not leave" ;;
+  *) [ "$(count)" = "$before" ] && pass "the request under way when a setting changed does not leave" ||
+    fail "the request under way when a setting changed does not leave (it arrived)" ;;
+esac
+if gone "$second_pid"; then pass "the broker stops by itself"; else fail "the broker stops by itself"; fi
+grep -q 'stopping, because mitmproxy runs with settings' "$work/third.log" && grep -q '`modify_headers` is set' "$work/third.log" &&
+  pass "and says which setting" || fail "and says which setting"
+before=$(count)
+third "${login[@]}" "$api/repos/$listed" >/dev/null 2>&1
+[ "$(count)" = "$before" ] && pass "nothing goes through it afterwards" || fail "nothing goes through it afterwards"
+kill "$second_pid" 2>/dev/null
+wait "$second_pid" 2>/dev/null
+second_pid=""
+
+# A settings file that appears in mitmproxy's folder after the broker's
+# check at start, and before mitmproxy is up. The check made once mitmproxy
+# has started has to find it.
+echo settings-file-at-start >"$work/third/fail"
+rm -f "$work/state3/broker/config.yaml"
+start_third "$work/third-file.log"
+if gone "$second_pid"; then
+  pass "a settings file that appears during the start: the broker stops by itself"
+else
+  fail "a settings file that appears during the start: the broker stops by itself"
+fi
+grep -q 'config.yaml is a settings file' "$work/third-file.log" &&
+  pass "and names the file" || fail "and names the file"
+before=$(count)
+third "${login[@]}" "$api/repos/$listed" >/dev/null 2>&1
+[ "$(count)" = "$before" ] && pass "nothing went through it" || fail "nothing went through it"
+kill "$second_pid" 2>/dev/null
+wait "$second_pid" 2>/dev/null
+second_pid=""
+: >"$work/third/fail"
 
 memory() { echo $(($(ps -o rss= -p "$mitm_pid") / 1024)); }
 # The broker command ends by turning into mitmdump, so the process is the same.
@@ -1480,6 +1769,18 @@ if grep -rq "$standin_token" "$work/broker.log" "$work/state"; then
   fail "the token is in no log and no file of the broker"
 else
   pass "the token is in no log and no file of the broker"
+fi
+# The shell these brokers were started from named two files for the keys
+# of encrypted connections, among them the one that carries the token.
+if [ -e "$work/keys.log" ] || [ -e "$work/keys-too.log" ]; then
+  fail "the keys of the broker's connections were written nowhere"
+else
+  pass "the keys of the broker's connections were written nowhere"
+fi
+if ps eww -o command= -p "$mitm_pid" | grep -Eq "SSLKEYLOGFILE|HTTPS_PROXY|OPENSSL_CONF"; then
+  fail "the shell's variables did not reach mitmproxy"
+else
+  pass "the shell's variables did not reach mitmproxy"
 fi
 if ps eww -o command= -p "$mitm_pid" | grep -q "$standin_token"; then
   fail "the token is not in the broker's command line or environment"

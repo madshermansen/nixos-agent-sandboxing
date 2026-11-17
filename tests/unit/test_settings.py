@@ -111,6 +111,15 @@ def test_the_value_of_a_refused_setting_is_not_repeated():
         ("rawtcp", True),
         ("http2", True),
         ("http2", 0),
+        # mitmproxy passes a body on unread when it is larger than this, so
+        # a smaller value would send a request before the broker judged it.
+        ("stream_large_bodies", "1k"),
+        ("stream_large_bodies", "1"),
+        ("stream_large_bodies", None),
+        ("stream_large_bodies", "2m"),
+        # At "info" mitmproxy logs the bytes of a request that was cut off.
+        ("termlog_verbosity", "info"),
+        ("termlog_verbosity", "debug"),
     ],
 )
 def test_a_setting_of_the_start_command_must_have_its_one_value(name, value):
@@ -141,6 +150,73 @@ def test_the_free_settings_may_have_any_value():
 
 def test_no_setting_is_both_required_and_free():
     assert not set(settings.REQUIRED) & settings.FREE
+
+
+# --- The environment ----------------------------------------------------------
+
+# What mitmproxy has in its environment when the start command starts it.
+STARTED_WITH = [
+    "PYTHONUNBUFFERED", "AGENT_BROKER_RULES", "AGENT_BROKER_TOKENS_FD",
+    "PATH", "PYTHONNOUSERSITE", "PWD", "SHLVL", "_", "__CF_USER_TEXT_ENCODING", "LC_CTYPE",
+]  # fmt: skip
+
+
+def test_the_environment_of_the_start_command_is_accepted():
+    assert settings.unreviewed_environment(STARTED_WITH) == []
+    assert settings.unreviewed_environment([]) == []
+
+
+def test_the_start_command_passes_no_more_than_the_broker_allows():
+    """Every variable given to mitmdump in darwin/commands.nix is known here."""
+    import re
+
+    text = (REPO / "darwin/commands.nix").read_text()
+    start = text.index("exec /usr/bin/env -i")
+    passed = re.findall(r"^\s+([A-Z_]+)=", text[start : text.index("mitmdump", start)], re.M)
+    assert passed == ["PYTHONUNBUFFERED", "AGENT_BROKER_RULES", "AGENT_BROKER_TOKENS_FD"]
+    assert set(passed) <= settings.ENVIRONMENT
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # Make mitmproxy write the keys of every encrypted connection to a file.
+        "SSLKEYLOGFILE",
+        "MITMPROXY_SSLKEYLOGFILE",
+        # Load code or settings from somewhere else.
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONWARNINGS",
+        "PYTHONUSERBASE",
+        "OPENSSL_CONF",
+        "OPENSSL_MODULES",
+        "DYLD_INSERT_LIBRARIES",
+        "BASH_ENV",
+        # Change which servers are believed, or where connections go.
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NIX_SSL_CERT_FILE",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "NO_PROXY",
+        # Anything else, known or not.
+        "HOME",
+        "MITMPROXY_DEBUG_EXIT",
+        "SOMETHING_NOBODY_HEARD_OF",
+        "pythonunbuffered",
+    ],
+)
+def test_any_other_variable_is_refused(name):
+    wrong = settings.unreviewed_environment([*STARTED_WITH, name])
+    assert len(wrong) == 1 and f"`{name}`" in wrong[0]
+
+
+def test_the_value_of_a_variable_is_never_looked_at_or_shown():
+    wrong = settings.unreviewed_environment({"SSLKEYLOGFILE": "/a/secret/path", "PATH": "/x"})
+    assert len(wrong) == 1 and "/a/secret/path" not in wrong[0]
 
 
 def test_a_settings_file_in_the_folder_is_found(tmp_path):

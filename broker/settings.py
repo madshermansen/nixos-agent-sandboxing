@@ -26,6 +26,15 @@ The rule is "not on the list, so it must be untouched", and not a list of
 dangerous settings. A setting that a later mitmproxy adds is then covered
 without anyone having to notice it.
 
+The same goes for the environment, the variables a program is started with.
+mitmproxy, Python and the TLS library read some of them, and they are
+settings by another name: SSLKEYLOGFILE makes mitmproxy write the keys of
+every encrypted connection to a file, the one that carries the token
+included; PYTHONPATH and OPENSSL_CONF load code and settings from elsewhere.
+The start command therefore starts mitmproxy with an environment of its
+own, and the broker refuses to start with any variable that is not in
+ENVIRONMENT below.
+
 This file knows nothing of mitmproxy, so that it can be tested by itself
 (tests/unit/test_settings.py). proxy.py hands it the values.
 
@@ -37,6 +46,28 @@ import os
 
 # The files mitmproxy reads settings from, in its configuration folder.
 CONFIG_FILES = ("config.yaml", "config.yml")
+
+# The variables mitmproxy may be started with. Their values are not looked
+# at; none of them is read as a place to write to or to load code from.
+ENVIRONMENT = frozenset(
+    {
+        # Set by the start command in darwin/commands.nix.
+        "PYTHONUNBUFFERED",  # write each log line at once
+        "AGENT_BROKER_RULES",  # the path of rules.yaml
+        "AGENT_BROKER_TOKENS_FD",  # the number of the pipe with the tokens
+        # Set by the small script that Nix puts in front of mitmdump.
+        "PATH",  # where it would look for programs; the broker runs none
+        "PYTHONNOUSERSITE",  # no Python packages from the home folder
+        # Set by the shell that runs that script, about itself.
+        "PWD",
+        "OLDPWD",
+        "SHLVL",
+        "_",
+        # Set by macOS and by Python when a program starts.
+        "__CF_USER_TEXT_ENCODING",
+        "LC_CTYPE",
+    }
+)
 
 # Settings the start command sets, and the one value each may have.
 REQUIRED = {
@@ -54,6 +85,18 @@ REQUIRED = {
     "rawtcp": False,
     # HTTP/1.1 where the broker opens traffic; see proxy.py.
     "http2": False,
+    # mitmproxy passes a body on in pieces, without reading it in, when it
+    # is declared to be larger than this. It decides that before the
+    # broker's code is asked, so the value has to agree with what the
+    # broker itself reads in full, swap.MAX_READ_BODY. With a smaller
+    # value, a request to the API would be on its way before the broker
+    # had read the body it judges by. proxy.py does not rely on this
+    # alone: it turns the passing-on off again for every request whose
+    # body it reads and for every request it refuses.
+    "stream_large_bodies": "1m",
+    # Of mitmproxy's own messages, only errors. At "info" it writes the
+    # first bytes of a request that was cut off into the log.
+    "termlog_verbosity": "error",
 }
 
 # Settings that may have any value. None of them changes what happens to a
@@ -63,10 +106,6 @@ FREE = frozenset(
         # Where the broker listens and keeps its files.
         "listen_port",
         "confdir",
-        # How much mitmproxy says about itself in the log.
-        "termlog_verbosity",
-        # A second safeguard against holding bodies in memory.
-        "stream_large_bodies",
         # The scripts mitmproxy loads: the broker itself, and in
         # tests/github-broker.sh two more. They are named on the command
         # line, where the user chose them; a settings file cannot name any,
@@ -87,6 +126,19 @@ def config_files(folder: str) -> list[str]:
         os.path.join(folder, name)
         for name in CONFIG_FILES
         if os.path.lexists(os.path.join(folder, name))
+    ]
+
+
+def unreviewed_environment(names) -> list[str]:
+    """The variables in the environment that the broker does not allow.
+
+    `names` holds the names of the variables mitmproxy was started with.
+    Returns one line per variable that is not in ENVIRONMENT, without its
+    value. An empty list means all is well.
+    """
+    return [
+        f"the variable `{name}` is set, and the broker does not allow that"
+        for name in sorted(set(names) - ENVIRONMENT)
     ]
 
 

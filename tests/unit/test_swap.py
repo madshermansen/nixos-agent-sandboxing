@@ -169,11 +169,63 @@ def test_headers_that_claim_another_method_or_host_are_left_out(name):
     assert swap.drops_header(name)
 
 
+@pytest.mark.parametrize("name", ["Proxy-Connection", "Keep-Alive", "TE", "te", " keep-alive"])
+def test_headers_about_the_connection_to_the_next_server_are_left_out(name):
+    assert swap.drops_header(name)
+
+
 @pytest.mark.parametrize(
     "name", ["Host", "Accept", "User-Agent", "X-GitHub-Api-Version", "Content-Type", "X-Forward"]
 )
 def test_other_headers_stay(name):
     assert not swap.drops_header(name)
+
+
+# --- Headers of plain ASCII ---------------------------------------------------
+
+
+def test_ordinary_headers_are_plain():
+    assert swap.headers_are_plain([])
+    assert swap.headers_are_plain(
+        [
+            ("Host", "api.github.com"),
+            ("Accept", "application/vnd.github+json; charset=utf-8, */*;q=0.5"),
+            ("User-Agent", "git/2.56.0 (with a\ttab)"),
+            ("X-Empty", ""),
+            ("Authorization", "Basic eDo9PX4hQCMkJV4mKigpXytgLXt9fFtdOjs8Pj8sLi8="),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        # What Python counts as white space and HTTP does not.
+        ("Content-Type", "application/json\xa0"),
+        ("Content-Type", "\x85application/json"),
+        ("Content-Encoding", "\xa0"),
+        ("Content-Type", "application/json\x1c"),
+        ("Content-Type", "application/json\x1f"),
+        ("Content-Type", "application/json\x0b"),
+        ("Content-Type", "application/json\x0c"),
+        # Other bytes that are not plain ASCII.
+        ("X-Nul", "a\x00b"),
+        ("X-High", "\xff\xfe"),
+        ("X-Accent", "caf\xc3\xa9"),
+        ("X-Delete", "a\x7fb"),
+        ("X-Escape", "a\x1bb"),
+        ("X-Break", "a\r\n b"),
+        ("X-Wide", "\u00e9"),
+        ("X-Surrogate", "\udca0"),
+        # And in a name.
+        ("X-N\xe4me", "x"),
+        ("X Name", "x"),
+        ("X-Name\t", "x"),
+        ("", "x"),
+    ],
+)
+def test_a_header_with_a_byte_outside_plain_ascii_is_not(name, value):
+    assert not swap.headers_are_plain([("Host", "api.github.com"), (name, value)])
 
 
 # --- The Connection header ----------------------------------------------------

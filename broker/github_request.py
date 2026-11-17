@@ -194,8 +194,10 @@ def plan(
     "As sent" is meant strictly: proxy.py hands over the bytes that arrived
     and that will be sent on, each byte read as one character, and not the
     tidied form that mitmproxy offers for convenience (its `method` is in
-    upper case whatever was sent). The policy accepts plain ASCII only, so a
-    request it allows is one whose text and bytes are the same thing.
+    upper case whatever was sent). For the method, the path and the query
+    the policy accepts plain ASCII only. For the headers this function
+    does, before it asks the policy. So a request that is allowed is one
+    whose text and bytes are the same thing.
 
     The token is in the result only when the request carried the
     placeholder and the policy allows the token. A request without a login
@@ -205,6 +207,9 @@ def plan(
         # Cannot happen with rules that load_policy() accepted. Refusing is
         # the safe answer if it ever does.
         return Plan(False, reason="no-policy")
+
+    if not swap.headers_are_plain(headers):
+        return Plan(False, reason="odd-header")
 
     logins = [value for name, value in headers if name.strip().lower() == "authorization"]
     credential = swap.swap_authorization(logins, token)

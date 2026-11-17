@@ -417,6 +417,33 @@ def test_a_method_in_another_spelling_is_refused_not_read_as_the_usual_one(metho
     assert not result.allowed
 
 
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("Content-Type", "application/json\xa0"),
+        ("Content-Encoding", "\xa0"),
+        ("X-Nul", "a\x00b"),
+        ("X-High", "\xff\xfe"),
+        ("X-N\xe4me", "x"),
+    ],
+)
+def test_a_header_with_a_byte_outside_plain_ascii_is_refused_before_the_policy_is_asked(extra, monkeypatch):
+    """The policy removes more than HTTP's white space around a value before
+    it reads it, so `application/json` plus the byte 0xa0 would be judged
+    as `application/json` and sent on with the byte."""
+
+    def never(*arguments, **named):
+        raise AssertionError("the policy was asked")
+
+    monkeypatch.setattr(github_policy, "decide", never)
+    headers = [("Host", API), ("Authorization", f"token {PLACEHOLDER}"), extra]
+    result = github_request.plan(
+        POLICY, TOKEN, method="GET", host=API, target="/repos/some-owner/listed",
+        headers=headers, authority=API, body=None,
+    )
+    assert (result.allowed, result.reason, result.message) == (False, "odd-header", None)
+
+
 def test_every_header_reaches_the_policy_also_one_sent_twice():
     """A header that asks for another method is refused by the policy."""
     result = plan("POST", API, "/repos/some-owner/listed/issues/7/comments", body=b'{"body":"x"}',

@@ -389,7 +389,9 @@ REFUSALS = {
     ),
     "odd-header": (
         "one of the request's header lines is split over several lines, or "
-        "holds a line-break character. The broker does not pass that on."
+        "holds a character outside plain ASCII, such as a line break, a "
+        "control character or an accented letter. The broker does not pass "
+        "that on."
     ),
     "names-another-host": (
         "the request names another site than {host}, the one its connection "
@@ -523,6 +525,7 @@ def _stop_broker(broker: "Broker", data: object) -> None:
 
 ON_FAILURE = {
     "running": _stop_broker,
+    "configure": _stop_broker,
     "client_connected": _stop_client,
     "client_disconnected": _stop_nothing,
     "http_connect": _stop_flow,
@@ -661,6 +664,11 @@ class Broker:
         host, port = flow.request.host, flow.request.port
         log("refused", host, port, how, *details, reason)
         flow.metadata[STATE] = "refused"
+        # mitmproxy may have decided, before the broker was asked, to pass
+        # this request's body on in pieces as it arrives, which means
+        # sending the request's first lines to the server at once. A
+        # refused request must not go anywhere.
+        flow.request.stream = False
 
         method, target = as_sent(flow.request)
         if method != "CONNECT" and not self.body_is_small(flow):
@@ -709,8 +717,26 @@ class Broker:
             has_transfer_encoding="transfer-encoding" in request.headers,
         )
 
+    def stopping(self, flow: http.HTTPFlow, how: str) -> bool:
+        """End a request when the broker has found that it must not run.
+
+        A broker that is stopping refuses new connections. This is for the
+        requests that were under way on a connection it already had: they
+        must not be finished under settings that the broker does not allow.
+        """
+        if not self.blocked:
+            return False
+        log("refused", flow.request.host, flow.request.port, how, "broker-stopping")
+        flow.metadata[STATE] = "refused"
+        flow.request.stream = False
+        if flow.killable:
+            flow.kill()
+        return True
+
     def http_connect(self, flow: http.HTTPFlow) -> None:
         """A program in the VM asks for a tunnel to host:port."""
+        if self.stopping(flow, "connect"):
+            return
         if flow.client_conn.id in self.tunnels:
             # A tunnel asked for inside a tunnel. Nothing honest does that,
             # and it would change where the outer tunnel leads.
@@ -723,12 +749,13 @@ class Broker:
                 flow.request.port,
             )
 
-    def running(self) -> None:
-        """mitmproxy has started. Check its settings once more.
+    def check_settings(self) -> None:
+        """Stop the broker if mitmproxy's settings are not what it allows.
 
-        start() below has checked them already, before the broker listened.
-        By now mitmproxy has read everything it reads at start, so this is
-        the check of what it really runs with. See settings.py.
+        start() below makes the same check before the broker listens, and
+        does not start it if the check fails. This is for what happens
+        after that. From here the broker cannot simply not start, so it
+        refuses every connection from now on and tells mitmproxy to end.
         """
         problems = settings_problems()
         if problems:
@@ -742,6 +769,26 @@ class Broker:
                 flush=True,
             )
             ctx.master.shutdown()
+
+    def running(self) -> None:
+        """mitmproxy has started. Check its settings once more.
+
+        By now mitmproxy has read everything it reads at start, so this is
+        the check of what it really runs with. A settings file that appeared
+        in its folder after start() looked is found here. See settings.py.
+        """
+        self.check_settings()
+
+    def configure(self, updated: set[str]) -> None:
+        """One of mitmproxy's settings was changed. Check them again.
+
+        mitmproxy calls this whenever a setting changes, also long after
+        the start: another script, or a command given to mitmproxy while it
+        runs, can change one. A setting such as `modify_headers`, turned on
+        an hour in, would rewrite requests after the broker judged them
+        just as it would from the start.
+        """
+        self.check_settings()
 
     def client_connected(self, client: connection.Client) -> None:
         """A program in the VM connects. Refuse it when there are too many."""
@@ -781,6 +828,15 @@ class Broker:
         for name, value in request.headers.fields:
             if any(mark in part for part in (name, value) for mark in (b"\r", b"\n")):
                 return "odd-header"
+        # Nor any other byte outside plain ASCII: programs disagree about
+        # what such a byte in a header means. See swap.headers_are_plain.
+        if not swap.headers_are_plain(
+            [
+                (name.decode("latin-1"), value.decode("latin-1"))
+                for name, value in request.headers.fields
+            ]
+        ):
+            return "odd-header"
         if "trailer" in request.headers:
             return "trailers"
         if "upgrade" in request.headers:
@@ -810,6 +866,8 @@ class Broker:
         with a body that never ends. The first lines themselves are bounded
         before this method is called, by limits.py.
         """
+        if self.stopping(flow, "http"):
+            return
         tunnel = self.tunnels.get(flow.client_conn.id)
         if tunnel is None:
             host, port = flow.request.host, flow.request.port
@@ -905,6 +963,10 @@ class Broker:
             self.refuse(flow, "https", "body-not-read", method, path)
         elif when == "after-body":
             # The request is decided on and passed on from request() below.
+            # Nothing of it may be sent before that. mitmproxy may have
+            # chosen to pass the body on in pieces, by a setting of its
+            # own, before the broker was asked; that is undone here.
+            flow.request.stream = False
             flow.metadata[STATE] = "reading"
         elif self.pass_on(flow, body=None):
             flow.request.stream = True
@@ -937,6 +999,8 @@ class Broker:
         tunnel was opened for, which opened_request() has checked against
         the name in the encrypted connection and in the Host header.
         """
+        if self.stopping(flow, "https"):
+            return False
         request = flow.request
         host = request.host.lower()
         method, target = as_sent(request)
@@ -1123,6 +1187,8 @@ class Broker:
         address = data.server.address
         host, port = (address[0], address[1]) if address else ("-", 0)
         reason = "no-address" if address is None else self.refusal(host, port)
+        if self.blocked:
+            reason = "broker-stopping"
         if reason is None and self.rules[host.lower()].inspect:
             if data.server.tls:
                 data.server.sni = host.lower()
@@ -1195,6 +1261,23 @@ def start() -> Broker:
             flush=True,
         )
         # Carrying on would mean a broker whose memory the VM can fill.
+        sys.exit(1)
+
+    # The variables this process was started with. mitmproxy has read some
+    # of them already, so all that is left is not to run.
+    problems = settings.unreviewed_environment(os.environ)
+    if problems:
+        print(
+            "broker: not starting, because of what is in its environment.",
+            *(f"broker: {problem}" for problem in problems),
+            "broker: mitmproxy, Python and the TLS library read variables that "
+            "change what they do or make them write data to a file. Start the "
+            "broker with `nix run .#broker`, which gives it an environment of "
+            "its own. broker/settings.py in the nixt3 repo has the list.",
+            sep="\n",
+            file=sys.stderr,
+            flush=True,
+        )
         sys.exit(1)
 
     problems = settings_problems()
