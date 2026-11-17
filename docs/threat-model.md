@@ -5,16 +5,12 @@ It says what is protected, who the attacker is, what stops them, and what
 does not stop them. The last part has the same weight as the rest. Read it
 before you rely on this.
 
-It describes the code on `main` after phase 4: the VM, the network lock, and
-GitHub through the broker with the token kept on the Mac. The plan is in
-[PLAN.md](../PLAN.md).
+It describes the code after phase 5: the VM, the network lock, GitHub
+through the broker with the token kept on the Mac, and the rules for which
+requests to GitHub the broker lets out. The plan is in [PLAN.md](../PLAN.md).
 
-Two things are not finished, and each is described in one place below:
-
-- The rules for what the agent may do on GitHub are written but not in use.
-  See [GitHub rules: built, not yet enforced](#github-rules-built-not-yet-enforced).
-- The check with a real GitHub token has not been run. See
-  [What has not been run](#what-has-not-been-run).
+One thing is not finished: the check with a real GitHub token has not been
+run. See [What has not been run](#what-has-not-been-run).
 
 ## Words used on this page
 
@@ -35,9 +31,13 @@ Two things are not finished, and each is described in one place below:
 - **Holds today:** a program in the VM cannot reach the Mac's files, the
   Mac's own services, your home network, or any host that is not on a list
   of five. It can use GitHub with your token without being able to read the
-  token. `nix run .#check` and `tests/github-broker.sh` test most of this.
-- **Does not hold:** the listed hosts are still a way to send data out. On
-  GitHub the agent can do everything your token allows. The Claude sign-in
+  token, and only for the repos the rules list: a request about another
+  repo, or one that changes a repo's settings, secrets or access, does not
+  leave the Mac. `nix run .#check` and `tests/github-broker.sh` test most
+  of this.
+- **Does not hold:** the listed hosts are still a way to send data out. In a
+  repo the rules list for writing, the agent can push and write whatever it
+  likes; what is inside a push is not looked at. The Claude sign-in
   is inside the VM and can be used or copied. Any program on the Mac can use
   the token through the broker's port. The broker and QEMU are ordinary
   programs on the Mac that run with your rights, and a bug in either is a
@@ -106,11 +106,14 @@ The last column of each table says what proves the claim:
 | By hand | Looked at once by hand. No check repeats it. |
 | Nothing | The claim rests on reading the code |
 
-All three were done on 2026-11-17, on `main` at commit `a0ad1a0`.
-`nix run .#check` passed every check, `tests/github-broker.sh` passed all
-103, and the 2139 unit tests in `tests/unit/` passed. "By hand" was done on
-the running VM, which was the build of that commit. The token on the Mac was
-a made-up one that day.
+All three were done on 2026-11-17. The rows about the lock and the token
+were done on `main` at commit `a0ad1a0`, and "by hand" on the running VM,
+which was the build of that commit. The tests were run again on the commit
+that put the GitHub rules to use: `nix run .#check` passed every check,
+`tests/github-broker.sh` has 219 checks, and the 2281 unit tests in
+`tests/unit/` passed. One of the 219, "a first TLS message that never ends:
+logged", sometimes fails when the Mac is busy; it waits three seconds for a
+line in the log. The token on the Mac was a made-up one that day.
 
 ### Going around the broker
 
@@ -172,11 +175,13 @@ the broker puts the real token in its place on the way out. This is in
 | Read the token in the broker's log | Headers are not logged. Everything the broker process writes also passes a filter that replaces the token. | Mac test: "the token is in no log and no file of the broker", "a token in a line that mitmproxy wrote is replaced" |
 | Use another login on GitHub: a token of the attacker's own, or one found on a web page | Refused, not removed. Cookies are left out of the request. | "a request with any other token is refused by the broker"; Mac test: "another token is refused and never leaves", "a cookie is left out" |
 | Hide a second login in a header that runs over two lines | A header with a line break is refused | Mac test: "a login on a continuation line", "a login after a lone carriage return" |
-| Claim another method or host in a header such as `X-HTTP-Method-Override` | Such headers are left out | Mac test: "headers that claim another method or host are left out" |
+| Claim another host or sender in a header such as `X-Forwarded-Host` | Such headers are left out | Mac test: "headers that claim another host or sender are left out" |
+| Claim another method in a header such as `X-HTTP-Method-Override` | Refused | Mac test: "a header that asks for another method than the one sent is refused" |
+| Name headers in a `Connection` header, for GitHub's own servers to drop after the broker has judged the request | A `Connection` header may say `close` or `keep-alive` only | Mac test: "a Connection header that names other headers to drop" |
 | Switch the connection to another protocol, or send lines after the body | Refused | Mac test: "a request to switch to another protocol is refused", "a request that announces trailers is refused before anything is sent" |
 
 What these rows do **not** say: which requests may go out with the token.
-Today all of them do. See the next section but one.
+That is [GitHub rules: in use](#github-rules-in-use), below.
 
 ### Filling the Mac's memory through the broker
 
@@ -196,7 +201,8 @@ This bounds the broker's memory. It does not bound how much the VM sends
 | The attacker tries | What stops it | Proof |
 | --- | --- | --- |
 | Edit `rules.yaml` | It is on the Mac. Nothing on the Mac is shared with the VM. | "no folder is shared with the Mac" |
-| Have the broker start with a rules file that is missing or wrong | `start` in `proxy.py` exits, and `nix run .#vm` then does not start the VM | Nothing. It cannot be tested from inside the VM, and no other test does. |
+| Have the broker start with a rules file that is missing or wrong | `start` in `proxy.py` exits, and `nix run .#vm` then does not start the VM | Mac test, for the part about GitHub: "rules without a github part", "a mistake in the github part", "an opened host that is not GitHub". Nothing for the rest of the file, and nothing shows that the VM is then not started. |
+| Have mitmproxy change a request after the broker judged it, through one of mitmproxy's own settings or a settings file in the broker's folder | The broker does not start with a setting it does not know, or with such a file ([`broker/settings.py`](../broker/settings.py)). The folder is on the Mac, so this takes a program that already runs as you. | Mac test: "a settings file in the broker's folder", "a setting that sends a request elsewhere after it was judged (map_remote)", and ten more |
 | Have the broker start without its token | `fetch_tokens.py` and `receive_tokens` stop the start | Mac test: "Starting without what it needs" |
 | Slip a rule in through a typing mistake | `load_rules` rejects unknown keys, wildcards, addresses and a missing `note` | Nothing |
 | Write false lines into the broker's log | `_clean` turns spaces and unprintable characters into `_` and `?`, and cuts a field at 255 characters | Nothing |
@@ -235,34 +241,48 @@ and passwords. This is in `users.users.agent` and `services.openssh` in
   **not** what protects the Mac. A bug in Linux that makes `agent` into
   `root` changes little: the lock is outside the VM.
 
-## GitHub rules: built, not yet enforced
+## GitHub rules: in use
 
-> **Update this section when the rules are put to use.** It is the one place
-> on this page that describes their state.
+The broker adds your token to what it lets through to GitHub, so it also
+decides what that is. [`broker/github_policy.py`](../broker/github_policy.py)
+makes the decision for every request to `github.com` and `api.github.com`,
+before the token is put in and before anything is sent.
+[github-rules.md](github-rules.md) says what is allowed and why. The rules
+list one repo, `madshermansen/nixt3`, for writing; merging and reading other
+repos are off.
 
-[`broker/github_policy.py`](../broker/github_policy.py) decides which
-requests to GitHub may go out: which repos, and which actions on them. It is
-described in [github-rules.md](github-rules.md) and has its own tests in
-`tests/unit/`.
+| The attacker tries | What stops it | Proof |
+| --- | --- | --- |
+| Read or clone a repo that is not listed, with your token | Refused; the request does not leave the Mac | "git: a repo that is not listed is refused, and git shows the broker's reason", "the API: a repo that is not listed is refused with the broker's reason"; Mac test: "fetch from a repo that is not listed", "read a repo that is not listed" |
+| Push to a repo that is not listed, or comment there, to carry data out | Refused | Mac test: "push to a repo that is not listed", "comment in a repo that is not listed", "an upload to a repo that is not listed is cut off" |
+| Change a listed repo's settings, read its secrets, delete it, merge | Refused on every repo | "changing the listed repo's settings is refused", "reading the listed repo's secrets is refused"; Mac test: "delete the listed repo", "merge a pull request, which the rules leave off" |
+| Name the target by an id that claims a listed repo | A change that names its target only by such an id is refused | "a change by the id of a pull request is refused, and the refusal names the gh api line to use"; Mac test: "comment by a forged id that claims the listed repo" |
+| Ask through GraphQL for something reached from a listed repo: its owner's other repos, the repo it was forked from | Only what is on a list may be read | Mac test: "a query that walks from the listed repo to its owner's other repos", and two more |
+| Spell the address so that the broker reads one repo and GitHub another: `..`, encoded dots, a doubled slash, a `#` | Refused, not put right. The policy is given the address as it was sent. | Mac test: "an address that climbs out of the listed repo with ..", "a # in the path, followed by a way out of the listed repo", and seven more |
+| Spell the method in small letters, so that it is judged as one method and sent as another | The broker reads the bytes that are sent on, not mitmproxy's tidied view of them, and refuses a method that is not in capitals | Mac test: "a method in small letters: get", "delete, on a comment", and four more |
+| Send an allowed request, then a refused one over the same connection | Each request is decided by itself | Mac test: "git: a listed repo, then an unlisted one, on one connection", and five more |
+| Hide what a request changes in a body the broker does not read: a large one, a compressed one, one sent in pieces | A request to the API whose body cannot be read in full is refused | Mac test: "A body the policy needs but cannot read", six checks |
+| Use the token without the placeholder, or get it added to a read of someone else's repo | The token goes in only where the request carried the placeholder and the policy allows the token. Where reading unlisted repos is turned on, those requests go out with no login at all. | Mac test: "With 'other_repos: read-public'", ten checks. It is off in the rules. |
+| Make the code that asks the policy fail, so that the request goes out unjudged | An error there ends in a refusal | Mac test: "request fails: nothing reaches the server", "the policy call fails for a git request: nothing reaches the server" |
+| Start a broker that opens GitHub without rules for it | The broker does not start | Mac test: "rules without a github part: the broker does not start" |
 
-**The broker does not call it yet.** The place where it will be called is the
-method `policy` in `proxy.py`, which today allows every request. The rules
-file also does not accept the `github:` part that page describes; a broker
-given one does not start.
+What the rules do not stop is in [github-rules.md](github-rules.md), under
+"What the broker cannot see or enforce". The parts that matter most here:
 
-What this means today:
+- **What is inside a push.** Which branch, a rewritten history, a changed
+  workflow file. Protect `main` on GitHub, and use a token without the
+  Workflows permission.
+- **What the repo does in response:** Actions workflows, bots.
+- **A listed repo is a way out for data.** The agent can push to it and
+  comment in it. If it is public, so is what the agent puts there.
+- **The token is still the second limit.** Give the broker a fine-grained
+  token for the repos the agent works on. [setup.md](setup.md) has the
+  steps.
 
-- **The agent can do on GitHub everything the token allows.** Push to any
-  repo the token reaches, read private repos, change settings, write
-  secrets, delete a repo, if the token may.
-- **The token is the only limit.** Give the broker a fine-grained token for
-  the repos the agent works on, with as few permissions as the work needs.
-  [setup.md](setup.md) has the steps.
-
-What changes when the rules are in use: a request to a repo that is not
-listed, or for an action that is refused on every repo, does not leave the
-Mac. [github-rules.md](github-rules.md) also lists what the rules will still
-not see, such as what is inside a push.
+Two things about the proof. The rules were written and tested against
+GitHub's documentation and against requests recorded from `gh` 2.102; the VM
+has `gh` 2.104. And none of it has been run against the real GitHub with a
+real token; see [What has not been run](#what-has-not-been-run).
 
 ## What does not stop them
 
@@ -276,9 +296,10 @@ can send anything it can read to any of them.
   unread, so the broker cannot see whose account a request uses. The
   attacker can bring a key of their own and send data to their own account.
 - **To GitHub, as you.** A login other than the placeholder is refused, so
-  the attacker cannot use an account of their own there. They can use yours:
-  anything the token may write to is a place to put data. If that place is
-  public, so is the data.
+  the attacker cannot use an account of their own there. They can use
+  yours, in the repos the rules list for writing: a branch, a pull request
+  and a comment there are places to put data. If the repo is public, so is
+  the data.
 - **A listed host can act for the VM.** The list limits which hosts the VM
   connects to. It does not limit where the data ends up after that.
   Anthropic's API has tools that run on Anthropic's machines; its
@@ -325,7 +346,8 @@ adds the token for anyone who sends the placeholder, and the placeholder is
 public.
 
 - While the broker runs, any program on the Mac can act on GitHub with your
-  token, without asking your password manager.
+  token, without asking your password manager. The rules for GitHub apply
+  to it as they do to the VM: listed repos, allowed actions.
 - That includes a thread that runs on the Mac outside the VM. See
   [local-threads.md](local-threads.md).
 - Nothing here prevents it. The VM cannot reach the port except through its
@@ -334,9 +356,11 @@ public.
 ### The broker runs with your rights
 
 The broker is the one program on the Mac that reads what the VM sends. It is
-mitmproxy, a large program, with about 1600 lines of this project's own code
-in `proxy.py`, `swap.py` and `limits.py`. `limits.py` changes three of
-mitmproxy's own functions while it runs. A bug that lets hostile input run
+mitmproxy, a large program, with about 4800 lines of this project's own code
+in `proxy.py`, `swap.py`, `limits.py`, `settings.py`, `github_request.py`
+and `github_policy.py`. The last is more than half of that, and reads
+requests and a small language (GraphQL) that the VM writes. `limits.py`
+changes three of mitmproxy's own functions while it runs. A bug that lets hostile input run
 code would run it as you, with all your files and keys in reach, and with the
 token in the same memory.
 
@@ -456,7 +480,8 @@ Every row above marked "Nothing", in one list:
 - The last gate in `server_connect`.
 - That a server with a wrong certificate gets no token.
 - The limit of 256 connections.
-- That a rules file with a mistake stops the broker and the VM from starting.
+- That a rules file with a mistake stops the VM from starting, and, for the
+  part of the file that is not about GitHub, the broker.
 - The cleaning of log lines.
 - The test of who holds the broker's port, which is weak as well.
 - That the start command and the VM refuse a private key in place of the
@@ -480,6 +505,11 @@ And these, which no test can show:
   stand-in on the Mac. `nix run .#check` says so in a note. The two searches
   for a token in the VM passed while no real token existed, so they have not
   yet had anything to find.
+- **The same goes for the GitHub rules.** That an allowed request is one
+  GitHub accepts, and that `gh pr create` gets through from start to end,
+  is not shown: with a made-up token GitHub answers "Bad credentials" to
+  the first request. What is shown is that refused requests do not leave,
+  and that allowed ones leave as they were judged.
 
 ## How planned work changes this
 
@@ -492,14 +522,16 @@ And these, which no test can show:
 
 - Use a fine-grained GitHub token for the repos the agent works on, and
   protect `main` there.
-- Keep the list in `rules.yaml` short. Every host is a way out.
+- Keep the list in `rules.yaml` short. Every host is a way out, and so is
+  every repo listed for writing.
 - Put in the VM only the code the task needs.
 - Stop the broker when you do not use the VM: `nix run .#stop`. The token is
   within reach of every program on the Mac only while it runs.
 - Start the VM from a clean shell, without `QEMU_OPTS` set.
 - Read what the agent produced before you run it on the Mac or merge it.
 - Watch `nix run .#logs` now and then. A `refused` line for a host you do
-  not know, or with the reason `other-login`, is worth a look.
+  not know, or with the reason `other-login` or `repo-not-listed`, is worth
+  a look.
 - If you think the VM was taken over: stop it, delete the state folder,
   revoke the GitHub token, and revoke the Claude sign-in that was in the VM
   from your Claude account. The steps for the last were not checked for this

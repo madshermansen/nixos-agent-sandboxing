@@ -18,7 +18,7 @@ marked **inferred** gives a reason that fits the code but is written down
 nowhere. Add a new entry when a decision is made; do not rewrite old ones,
 add a note to them.
 
-This page describes `main` after phase 4. Words such as "tunnel", "opened"
+This page describes the code after phase 5. Words such as "tunnel", "opened"
 and "fails closed" are explained in the word list at the top of
 [threat-model.md](threat-model.md#words-used-on-this-page).
 
@@ -169,7 +169,12 @@ and "fails closed" are explained in the word list at the top of
   see what is sent or whose account is used. See
   [threat-model.md](threat-model.md).
 - **History:** in phase 3 nothing was opened.
-- **Where:** the comments in [`broker/rules.yaml`](../broker/rules.yaml).
+- **Note, phase 5:** only `github.com` and `api.github.com` *can* be marked
+  now. The broker does not start when another host is, because it has rules
+  for what may be sent to those two only, and adds a token to what it lets
+  through. A second service needs rules of its own first.
+- **Where:** the comments in [`broker/rules.yaml`](../broker/rules.yaml);
+  `load_policy` in `broker/github_request.py`.
 
 ### Opened traffic is read as HTTP/1.1 only
 
@@ -264,6 +269,11 @@ and "fails closed" are explained in the word list at the top of
     by themselves when something fails, and those lines do not pass the
     broker's own code.
   - Why nothing more is logged: reason not recorded.
+- **Note, phase 5:** an allowed request to GitHub is also logged with what
+  the rules found it to be (`git-read`, `api-write`, ...), and a refused one
+  with the rules' reason (`repo-not-listed`, ...). The method is logged in
+  the letters it was sent in. The text that a refusal gives the agent is
+  never logged, because it can repeat part of the request.
 - **Where:** `log` and `scrub_output` in `broker/proxy.py`; `split_path` in
   `broker/swap.py`.
 
@@ -432,19 +442,107 @@ and "fails closed" are explained in the word list at the top of
 
 ### Which GitHub requests go out: allowed if known
 
-> **Update this entry when the rules are put to use.** It is the one place
-> on this page that describes their state.
-
 - **Chosen:** a request to GitHub goes out only when the broker recognises
   it as a kind that is allowed, for a repo that is listed. Everything else
   is refused, including harmless requests nobody thought of.
 - **Not chosen:** refusing only what is known to be bad.
 - **Why, and the choices inside it:** see [github-rules.md](github-rules.md).
-- **State:** built in `broker/github_policy.py` with its own tests, and
-  **not yet enforced**. The broker does not call it; today every request
-  with the placeholder goes out with the token.
-- **Where:** [github-rules.md](github-rules.md); `policy` in
-  `broker/proxy.py`.
+- **State:** in use since phase 5. `broker/github_policy.py` decides, and
+  the broker asks it about every request to GitHub before the token is put
+  in. The rules list one repo, `madshermansen/nixt3`, for writing; merging
+  and reading other repos are off. A broker whose rules open a GitHub host
+  without a `github` part does not start. Not yet run against the real
+  GitHub with a real token.
+- **Where:** [github-rules.md](github-rules.md); `pass_on` in
+  `broker/proxy.py`; `broker/github_request.py`.
+
+### The rules are given the bytes that are sent
+
+- **Chosen:** the rules judge the method, the address and the headers as the
+  bytes that arrived and that are sent on, each byte read as one character.
+  A request in an odd spelling is refused, not put right: a method that is
+  not in capitals, a `#` in the address, `..` in a path.
+- **Not chosen:** the convenient form mitmproxy offers to a script, or
+  tidying a request and passing the tidy form on.
+- **Why:** if the broker judges one thing and sends another, the difference
+  is a way around the rules. mitmproxy's `request.method` is in upper case
+  whatever was sent, so `delete /repos/...` was judged as DELETE and left as
+  `delete`, with the token. A review found it. Refusing is safer than
+  tidying because the broker then never has to guess how GitHub reads an
+  odd request.
+- **The one exception:** a body in JSON is sent as the rules wrote it out
+  again from what they read, so that GitHub reads exactly what was judged.
+  Two programs can read a sloppy JSON text in two ways. A number may change
+  its spelling on the way (`1e2` leaves as `100.0`).
+- **Where:** `as_sent` and `pass_on` in `broker/proxy.py`; `_fresh` in
+  `broker/github_policy.py`.
+
+### A request without a login is not given the token
+
+- **Chosen:** the token goes in only where a request carried the
+  placeholder and the rules allow the token. A request without a login goes
+  out without one. Where the rules allow a request only without the token
+  (reading a repo that is not listed, which is off), the login is removed,
+  placeholder included.
+- **Not chosen:** adding the token to every request the rules allow.
+- **Why:** it keeps what was decided in phase 4: the program in the VM
+  chooses to log in, and the broker does not do it for it. git asks without
+  a login first and logs in when GitHub wants one, which works as before.
+- **Where:** `plan` in `broker/github_request.py`.
+
+### A refusal is worded for the program that gets it
+
+- **Chosen:** the text of a refusal is the same for every program, but it
+  is wrapped three ways. For git: a 403 in plain text. For the REST API: a
+  403 with JSON that has a `message`. For GraphQL: the status 200 with
+  `errors` in place of data, which is how GraphQL itself refuses.
+- **Not chosen:** one plain-text 403 for all.
+- **Why:** the text is where the agent is told what to do instead, and each
+  program shows only what it expects. `gh` showed only the status line of a
+  plain-text 403, and the `gh pr` commands that change something printed
+  the JSON of a 403 as one line with every line break escaped. Each form
+  was tried with the real `gh` (2.102 on the Mac, 2.104 in the VM).
+- **Cost:** a refused GraphQL request has the status 200. Every GraphQL
+  client has to read `errors` anyway, because that is how the real API
+  reports them. The broker's log says `refused` in every case.
+- **Where:** `refusal_answer` in `broker/github_request.py`.
+
+### The broker runs only with settings it knows
+
+- **Chosen:** the broker does not start when mitmproxy's folder holds a
+  settings file, or when any of mitmproxy's settings differs from what the
+  start command sets. The list is short: six settings with one allowed
+  value each, and seven that may have any value. Every other setting must
+  be untouched.
+- **Not chosen:** a list of the settings that are dangerous.
+- **Why:** several of mitmproxy's settings change a request after the
+  broker has judged it (`map_remote`, `modify_headers`, an upstream proxy),
+  and mitmproxy reads `config.yaml` from its folder without being asked. A
+  review sent a listed git read to another repo that way, with the token.
+  "Untouched unless listed" also covers a setting that a later mitmproxy
+  adds. Only a program that already runs as you can write to that folder,
+  which is outside what this project defends against; the check is there
+  so that the broker never runs with settings nobody chose.
+- **Cost:** a new `--set` in the start command needs an entry in
+  `broker/settings.py`, or the broker does not start. A unit test compares
+  the two.
+- **Where:** [`broker/settings.py`](../broker/settings.py); `start` and
+  `running` in `broker/proxy.py`.
+
+### The stand-in test uses GitHub's real names
+
+- **Chosen:** `tests/github-broker.sh` sends its requests to `github.com`
+  and `api.github.com`, through a broker with this repo's own rules. A
+  script loaded only by the test changes one thing, at the last step: the
+  address the broker's connection goes to.
+- **Not chosen:** a test host name that the broker or the rules would have
+  to know about.
+- **Why:** the rules go by the host's name and refuse every other. A test
+  that taught them a second name would test something that does not run
+  for real. This way the broker and the rules run unchanged. The script
+  refuses every connection it does not redirect, so a mistake in the test
+  cannot reach the real GitHub.
+- **Where:** the top of [`tests/github-broker.sh`](../tests/github-broker.sh).
 
 ### The Claude sign-in lives in the VM (open)
 
