@@ -102,6 +102,12 @@ and T3's data.
 
 ## What this does not protect against
 
+This is the short list. [threat-model.md](threat-model.md) is the full
+version: each thing an attacker can try, what stops it, and what proves it.
+The reasons behind the design are in [decisions.md](decisions.md), and
+threads that run on the Mac itself are covered in
+[local-threads.md](local-threads.md).
+
 - **An allowed destination is still a way out.** The agent can send data to
   any listed host, for example to someone else's repo on GitHub. The lock
   narrows where data can go; it does not stop it.

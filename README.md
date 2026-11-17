@@ -36,5 +36,8 @@ Claude also needs a one-time sign-in inside the VM. The steps are in
 | --- | --- |
 | [docs/setup.md](docs/setup.md) | Getting it running, day-to-day commands, problems |
 | [docs/architecture.md](docs/architecture.md) | The parts, what crosses between Mac and VM, the target design |
+| [docs/threat-model.md](docs/threat-model.md) | What is protected, what stops an attacker, and what does not |
+| [docs/decisions.md](docs/decisions.md) | The choices made so far, the alternatives and the reasons |
+| [docs/local-threads.md](docs/local-threads.md) | Claude Code's own sandbox, for threads that run on the Mac itself |
 | [PLAN.md](PLAN.md) | The phases and the risks |
 | [CLAUDE.md](CLAUDE.md) | Instructions for agents working on this repo |

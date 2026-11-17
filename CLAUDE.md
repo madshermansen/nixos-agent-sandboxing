@@ -40,7 +40,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `darwin/commands.nix` | The Mac-side commands behind every `nix run .#…` |
 | `darwin/default.nix` | nix-darwin module for the Mac |
 | `tests/network-lock.sh` | Checks run inside the VM by `nix run .#check` |
-| `docs/` | Setup, architecture, diagrams |
+| `docs/` | Setup, architecture, the threat model (`threat-model.md`), the decision log (`decisions.md`), advice for threads on the Mac (`local-threads.md`), diagrams |
 
 ## Commands
 
