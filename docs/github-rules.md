@@ -414,8 +414,9 @@ Refused for their spelling, whatever they ask for:
   host that names another in its `Host` header is refused, because GitHub
   goes by that name.
 - **Bodies** that are compressed, larger than 1 MiB, not UTF-8, not one JSON
-  object, without `Content-Type: application/json`, or with a name used
-  twice. Two programs can read such a body in two ways. A body that was
+  object, without `Content-Type: application/json`, with a name used twice,
+  or with the character U+0000 or half a surrogate pair in a name or a
+  text. Two programs can read such a body in two ways. A body that was
   judged is sent on freshly written out from what the broker read, so GitHub
   gets exactly what was judged.
 - **GraphQL** text that cannot be read; a body with several requests in it;

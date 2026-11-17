@@ -472,6 +472,26 @@ def test_a_request_that_names_no_host_is_refused():
     assert (result.allowed, result.reason) == (False, "host-differs")
 
 
+def test_the_broker_hands_over_the_bytes_and_not_mitmproxys_view_of_them():
+    """proxy.py cannot be loaded here, so this reads it.
+
+    The part that asks the policy must take the method, the address and the
+    headers from the bytes mitmproxy holds (`request.data`, and the header
+    `fields`), not from the accessors mitmproxy offers for convenience:
+    `request.method` is in upper case whatever was sent, and the header
+    accessors decode. A request that passes is the same either way since
+    headers outside plain ASCII are refused, so no request can show the
+    difference; this keeps the next change from bringing it back.
+    """
+    source = (REPO / "broker/proxy.py").read_text()
+    start = source.index("    def pass_on(")
+    asks = source[start : source.index("\n    def ", start + 1)]
+    assert "request.headers.fields" in asks and "as_sent(request)" in asks
+    for convenient in ("request.method", "request.path", "host_header", "= request.authority",
+                       ".items(", "get_all(", "request.url", "pretty_"):  # fmt: skip
+        assert convenient not in asks, convenient
+
+
 # --- Repos that are not listed, when reading them is allowed --------------------------
 
 

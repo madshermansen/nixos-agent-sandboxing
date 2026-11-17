@@ -223,15 +223,30 @@ that ask to switch to another protocol (`Upgrade`, as WebSocket does) or
 that carry lines after their body (trailers) are refused. So is a
 `Connection` header that says more than `close` or `keep-alive`: it can
 name other headers for the next server to drop, after the broker has judged
-the request with them.
+the request with them. `Proxy-Connection`, `Keep-Alive` and `TE`, which are
+about the connection to the next server as well, are left out. And a header
+whose name or value holds a byte outside plain ASCII is refused: programs
+disagree about what such a byte means, and no real program sends one.
 
 **The broker's own settings.** mitmproxy, the program the broker is a script
 for, has about a hundred settings, and some of them change a request after
 the broker has judged it: one sends it to another address, others rewrite
 its headers or body, or write the traffic to a file. mitmproxy also reads
 settings from a file in its folder without being asked. The broker refuses
-to start when that file is there, or when any setting differs from what the
-start command sets. The list is in [`broker/settings.py`](../broker/settings.py).
+to start when that file is there. It also goes through every setting: eight
+must have the value the start command gives them, five may have any value
+(the port, the folder, the scripts to load, and which certificate
+authorities to believe), and every other one must be as mitmproxy has it by
+itself. It checks again whenever a setting changes while it runs, and then
+stops. The list is in [`broker/settings.py`](../broker/settings.py).
+
+The same goes for the environment, the variables a program is started with,
+because mitmproxy, Python and the TLS library read some of them and they are
+settings by another name. With `SSLKEYLOGFILE` set, as some people have it
+for Wireshark, mitmproxy writes the keys of every encrypted connection to a
+file, the one that carries the token included. The start command therefore
+gives mitmproxy an environment of three variables of its own making, and
+the broker refuses to start with any variable that is not on its list.
 
 ### Watching the traffic
 

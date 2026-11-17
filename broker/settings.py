@@ -99,8 +99,10 @@ REQUIRED = {
     "termlog_verbosity": "error",
 }
 
-# Settings that may have any value. None of them changes what happens to a
-# request after the broker has judged it.
+# Settings that may have any value. The first two say where the broker
+# listens and keeps its files. The others are for whoever starts the broker
+# to choose, on the command line: a script can do anything, and a
+# certificate authority decides which servers are believed.
 FREE = frozenset(
     {
         # Where the broker listens and keeps its files.

@@ -208,11 +208,29 @@ The reply should name Linux and the host `agent-vm`.
   connection: a listed request may be followed by an unlisted one on the
   same connection.
 - **The broker runs only with mitmproxy settings it knows.** A
-  `config.yaml` or `config.yml` in the broker's folder, or any setting that
-  differs from what `darwin/commands.nix` sets, stops it from starting:
-  settings such as `map_remote` and `modify_headers` change a request after
-  it was judged. A new `--set` in the start command needs an entry in
-  `broker/settings.py`; a unit test compares the two.
+  `config.yaml` or `config.yml` in the broker's folder stops it from
+  starting. So does a setting that is not as `broker/settings.py` wants it:
+  eight must have the value `darwin/commands.nix` gives them, five may have
+  any value, every other must be at mitmproxy's default. Settings such as
+  `map_remote` and `modify_headers` change a request after it was judged.
+  The `configure` hook checks again whenever a setting changes, and stops
+  the broker. A new `--set` in the start command needs an entry in
+  `settings.py`; a unit test compares the two.
+- **mitmproxy gets an environment of its own.** The start command runs
+  mitmdump under `env -i` with three variables, and the broker refuses to
+  start with any variable that is not in `ENVIRONMENT` in `settings.py`.
+  `SSLKEYLOGFILE` in the shell would otherwise make mitmproxy write the
+  keys of its connections, the token's among them, to a file. A new
+  variable for mitmdump needs an entry there. The token fetcher still runs
+  with the shell's environment, because the password manager needs it.
+- **`stream_large_bodies` must stay `1m`,** equal to what the broker reads
+  in full. mitmproxy passes a larger body on before the broker is asked.
+  The broker also sets `flow.request.stream = False` for every request it
+  refuses or reads first; keep both.
+- **A header with a byte outside plain ASCII is refused** on opened hosts
+  (`odd-header`). The policy strips more than HTTP's white space from a
+  value before reading it, so such a byte could be judged away and still
+  be sent.
 - **A `Connection` header may say `close` or `keep-alive` only** on opened
   hosts. Anything else can name headers for GitHub's front servers to drop.
 - **The API is decided after the body, git before it.** For
@@ -224,8 +242,9 @@ The reply should name Linux and the host `agent-vm`.
   where the agent is told which `gh api` line to use instead, and each
   program shows only what it expects. For git: a 403 in plain text, shown
   as `remote:` lines. For the REST API: a 403 with JSON that has a
-  `message`, as GitHub's own errors are; `gh api` shows it. For
-  `POST /graphql`: the status 200 with `errors` in place of data, as
+  `message`, as GitHub's own errors are; `gh api` shows it. For the
+  address `/graphql`, whatever the method and the reason: the status 200
+  with `errors` in place of data, as
   GraphQL itself refuses; the `gh pr` commands print the body of a 403 as
   one escaped line, and this form cleanly. `refusal_answer()` in
   `github_request.py`; each form was tried with the real `gh`.

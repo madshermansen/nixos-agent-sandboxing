@@ -510,10 +510,14 @@ and "fails closed" are explained in the word list at the top of
 ### The broker runs only with settings it knows
 
 - **Chosen:** the broker does not start when mitmproxy's folder holds a
-  settings file, or when any of mitmproxy's settings differs from what the
-  start command sets. The list is short: six settings with one allowed
-  value each, and seven that may have any value. Every other setting must
-  be untouched.
+  settings file, or when one of mitmproxy's settings is not as the broker
+  wants it. The list is short: eight settings must have the value the start
+  command gives them, and five may have any value (the port, the folder,
+  the scripts to load, and which certificate authorities to believe).
+  Every other setting must be untouched. The broker checks again whenever
+  a setting changes while it runs, and then stops. The environment is
+  treated the same way: the start command gives mitmproxy three variables
+  of its own making, and the broker refuses any that is not on its list.
 - **Not chosen:** a list of the settings that are dangerous.
 - **Why:** several of mitmproxy's settings change a request after the
   broker has judged it (`map_remote`, `modify_headers`, an upstream proxy),
@@ -523,11 +527,20 @@ and "fails closed" are explained in the word list at the top of
   adds. Only a program that already runs as you can write to that folder,
   which is outside what this project defends against; the check is there
   so that the broker never runs with settings nobody chose.
-- **Cost:** a new `--set` in the start command needs an entry in
-  `broker/settings.py`, or the broker does not start. A unit test compares
-  the two.
-- **Where:** [`broker/settings.py`](../broker/settings.py); `start` and
-  `running` in `broker/proxy.py`.
+  - The environment is not only a matter of someone hostile.
+    `SSLKEYLOGFILE` is a variable people set for good to use Wireshark,
+    and with it mitmproxy wrote the keys of the connection that carries
+    the token to a file. A second review found that.
+  - `stream_large_bodies` has to be one value, not any: below the size the
+    broker reads in full, mitmproxy passes a body on before the broker is
+    asked. The broker does not rest on the setting alone; it takes the
+    request back from mitmproxy whenever it refuses or reads first.
+- **Cost:** a new `--set` or variable in the start command needs an entry
+  in `broker/settings.py`, or the broker does not start. A unit test
+  compares the two.
+- **Where:** [`broker/settings.py`](../broker/settings.py); `start`,
+  `running` and `configure` in `broker/proxy.py`; the broker run function
+  in `darwin/commands.nix`.
 
 ### The stand-in test uses GitHub's real names
 

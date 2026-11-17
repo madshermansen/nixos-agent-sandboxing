@@ -110,8 +110,8 @@ All three were done on 2026-11-17. The rows about the lock and the token
 were done on `main` at commit `a0ad1a0`, and "by hand" on the running VM,
 which was the build of that commit. The tests were run again on the commit
 that put the GitHub rules to use: `nix run .#check` passed every check,
-`tests/github-broker.sh` has 219 checks, and the 2281 unit tests in
-`tests/unit/` passed. One of the 219, "a first TLS message that never ends:
+`tests/github-broker.sh` has 249 checks, and the 2356 unit tests in
+`tests/unit/` passed. One of the 249, "a first TLS message that never ends:
 logged", sometimes fails when the Mac is busy; it waits three seconds for a
 line in the log. The token on the Mac was a made-up one that day.
 
@@ -176,6 +176,8 @@ the broker puts the real token in its place on the way out. This is in
 | Use another login on GitHub: a token of the attacker's own, or one found on a web page | Refused, not removed. Cookies are left out of the request. | "a request with any other token is refused by the broker"; Mac test: "another token is refused and never leaves", "a cookie is left out" |
 | Hide a second login in a header that runs over two lines | A header with a line break is refused | Mac test: "a login on a continuation line", "a login after a lone carriage return" |
 | Claim another host or sender in a header such as `X-Forwarded-Host` | Such headers are left out | Mac test: "headers that claim another host or sender are left out" |
+| Put a byte outside plain ASCII in a header, which the broker and GitHub might read differently | Refused | Mac test: "six headers with a byte outside plain ASCII are refused, and none arrives" |
+| Put U+0000 or half a surrogate pair in a name of a JSON body, so that the name reads as another one after GitHub's reader has dropped it | Refused | Nothing through the broker; unit tests of `github_policy.py` |
 | Claim another method in a header such as `X-HTTP-Method-Override` | Refused | Mac test: "a header that asks for another method than the one sent is refused" |
 | Name headers in a `Connection` header, for GitHub's own servers to drop after the broker has judged the request | A `Connection` header may say `close` or `keep-alive` only | Mac test: "a Connection header that names other headers to drop" |
 | Switch the connection to another protocol, or send lines after the body | Refused | Mac test: "a request to switch to another protocol is refused", "a request that announces trailers is refused before anything is sent" |
@@ -202,7 +204,8 @@ This bounds the broker's memory. It does not bound how much the VM sends
 | --- | --- | --- |
 | Edit `rules.yaml` | It is on the Mac. Nothing on the Mac is shared with the VM. | "no folder is shared with the Mac" |
 | Have the broker start with a rules file that is missing or wrong | `start` in `proxy.py` exits, and `nix run .#vm` then does not start the VM | Mac test, for the part about GitHub: "rules without a github part", "a mistake in the github part", "an opened host that is not GitHub". Nothing for the rest of the file, and nothing shows that the VM is then not started. |
-| Have mitmproxy change a request after the broker judged it, through one of mitmproxy's own settings or a settings file in the broker's folder | The broker does not start with a setting it does not know, or with such a file ([`broker/settings.py`](../broker/settings.py)). The folder is on the Mac, so this takes a program that already runs as you. | Mac test: "a settings file in the broker's folder", "a setting that sends a request elsewhere after it was judged (map_remote)", and ten more |
+| Have mitmproxy change a request after the broker judged it, through one of mitmproxy's own settings, a settings file in the broker's folder, or a setting changed while it runs | The broker does not start with a setting it does not know, or with such a file, and stops when a setting changes ([`broker/settings.py`](../broker/settings.py)). The folder is on the Mac, so this takes a program that already runs as you. | Mac test: "a settings file in the broker's folder", "a setting that sends a request elsewhere after it was judged (map_remote)", and ten more; "A setting that changes while the broker runs", eight checks |
+| Have mitmproxy write the keys of its encrypted connections to a file, or load code or settings, through a variable in the shell the broker is started from (`SSLKEYLOGFILE`, `PYTHONPATH`, `OPENSSL_CONF`) | The start command gives mitmproxy an environment of its own, and the broker refuses to start with a variable it does not know. Some people set `SSLKEYLOGFILE` themselves, so this is not only about an attacker. | Mac test: "the keys of the broker's connections were written nowhere", "started by hand with SSLKEYLOGFILE set", and eight more |
 | Have the broker start without its token | `fetch_tokens.py` and `receive_tokens` stop the start | Mac test: "Starting without what it needs" |
 | Slip a rule in through a typing mistake | `load_rules` rejects unknown keys, wildcards, addresses and a missing `note` | Nothing |
 | Write false lines into the broker's log | `_clean` turns spaces and unprintable characters into `_` and `?`, and cuts a field at 255 characters | Nothing |
