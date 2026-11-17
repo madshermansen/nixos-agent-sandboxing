@@ -36,6 +36,9 @@
   qemu_kvm,
   vm,
   ports,
+  # How long `nix run .#stop` waits for a VM that is still starting. It is
+  # an argument so that tests/commands.sh can make it short.
+  stopWaitSeconds ? 90,
 }:
 let
   stateDir = ''"''${AGENT_VM_STATE:-''${XDG_STATE_HOME:-$HOME/.local/state}/agent-vm}"'';
@@ -136,17 +139,30 @@ let
   vmFunctions = ''
     # Prints the process id of the running VM and succeeds, or fails when
     # there is none. QEMU writes qemu.pid itself. The file can outlive the
-    # VM, and its number may by then belong to another program, so the
-    # process is also checked to be QEMU.
+    # VM, for example across a crash or a restart of the Mac, and its number
+    # may by then belong to another program. So the process is also checked
+    # to be the QEMU of this state folder: its command line names this
+    # folder's qemu.pid. Another QEMU, such as the Linux builder, is not
+    # taken for the VM, and so never signalled.
     vm_pid() {
       local pid
       [ -f "$state/qemu.pid" ] || return 1
       pid=$(cat "$state/qemu.pid" 2>/dev/null) || return 1
       [[ $pid =~ ^[0-9]+$ ]] || return 1
       case "$(/bin/ps -ww -o command= -p "$pid" 2>/dev/null)" in
-        *qemu-system*) echo "$pid" ;;
+        *qemu-system*"-pidfile $state/qemu.pid"*) echo "$pid" ;;
         *) return 1 ;;
       esac
+    }
+
+    # Succeeds when a program has vm.lock open. The start command opens it
+    # and takes the lock as its first step, and QEMU inherits it, so this is
+    # true from the moment a start begins until the VM has ended. With no
+    # QEMU yet, it means a VM is starting. Looking does not take the lock,
+    # so it cannot get in the way of a start.
+    vm_lock_held() {
+      [ -e "$state/vm.lock" ] || return 1
+      [ -n "$(/usr/sbin/lsof -t -- "$state/vm.lock" 2>/dev/null)" ]
     }
 
     # Succeeds when the VM with process id $1 is a throwaway run. QEMU's own
@@ -340,6 +356,14 @@ let
     text = ''
       state=${stateDir}
 
+      # Without the VM's own key, ssh would try the keys in ~/.ssh instead,
+      # and so offer the user's own keys to the VM. It is not started then.
+      if [ ! -f "$state/ssh_key" ]; then
+        echo "agent-vm: there is no SSH key for the VM at $state/ssh_key." >&2
+        echo "agent-vm: \`nix run .#vm\` makes one when it first starts the VM." >&2
+        exit 1
+      fi
+
       # The VM gets a new host key whenever its disk is recreated, and it is
       # only reachable on localhost, so host keys are not remembered.
       #
@@ -409,7 +433,11 @@ lib.fix (self: {
         echo "agent-vm: passing these options to QEMU as typed: $*" >&2
       fi
 
-      if [ -f "$state/qemu.pid" ] && kill -0 "$(cat "$state/qemu.pid")" 2>/dev/null; then
+      # A qemu.pid left by a VM that ended by a crash does not count: its
+      # number may belong to another program by now. vm_pid looks at the
+      # process itself.
+      ${vmFunctions}
+      if vm_pid >/dev/null; then
         echo "agent-vm: already running. Stop it with: nix run .#stop" >&2
         exit 1
       fi
@@ -525,12 +553,30 @@ lib.fix (self: {
 
         # Unlike the normal start, this script stays until QEMU has ended, to
         # delete the layer then. It holds the lock until it is done, so the
-        # next start cannot come in between. If this script is killed, the
-        # layer is deleted by the next start or \`nix run .#stop\` instead.
-        trap 'rm -f "$state/throwaway.qcow2"; echo "agent-vm: the throwaway run has ended. What it wrote is gone." >&2' EXIT
+        # next start cannot come in between. If this script is killed the
+        # hard way, the layer is deleted by the next start or
+        # \`nix run .#stop\` instead.
         echo "agent-vm: throwaway run. Everything written in the VM is discarded when it stops." >&2
-        ${vm}/bin/run-agent-vm-vm "$@"
-        exit
+
+        # QEMU runs beside this script and not in its place, so that the
+        # script can act when it is told to end (the terminal closes, or
+        # someone ends it): it tells QEMU to end and waits for it. Only when
+        # QEMU is gone is the layer deleted and the run reported as ended.
+        # `<&0` keeps the console's keyboard, which bash would otherwise
+        # take away from a program started with `&`.
+        ${vm}/bin/run-agent-vm-vm "$@" <&0 &
+        qemu=$!
+        trap 'kill -TERM "$qemu" 2>/dev/null || true' TERM HUP INT
+        trap 'rm -f "$state/throwaway.qcow2"; echo "agent-vm: the throwaway run has ended. What it wrote is gone." >&2' EXIT
+        # `wait` also returns when one of the signals above arrives, so it is
+        # repeated until QEMU has really ended.
+        status=0
+        wait "$qemu" || status=$?
+        while kill -0 "$qemu" 2>/dev/null; do
+          status=0
+          wait "$qemu" || status=$?
+        done
+        exit "$status"
       fi
 
       exec ${vm}/bin/run-agent-vm-vm "$@"
@@ -592,8 +638,14 @@ lib.fix (self: {
   # socket, so the system shuts down cleanly. If it has not stopped after a
   # minute, QEMU is told to quit, which is like pulling the plug.
   #
-  # After a throwaway run (`nix run .#vm-fresh`) the run's disk is deleted
-  # here too, if the start command has not done so already.
+  # A VM that is still starting has no QEMU yet. This command then waits for
+  # it, up to 90 seconds, and stops it when it is there, so that "stop"
+  # leaves nothing running also when it is typed right after a start. If the
+  # start takes longer, nothing is stopped, not the broker either, which the
+  # starting VM is about to need, and the command ends with an error.
+  #
+  # What a VM that ended by itself left behind is removed here too: qemu.pid,
+  # qmp.sock, and the disk of a throwaway run (`nix run .#vm-fresh`).
   stop = writeShellApplication {
     name = "agent-vm-stop";
     runtimeInputs = [
@@ -606,56 +658,103 @@ lib.fix (self: {
       ${brokerFunctions}
       ${vmFunctions}
 
-      # Deletes the disk of a throwaway run, also one left by a run that
-      # ended by a crash. The lock is the one a VM holds for as long as it
-      # runs (see the start command). Taking it first means the disk of a VM
-      # that is running, for example one started a moment ago, is never
-      # deleted. If the lock is taken, the disk is left for its owner.
-      remove_throwaway() {
-        [ -e "$state/throwaway.qcow2" ] || return 0
-        if (exec 9>>"$state/vm.lock" && flock -n 9 && rm -f "$state/throwaway.qcow2") 2>/dev/null; then
-          echo "agent-vm: the throwaway run's disk is deleted. What that run wrote is gone." >&2
-        fi
+      # Removes what a VM that has ended can leave behind. It succeeds when
+      # it could take the lock that a VM holds from the first step of its
+      # start to its end (see the start command), and removes things only
+      # then. So nothing of a VM that is running or starting is ever
+      # removed, and failing means: a VM is running or starting.
+      tidy() {
+        [ -d "$state" ] || return 0
+        (
+          exec 9>>"$state/vm.lock" || exit 1
+          flock -n 9 || exit 1
+          rm -f "$state/qemu.pid" "$state/qmp.sock"
+          if [ -e "$state/throwaway.qcow2" ]; then
+            rm -f "$state/throwaway.qcow2"
+            echo "agent-vm: the throwaway run's disk is deleted. What that run wrote is gone." >&2
+          fi
+        )
       }
 
       qmp() {
         {
           printf '{"execute":"qmp_capabilities"}\n{"execute":"%s"}\n' "$1"
           sleep 1
-        } | socat - "UNIX-CONNECT:$state/qmp.sock" >/dev/null
+        } | socat - "UNIX-CONNECT:$state/qmp.sock" >/dev/null 2>&1
       }
 
-      stop_vm() {
-        local pid
-        if [ ! -S "$state/qmp.sock" ] || [ ! -f "$state/qemu.pid" ] || ! kill -0 "$(cat "$state/qemu.pid")" 2>/dev/null; then
-          echo "agent-vm: VM not running" >&2
-          return
-        fi
-        pid=$(cat "$state/qemu.pid")
+      # Succeeds when the process $1 ends within $2 tenths of a second.
+      ended_within() {
+        for _ in $(seq "$2"); do
+          kill -0 "$1" 2>/dev/null || return 0
+          sleep 0.1
+        done
+        return 1
+      }
 
+      # Shuts down the VM that runs as process $1, which vm_pid has checked
+      # to be this folder's QEMU. Fails when the process does not end.
+      stop_vm() {
+        local pid=$1
         if vm_is_throwaway "$pid"; then
           echo "agent-vm: this is a throwaway run. What it wrote is discarded." >&2
         fi
         echo "agent-vm: shutting down" >&2
-        qmp system_powerdown
-        for _ in $(seq 60); do
-          if ! kill -0 "$pid" 2>/dev/null; then
-            rm -f "$state/qemu.pid" "$state/qmp.sock"
+        if [ -S "$state/qmp.sock" ] && qmp system_powerdown; then
+          if ended_within "$pid" 600; then
             echo "agent-vm: stopped" >&2
-            return
+            return 0
           fi
-          sleep 1
-        done
-
-        echo "agent-vm: still running after a minute, switching it off" >&2
-        qmp quit || kill "$pid"
-        rm -f "$state/qemu.pid" "$state/qmp.sock"
+          echo "agent-vm: still running after a minute, switching it off" >&2
+          qmp quit || kill "$pid" 2>/dev/null || true
+        else
+          echo "agent-vm: QEMU's control socket does not answer, so the VM is switched off without a clean shutdown" >&2
+          kill "$pid" 2>/dev/null || true
+        fi
+        if ended_within "$pid" 100; then
+          echo "agent-vm: stopped" >&2
+          return 0
+        fi
+        echo "agent-vm: process $pid did not end. Look at it with: ps -p $pid" >&2
+        return 1
       }
 
-      # The broker goes last, and also when stopping the VM went wrong.
-      trap stop_broker EXIT
-      stop_vm
-      remove_throwaway
+      # Half seconds spent waiting for a VM that is starting.
+      waited=0
+      while true; do
+        if pid=$(vm_pid); then
+          if ! stop_vm "$pid"; then
+            # Without the broker the VM has no way out, so the broker is
+            # stopped also when the VM could not be.
+            stop_broker
+            exit 1
+          fi
+          break
+        fi
+        if tidy; then
+          echo "agent-vm: VM not running" >&2
+          break
+        fi
+        # The lock is taken and there is no QEMU: a start is under way.
+        if [ "$waited" -eq 2 ]; then
+          echo "agent-vm: a VM is starting. Waiting for it to come up, to shut it down." >&2
+        fi
+        if [ "$waited" -ge ${toString (stopWaitSeconds * 2)} ]; then
+          echo "agent-vm: the VM is still starting after ${toString stopWaitSeconds} seconds. Nothing was stopped, and the broker is left for it." >&2
+          echo "agent-vm: end its start command, or run this again when it is up (see: nix run .#status)." >&2
+          exit 1
+        fi
+        sleep 0.5
+        waited=$((waited + 1))
+      done
+
+      # After a throwaway run, its start command deletes the disk and then
+      # gives the lock back, which takes a moment. Try for two seconds.
+      for _ in $(seq 20); do
+        if tidy; then break; fi
+        sleep 0.1
+      done
+      stop_broker
     '';
   };
 
@@ -668,7 +767,17 @@ lib.fix (self: {
 
       # One check sends a TLS hello with the wrong site name. Only the
       # broker's log can show that the broker is what stopped it.
-      count() { grep -c " tls tls-name-differs" "$state/broker.log" 2>/dev/null || true; }
+      # The fields of a line are the time, the event, the host, the port,
+      # how the request arrived and the reason. They are compared one by
+      # one, so that a host or a path chosen in the VM cannot stand in for
+      # them.
+      count() {
+        if [ -f "$state/broker.log" ]; then
+          awk '$2 == "refused" && $5 == "tls" && $6 == "tls-name-differs" { n++ } END { print n + 0 }' "$state/broker.log"
+        else
+          echo 0
+        fi
+      }
       before=$(count)
 
       status=0
@@ -728,13 +837,21 @@ lib.fix (self: {
   #
   # It ends with status 0 when the VM and all it needs are up, 1 when
   # something that should be up is down (the lines marked FAIL), and 2 when
-  # the VM is simply not running. A line marked `warn` works today but wants
-  # attention; it does not change the status.
+  # the VM is simply not running, which includes one that is still starting.
+  # A line marked `warn` works today but wants attention; it does not change
+  # the status.
   #
   # Much of what is shown comes from the VM or was caused by it: log lines,
   # version numbers, the notes of other agents. It is shown with everything
   # but plain letters and signs replaced, so that it cannot move the cursor
   # or recolour the terminal.
+  #
+  # A program in the VM also chooses much of what the broker's log holds:
+  # the host it asks for, and for GitHub the path. So lines are never picked
+  # out of the log by a word that may stand anywhere in them. A line counts
+  # as the broker's own when its first field is a time and its second field
+  # is the event looked for; the broker writes both, and replaces spaces in
+  # everything that comes from the VM, so the VM cannot fill those fields.
   status = writeShellApplication {
     name = "agent-vm-status";
     runtimeInputs = [
@@ -803,6 +920,17 @@ lib.fix (self: {
         fi
       }
 
+      # Prints the lines of the broker's log whose event, the second field,
+      # is $1 and whose first field is a time such as
+      # 2026-01-31T12:00:00+01:00. See the top of this command for why the
+      # fields are compared and the line is not searched for a word.
+      log_lines() {
+        [ -f "$state/broker.log" ] || return 0
+        awk -v event="$1" '
+          $1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9][-+][0-9][0-9]:[0-9][0-9]$/ && $2 == event
+        ' "$state/broker.log" 2>/dev/null || true
+      }
+
       # Prints the size of the file $1, such as 204MB.
       size_of() { numfmt --to=iec --suffix=B "$(stat -L -c %s "$1" 2>/dev/null || echo 0)"; }
 
@@ -816,6 +944,7 @@ lib.fix (self: {
 
       # --- The VM
       vm_up=
+      vm_starting=
       throwaway_up=
       if pid=$(vm_pid); then
         vm_up=yes
@@ -826,12 +955,19 @@ lib.fix (self: {
         else
           ok VM "running for $(running_for "$pid") as process $pid, on its normal disk"
         fi
-      elif [ -e "$state/qemu.pid" ]; then
-        off VM "not running. It ended without \`nix run .#stop\`; the next start tidies up"
+      elif vm_lock_held; then
+        # The start command has the lock and QEMU has not written qemu.pid
+        # yet. What lies in the folder now belongs to that start.
+        vm_starting=yes
+        off VM "starting: its start command runs, and QEMU is not up yet. Look again in a minute"
+        more "\`nix run .#stop\` waits for it to come up and then shuts it down"
+      elif [ -e "$state/qemu.pid" ] || [ -e "$state/qmp.sock" ]; then
+        off VM "not running. One ended without \`nix run .#stop\` and left qemu.pid or qmp.sock behind;"
+        more "they do not block anything: the next start, or \`nix run .#stop\`, removes them"
       else
         off VM "not running"
       fi
-      if [ -z "$throwaway_up" ] && [ -e "$state/throwaway.qcow2" ]; then
+      if [ -z "$throwaway_up" ] && [ -z "$vm_starting" ] && [ -e "$state/throwaway.qcow2" ]; then
         warn "" "a throwaway run left its disk behind ($(size_of "$state/throwaway.qcow2")). It is not used again;"
         more "the next start or \`nix run .#stop\` deletes it"
       fi
@@ -843,7 +979,7 @@ lib.fix (self: {
         if broker_port_open; then
           broker_up=yes
           ok Broker "running for $(running_for "$pid") as process $pid in the background, on $address"
-          started=$(grep -a ' started ' "$state/broker.log" 2>/dev/null | tail -n 1 | plain | cut -c1-200) || true
+          started=$(log_lines started | tail -n 1 | plain | cut -c1-200) || true
           if [ -n "$started" ]; then
             more "$started"
             # The rules are part of what a command is built from. If the
@@ -998,7 +1134,7 @@ lib.fix (self: {
       # --- What the VM asked for and did not get. A host that is unknown
       # here, or one refused again and again, is worth a look.
       echo
-      refused=$(grep -aE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+ refused ' "$state/broker.log" 2>/dev/null | tail -n 5 | plain | cut -c1-160 | sed 's/ refused /  /') || true
+      refused=$(log_lines refused | tail -n 5 | plain | cut -c1-160 | sed 's/ refused /  /') || true
       if [ ! -f "$state/broker.log" ]; then
         echo "Refused destinations: there is no broker.log yet"
       elif [ -z "$refused" ]; then
@@ -1045,6 +1181,10 @@ lib.fix (self: {
         echo "Not working: see the $problems line(s) marked FAIL."
         exit 1
       fi
+      if [ -n "$vm_starting" ]; then
+        echo "The VM is starting. Run this again in a minute."
+        exit 2
+      fi
       if [ -z "$vm_up" ]; then
         echo "The VM is not running. Start it with: nix run .#vm"
         exit 2
@@ -1063,8 +1203,12 @@ lib.fix (self: {
   #   nix run .#update-t3 -- 0.1.8   that version, whatever the app is
   #
   # The checksum comes from the file SHA256SUMS that each release on GitHub
-  # carries. AGENT_VM_T3_RELEASES names another place to fetch releases from,
-  # which is how this command is tested without GitHub.
+  # carries, fetched over HTTPS only. AGENT_VM_T3_RELEASES names another
+  # place to fetch releases from, which is how this command is tested
+  # without GitHub; the command says so when it is set. A wrong checksum
+  # cannot put another program in the VM: the address the server itself is
+  # downloaded from is fixed in vm/t3.nix, and a download that does not fit
+  # the checksum fails the build.
   update-t3 = writeShellApplication {
     name = "agent-vm-update-t3";
     runtimeInputs = [
@@ -1116,15 +1260,32 @@ lib.fix (self: {
 
       # The release's list of checksums, one line per file:
       #   <64 hex digits>  t3-0.1.8-linux-arm64.tar.gz
-      releases="''${AGENT_VM_T3_RELEASES:-https://github.com/pingdotgg/t3code/releases/download}"
+      releases="https://github.com/pingdotgg/t3code/releases/download"
+      protocols="=https"
+      if [ -n "''${AGENT_VM_T3_RELEASES:-}" ]; then
+        releases=$AGENT_VM_T3_RELEASES
+        # Plain HTTP is allowed here as well, for a test server on this
+        # machine. Other kinds of address, such as file://, never are.
+        protocols="=http,https"
+        echo "update-t3: fetching from $releases and not from GitHub, because AGENT_VM_T3_RELEASES is set." >&2
+      fi
       url="$releases/v$version/SHA256SUMS"
       archive="t3-$version-linux-arm64.tar.gz"
+      # curl prints the answer and, on a last line of its own, the status the
+      # server gave. Only 404 means "there is no such file"; any other
+      # status says nothing about whether the release exists.
       status=0
-      sums=$(curl --fail --silent --show-error --location --max-time 60 "$url") || status=$?
-      if [ "$status" -eq 22 ]; then
-        fail "there is no $url. Either T3 $version is not released, or the release has no checksum file. vm/t3.nix is unchanged"
-      elif [ "$status" -ne 0 ]; then
-        fail "could not fetch $url (curl ended with status $status). vm/t3.nix is unchanged"
+      answer=$(curl --silent --show-error --location --max-time 60 \
+        --proto "$protocols" --proto-redir "$protocols" \
+        --write-out '\n%{http_code}' "$url") || status=$?
+      code=''${answer##*$'\n'}
+      sums=''${answer%$'\n'*}
+      if [ "$status" -ne 0 ]; then
+        fail "could not fetch $url (curl ended with status $status; what it reported is above). vm/t3.nix is unchanged"
+      elif [ "$code" = 404 ]; then
+        fail "there is no $url (the server answered 404). Either T3 $version is not released, or the release has no checksum file. vm/t3.nix is unchanged"
+      elif [ "$code" != 200 ]; then
+        fail "$url was not handed out: the server answered $code. That says nothing about whether T3 $version is released; try again later. vm/t3.nix is unchanged"
       fi
       # The name may have a "*" or "./" in front, which checksum tools add.
       checksum=$(awk -v name="$archive" '{ file = $2; sub(/^\*/, "", file); sub(/^\.\//, "", file) } file == name { print tolower($1) }' <<<"$sums")
