@@ -328,6 +328,27 @@ elif kind == "trailers":  # lines after a chunked body, not announced
     except (OSError, ssl.SSLError):
         answer = b""
     print("answered " + answer.split(b"\r\n")[0].decode("latin-1") if answer else "closed")
+elif kind.startswith("hidden-"):
+    # A header hidden from the broker inside the value of another one: on a
+    # continuation line (a line that starts with a space), or after a lone
+    # carriage return. megabytes is not used.
+    hidden = {
+        "hidden-login-folded": b"\r\n Authorization: token some-other-token",
+        "hidden-login-cr": b"\rAuthorization: token some-other-token",
+        "hidden-forward-folded": b"\r\n X-Forwarded-Host: elsewhere.example",
+    }[kind]
+    connection = tunnel()
+    connection.sendall(
+        f"GET /{kind} HTTP/1.1\r\nHost: {host}:{port}\r\nX-Note: start".encode()
+        + hidden
+        + b"\r\n\r\n"
+    )
+    connection.settimeout(10)
+    try:
+        answer = connection.recv(200)
+    except (OSError, ssl.SSLError):
+        answer = b""
+    print("answered " + answer.split(b"\r\n")[0].decode("latin-1") if answer else "closed")
 EOF
 
 # --- The broker --------------------------------------------------------------
@@ -641,6 +662,22 @@ grown=$(($(memory) - start_memory))
 [ "$grown" -lt 30 ] &&
   pass "the broker held none of it in memory (grew ${grown} MB, from ${start_memory} MB)" ||
   fail "the broker held none of it in memory (grew ${grown} MB, from ${start_memory} MB)"
+
+echo "A header hidden inside another header's value (none may reach the stand-in):"
+
+for kind in hidden-login-folded hidden-login-cr hidden-forward-folded; do
+  before=$(count)
+  outcome=$(python3 "$work/client.py" "$kind" "$broker_port" standin.localhost "$server_port" "$ca" 1 2>&1)
+  sleep 0.5
+  case "$kind" in
+    hidden-login-folded) what="a login on a continuation line" ;;
+    hidden-login-cr) what="a login after a lone carriage return" ;;
+    *) what="a forwarding header on a continuation line" ;;
+  esac
+  [ "$(count)" = "$before" ] && pass "$what ($outcome)" || fail "$what ($outcome)"
+done
+logged " refused standin.localhost $server_port https GET /hidden-login-folded odd-header\$" &&
+  pass "a split header line is logged as refused" || fail "a split header line is logged as refused"
 
 echo "Lines after a body (trailers), which mitmproxy cannot pass on:"
 

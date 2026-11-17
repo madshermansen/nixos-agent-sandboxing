@@ -340,6 +340,10 @@ REFUSALS = {
         "the request asks to switch to another protocol (an Upgrade header), "
         "such as WebSocket, which the broker does not pass on."
     ),
+    "odd-header": (
+        "one of the request's header lines is split over several lines, or "
+        "holds a line-break character. The broker does not pass that on."
+    ),
     "names-another-host": (
         "the request names another site than {host}, the one its connection "
         "was opened for."
@@ -627,12 +631,22 @@ class Broker:
     def unwanted(request: http.Request) -> str | None:
         """Why a readable request is refused for what it asks of the broker.
 
-        Two things mitmproxy would do with a request are not safe here.
+        Three things mitmproxy would do with a request are not safe here.
         Lines after a chunked body ("trailers") it cannot pass on at all.
-        And a request to switch the connection to another protocol, such
-        as WebSocket, would have mitmproxy collect each message of that
+        A request to switch the connection to another protocol, such as
+        WebSocket, would have mitmproxy collect each message of that
         protocol in memory, however long.
+
+        And a header whose value runs on over a second line, or holds a
+        stray line-break character, mitmproxy reads as one header and sends
+        on as it came. A server that reads the second line as a header of
+        its own would then see a header the broker never did: a login the
+        broker did not check, or a header the broker meant to leave out.
+        So no header may hold a line break at all.
         """
+        for name, value in request.headers.fields:
+            if any(mark in part for part in (name, value) for mark in (b"\r", b"\n")):
+                return "odd-header"
         if "trailer" in request.headers:
             return "trailers"
         if "upgrade" in request.headers:
