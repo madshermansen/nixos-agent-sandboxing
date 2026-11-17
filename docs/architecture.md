@@ -107,6 +107,58 @@ The broker adds the token only when all of this holds:
 Clear text sent inside a tunnel is refused for every destination, so a token
 can never end up on an unencrypted connection.
 
+**Which requests get it.** A broker that adds your token to whatever the VM
+sends would hand the agent everything the token can do. So for every
+request to GitHub the broker first decides whether it may go out at all:
+
+- **Only listed repos.** The `github` part of `rules.yaml` lists the repos
+  the agent may use, each for reading or for writing. A request about any
+  other repo is refused.
+- **Nothing that does lasting damage.** In a listed repo too, changing
+  settings, deleting the repo, reading secrets, changing who has access,
+  and merging (unless you allow it for that repo) are refused.
+- **Only what is recognised.** A request the broker does not know is
+  refused, harmless or not. So is one in an odd spelling, such as a path
+  with `..`: the broker passes on what it was sent, so it must not read an
+  address in a way GitHub might not.
+
+The decision is made by [`broker/github_policy.py`](../broker/github_policy.py),
+on the request as it arrived and as it will be sent on. The broker hands
+over the bytes themselves: the method, the address with its query string,
+and every header, each byte read as one character. It does not hand over
+the tidied form that mitmproxy offers for convenience, in which a method
+sent as `delete` reads `DELETE`. A method that is not in capital letters is
+refused, and so is a `#` in the address; neither is put right and passed on.
+
+One thing is rewritten on purpose. A body in JSON is sent on as the policy
+wrote it out again from what it read, not as the bytes that arrived. Two
+programs can read a sloppy JSON text in two ways; after this, GitHub reads
+exactly what the policy judged. The cost is that a number may be spelled
+differently on the way out: `1e2` leaves as `100.0`.
+
+For git the decision is made from the first lines of a request, and the
+upload or download streams through. For the API it is made after the body
+has been read, because the body says what a request changes; a request to
+the API whose body the broker cannot read in full (over 1 MiB, compressed,
+or sent in pieces) is refused. Each request is decided by itself, also when
+several come over one connection.
+
+A refusal carries a text for the agent, which for several refusals names
+the command to use instead. The text is worded for the program that gets
+it, because each shows only what it expects: plain text for git, which
+prints it line by line; the JSON of a GitHub error for the REST API, which
+`gh api` prints; and for GraphQL the answer GraphQL itself gives when it
+refuses, which is what the other `gh` commands print cleanly.
+[github-rules.md](github-rules.md) has the whole list, the reasons, and what
+the broker cannot check.
+
+The rules can also allow *reading* repos that are not listed
+(`other_repos: read-public`). Those requests go out without the token, so
+GitHub answers only for public repos. It is off.
+
+If a GitHub host is opened and the `github` part is missing or has a
+mistake, the broker does not start.
+
 **Where the token comes from.** `rules.yaml` is public, so it names the token
 only as `github`. Where you keep it is in a file on your Mac, outside the
 repo: `~/.config/nixt3/tokens.yaml` gives a command that prints it, such as
@@ -168,7 +220,33 @@ says: `X-HTTP-Method-Override` and its relatives, and `X-Forwarded-Host`,
 `Forwarded` and the like. Nothing in the VM needs them, and a later rule
 about a request's method or host should not be undone by a header. Requests
 that ask to switch to another protocol (`Upgrade`, as WebSocket does) or
-that carry lines after their body (trailers) are refused.
+that carry lines after their body (trailers) are refused. So is a
+`Connection` header that says more than `close` or `keep-alive`: it can
+name other headers for the next server to drop, after the broker has judged
+the request with them. `Proxy-Connection`, `Keep-Alive` and `TE`, which are
+about the connection to the next server as well, are left out. And a header
+whose name or value holds a byte outside plain ASCII is refused: programs
+disagree about what such a byte means, and no real program sends one.
+
+**The broker's own settings.** mitmproxy, the program the broker is a script
+for, has about a hundred settings, and some of them change a request after
+the broker has judged it: one sends it to another address, others rewrite
+its headers or body, or write the traffic to a file. mitmproxy also reads
+settings from a file in its folder without being asked. The broker refuses
+to start when that file is there. It also goes through every setting: eight
+must have the value the start command gives them, five may have any value
+(the port, the folder, the scripts to load, and which certificate
+authorities to believe), and every other one must be as mitmproxy has it by
+itself. It checks again whenever a setting changes while it runs, and then
+stops. The list is in [`broker/settings.py`](../broker/settings.py).
+
+The same goes for the environment, the variables a program is started with,
+because mitmproxy, Python and the TLS library read some of them and they are
+settings by another name. With `SSLKEYLOGFILE` set, as some people have it
+for Wireshark, mitmproxy writes the keys of every encrypted connection to a
+file, the one that carries the token included. The start command therefore
+gives mitmproxy an environment of three variables of its own making, and
+the broker refuses to start with any variable that is not on its list.
 
 ### Watching the traffic
 
@@ -185,9 +263,16 @@ opens, each request gets a line with its method, its path without the query
 string, and the status of the answer:
 
 ```
-2026-11-16T17:01:13+01:00 allowed github.com 443 https POST /owner/repo.git/git-receive-pack 200
+2026-11-16T17:01:13+01:00 allowed github.com 443 https POST /owner/repo.git/git-receive-pack 200 git-write
 2026-11-16T17:01:14+01:00 refused api.github.com 443 https GET /user other-login
+2026-11-16T17:01:15+01:00 refused github.com 443 https GET /someone/else.git/info/refs repo-not-listed
 ```
+
+The last word of an `allowed` line is what the policy found the request to
+be: `git-read`, `git-write`, `api-read`, `api-write`, `graphql-read` or
+`graphql-write`. The last word of a `refused` line is the reason. The text
+the agent was given is not logged, because it can repeat part of the
+request.
 
 Headers, bodies and tokens are never logged. As a last safeguard,
 everything the broker process writes, including what mitmproxy and Python
@@ -245,10 +330,15 @@ threads that run on the Mac itself are covered in
   GitHub token for anyone who sends the placeholder, and the placeholder is
   public. So while the broker runs, any program on the Mac can act on GitHub
   with your token without asking 1Password.
-- **Everything the token allows.** The agent can do on GitHub whatever the
-  token can: push to any repo it reaches, change settings, read private
-  repos. Until the limits of phase 5 exist, give the broker a token that is
-  narrow by itself: a fine-grained token for the repos the agent works on.
+- **What is inside a push.** The broker decides whether a push to a repo
+  may go out, not what is in it: which branch it changes, whether it
+  rewrites history, whether it changes a workflow file. Protect branches on
+  GitHub, and give the broker a token that is narrow by itself: a
+  fine-grained token for the repos the agent works on, without the
+  Workflows permission. [github-rules.md](github-rules.md) lists everything
+  the broker cannot see or enforce.
+- **A listed repo is a way out for data.** The agent can push to it and
+  comment in it. If the repo is public, so is what the agent puts there.
 - **The broker's certificate authority.** Its private key is in the state
   folder on the Mac. Whoever reads it can pose as any site towards the VM.
   Only the VM trusts it, not the Mac.
@@ -276,9 +366,9 @@ for the real token on the way out. The real token stays in 1Password. The
 broker gets it once when it starts, which asks for Touch ID, and keeps it in
 memory only.
 
-The swap is built and described above. What is still to come is the
-checking: a list of the repos the agent may use, and refusals for actions
-such as changing a repo's settings.
+Both halves are built for GitHub and described above: the swap, and the
+checking against a list of the repos the agent may use, with refusals for
+actions such as changing a repo's settings.
 
 The rules live on the Mac, outside the VM, so the agent cannot change them.
 GitHub is the first service. Others can be added later as new rules.
@@ -293,8 +383,11 @@ GitHub is the first service. Others can be added later as new rules.
 | [`broker/rules.yaml`](../broker/rules.yaml) | The destinations the VM may reach |
 | [`broker/proxy.py`](../broker/proxy.py) | The broker: a mitmproxy script that applies the rules |
 | [`broker/swap.py`](../broker/swap.py) | The decisions about one opened request, among them the token swap |
+| [`broker/github_policy.py`](../broker/github_policy.py) | Which GitHub requests may go out: the repos and actions allowed |
+| [`broker/github_request.py`](../broker/github_request.py) | Joins the two: asks the policy, then puts the token in |
 | [`broker/fetch_tokens.py`](../broker/fetch_tokens.py) | Fetches the tokens before the broker starts |
 | [`broker/limits.py`](../broker/limits.py) | Limits on what a connection may send before it makes sense, added to mitmproxy from the outside |
+| [`broker/settings.py`](../broker/settings.py) | Which of mitmproxy's settings the broker agrees to run with |
 | [`broker/tokens.example.yaml`](../broker/tokens.example.yaml) | Example of the file on your Mac that says where each token is kept |
 | [`darwin/commands.nix`](../darwin/commands.nix) | The commands behind `nix run .#vm`, `.#stop`, `.#ssh` and the others |
 | [`darwin/default.nix`](../darwin/default.nix) | What the Mac itself needs, as a nix-darwin module |

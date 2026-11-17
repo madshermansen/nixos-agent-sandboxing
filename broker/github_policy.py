@@ -1213,7 +1213,45 @@ def _json_object(headers: dict[str, list[str]], body: bytes) -> dict[str, object
             "the body must be one JSON object. Several requests in one body "
             "are not accepted.",
         )
+    _refuse_odd_text(data)
     return data
+
+
+# Added when the policy was wired into the broker, after a review; the one
+# change made to this module then. It refuses more and allows nothing new.
+def _refuse_odd_text(data: object) -> None:
+    """Refuse a body with a name or a text that readers may shorten.
+
+    Two things can be written in JSON that are not text a program can rely
+    on: the character U+0000, and half of a pair of "surrogates" without its
+    other half (written `\\ud800` in JSON). Programs treat them differently.
+    Some drop the half pair, some replace it, and some cut a text off at
+    U+0000. A name such as `assignees` followed by such a half is not
+    `assignees` to the checks in this module, which would let it through;
+    if GitHub's reader dropped the odd character, it would be `assignees`
+    there, which is refused. Whether GitHub does is not known, so such a
+    body is refused.
+
+    A pair of surrogates that is whole is fine: the JSON reader has already
+    turned it into the one character it stands for.
+    """
+    todo = [data]
+    while todo:
+        item = todo.pop()
+        if isinstance(item, dict):
+            todo.extend(item)
+            todo.extend(item.values())
+        elif isinstance(item, list):
+            todo.extend(item)
+        elif isinstance(item, str) and any(
+            ord(char) == 0 or 0xD800 <= ord(char) <= 0xDFFF for char in item
+        ):
+            raise _fix(
+                "body-odd",
+                "the body has a name or a text with the character U+0000 or "
+                "half of a surrogate pair in it, which not every program "
+                "reads the same way.",
+            )
 
 
 # ---------------------------------------------------------------------------

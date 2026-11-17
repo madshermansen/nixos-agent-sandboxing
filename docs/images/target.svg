@@ -17,7 +17,7 @@
   <!-- The Mac -->
   <rect x="20" y="20" width="740" height="520" rx="14" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5"/>
   <text x="40" y="50" font-size="17" font-weight="600" fill="#0f172a">Your Mac</text>
-  <text x="290" y="50" fill="#475569" font-size="13">Built: the key swap for GitHub. Planned: limits on repos and actions.</text>
+  <text x="290" y="50" fill="#475569" font-size="13">Built for GitHub: the key swap, and limits on repos and actions.</text>
 
   <!-- The VM -->
   <rect x="40" y="80" width="280" height="330" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>

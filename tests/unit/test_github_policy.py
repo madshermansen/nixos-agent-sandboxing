@@ -2181,8 +2181,11 @@ def test_a_repository_must_be_named_in_plain_text():
 )
 def test_a_repository_that_is_not_listed_is_refused_through_graphql(owner, name):
     q = "query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { name } }"
+    # A name with U+0000 in it is refused sooner, when the body is read:
+    # see `_refuse_odd_text`.
+    reason = "body-odd" if "\u0000" in owner + name else "repo-not-listed"
     for used in (POLICY, PUBLIC):
-        refused(gql(q, {"owner": owner, "repo": name}, policy=used), "repo-not-listed")
+        refused(gql(q, {"owner": owner, "repo": name}, policy=used), reason)
 
 
 def test_text_escapes_in_a_query_are_read_as_github_reads_them():
@@ -3493,7 +3496,9 @@ def test_a_search_written_into_the_query():
     ],
 )
 def test_graphql_text_that_cannot_be_read_is_refused(query):
-    refused(gql(query), "graphql-malformed")
+    # Text with U+0000 in it is refused sooner, when the body is read: see
+    # `_refuse_odd_text`.
+    refused(gql(query), "body-odd" if "\x00" in query else "graphql-malformed")
 
 
 @pytest.mark.parametrize(
@@ -3695,3 +3700,56 @@ def test_no_rules_means_no_repo_is_reachable():
 def test_bytes_and_bytearray_bodies_are_both_read():
     body = bytearray(json.dumps({"query": "{ viewer { login } }"}).encode())
     allowed(ask("POST", "api.github.com/graphql", body), "graphql-read")
+
+
+# ---------------------------------------------------------------------------
+# Text that readers may shorten. Added when the policy was wired into the
+# broker: see `_refuse_odd_text`.
+# ---------------------------------------------------------------------------
+
+COMMENTS = "api.github.com/repos/octo-org/app/issues/7/comments"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # A name that becomes `assignees`, which is refused, for a reader
+        # that drops the odd character or cuts the name off at it.
+        '{"body":"a","assignees\\ud800":["someone"]}',
+        '{"body":"a","assignees\\u0000":["someone"]}',
+        '{"body":"a","assignees\\u0000x":["someone"]}',
+        # In a text, and deep inside.
+        '{"body":"a\\u0000b"}',
+        '{"body":"a\\udfffb"}',
+        '{"body":"a","more":{"deep":["x",{"k\\ud800":1}]}}',
+        '{"body":"a","more":[["\\u0000"]]}',
+        # Half a pair, and two halves in the wrong order.
+        '{"body":"\\ud83d"}',
+        '{"body":"\\ude00\\ud83d"}',
+    ],
+)
+def test_a_body_with_text_that_readers_may_shorten_is_refused(body):
+    refused(ask("POST", COMMENTS, body), "body-odd")
+
+
+def test_a_whole_surrogate_pair_is_one_character_and_is_fine():
+    allowed(ask("POST", COMMENTS, '{"body":"a \\ud83d\\ude00 b"}'), "api-write")
+    allowed(ask("POST", COMMENTS, {"body": "a \U0001f600 b, \u00e9, \u65e5\u672c"}), "api-write")
+
+
+def test_text_that_readers_may_shorten_is_refused_in_graphql_too():
+    query = "query { viewer { login } }"
+    for body in (
+        '{"query":"%s","variables":{"x\\ud800":1}}' % query,
+        '{"query":"%s","variables":{"x":"a\\u0000"}}' % query,
+        '{"query":"%s\\u0000"}' % query,
+        '{"query":"%s","operationName":"a\\udc00"}' % query,
+    ):
+        refused(ask("POST", "api.github.com/graphql", body), "body-odd")
+    allowed(ask("POST", "api.github.com/graphql", '{"query":"%s"}' % query), "graphql-read")
+
+
+def test_a_deeply_nested_body_does_not_stop_the_check_with_an_error():
+    """The check walks the body without calling itself, so depth costs nothing."""
+    deep = '{"body":"a","more":' + "[" * 400 + '"\\u0000"' + "]" * 400 + "}"
+    refused(ask("POST", COMMENTS, deep), "body-odd")
