@@ -114,7 +114,9 @@ This asks the VM's T3 server for a one-time pairing code and opens it in the
 T3 app. The VM now appears in the app as a second environment, named
 `agent-vm`. A thread started there runs inside the VM.
 
-The pairing is stored on the VM's disk and lasts 30 days.
+The pairing is stored on the VM's disk. How long it lasts is set by T3, not
+by this repo. The one time it was looked at, the session ended 30 days after
+it was made.
 
 To also let agents on the Mac hand work to the VM, turn on Linked
 environments under Settings → Labs in the T3 app, then run:
