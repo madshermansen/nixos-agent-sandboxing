@@ -140,6 +140,7 @@ t3 environment link http://127.0.0.1:3774 --pairing-code <code>
 | Test the network lock and the GitHub setup | `nix run .#check` |
 | Test GitHub end to end with the real token | `nix run .#ssh -- bash -s < tests/github-live.sh` |
 | Test the token swap without a VM or a token | `tests/github-broker.sh` |
+| Test the commands on this page without a VM | `tests/commands.sh` |
 | Stop the VM and the broker | `nix run .#stop` |
 | Start a clean VM for one task, keeping the sign-in and the link to T3 | `nix run .#vm-fresh` |
 | Bring the T3 server in the VM to the T3 app's version | `nix run .#update-t3` |
@@ -160,7 +161,7 @@ and takes about a second.
 A line marked `FAIL` is something that should be up and is not. A line marked
 `warn` works today but wants attention. The command ends with status 0 when
 everything is up, 1 when a line says `FAIL`, and 2 when the VM is simply not
-running, so a script can wait for the VM with it.
+running or is still starting, so a script can wait for the VM with it.
 
 ### A throwaway run
 
@@ -273,7 +274,16 @@ the state folder was deleted while the VM ran, restart the VM.
 
 **`nix run .#vm` says "a VM is running or starting".**
 Only one VM can use the disk at a time, the normal one or a throwaway run.
-`nix run .#status` shows which one runs; `nix run .#stop` stops it.
+`nix run .#status` shows which one runs, or that one is starting.
+`nix run .#stop` stops it. If it is still starting, stop waits for it to
+come up, for at most 90 seconds, and shuts it down then; if the start takes
+longer than that, stop ends with an error and changes nothing, and you can
+end the start command itself or run stop again.
+
+**`nix run .#ssh` says "there is no SSH key for the VM".**
+The key is made by `nix run .#vm` the first time it starts the VM. Without
+it the command does not start `ssh` at all, because `ssh` would then try
+your own keys on the VM.
 
 **`nix shell` or `nix run` fails inside the VM.**
 Nix's download servers are not on the list of destinations. Add tools to

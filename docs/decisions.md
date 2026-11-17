@@ -550,6 +550,22 @@ and "fails closed" are explained in the word list at the top of
 - **Where:** `vm` and `stop` in
   [`darwin/commands.nix`](../darwin/commands.nix).
 
+### Stop waits for a VM that is still starting
+
+- **Chosen:** when the lock is held and QEMU is not there yet,
+  `nix run .#stop` waits up to 90 seconds for it and then shuts it down. If
+  the start takes longer, stop fails, and stops nothing, not the broker
+  either.
+- **Not chosen:** saying "a VM is starting" and failing at once; treating it
+  as "not running", which is what the first version did, and which also
+  ended the broker that the start had just launched.
+- **Why:** "stop" should mean that nothing runs afterwards, also when it is
+  typed, or run by an agent, right after a start. A start normally has QEMU
+  up in under a minute. Failing without touching anything is kept for the
+  start that hangs, for example one that waits for a password manager.
+- **Where:** `stop` in [`darwin/commands.nix`](../darwin/commands.nix);
+  checked in [`tests/commands.sh`](../tests/commands.sh).
+
 ### Logs are moved aside at a start, not while the broker runs
 
 - **Chosen:** `broker.log` and `console.log` are moved aside when larger

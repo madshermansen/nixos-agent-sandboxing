@@ -392,6 +392,10 @@ line under `Host *` there did:
 - `SendEnv` sends variables from your shell into the VM.
 - `ForwardAgent` offers your SSH agent to the VM.
 
+Closed with it: when the VM's key file was missing from the state folder,
+`ssh` fell back to your own keys in `~/.ssh` and offered them to the VM.
+The command now refuses to start without the VM's key.
+
 What remains is what you type yourself: `nix run .#ssh -- -A` or `-R ...`
 still forwards, because it is asked for. Checked on 2026-11-17 by asking
 `ssh` for its settings (`-G`): the command's ssh has no forward, no
@@ -419,7 +423,12 @@ lines under `Host *` set every one of them when ssh was allowed to read it.
 The lock controls what goes out of the VM. Things also come back to the Mac,
 and nothing checks them:
 
-- **Text on your screen.** The console, the SSH session and the T3 app show
+- **Text on your screen.** `nix run .#status` shows log lines and notes
+  with everything but plain characters replaced, and picks the broker's
+  own lines by their first two fields, which the VM cannot fill; both are
+  checked in [`tests/commands.sh`](../tests/commands.sh). `nix run .#logs`
+  and the end of the log that a failed start prints are shown as they are.
+  The console, the SSH session and the T3 app show
   what the VM sends. The T3 server in the VM runs as `agent`, so the attacker
   controls what it tells the app. A bug in how the app or the terminal
   handles that data would be a way onto the Mac.

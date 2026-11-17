@@ -868,9 +868,10 @@ lib.fix (self: {
 
       # Treat text as plain bytes everywhere below, so that the clean-up of
       # what is shown works the same whatever language the Mac is set to.
-      # It is set once here and not in front of single commands: bash 5.3
-      # crashed now and then (about one run in six) with `LC_ALL=C tr ...`
-      # inside a function.
+      # It is set once here and not in front of single commands. On the Mac
+      # this was written on, bash 5.3 ended with a segmentation fault in
+      # about one run in six of `LC_ALL=C tr ...` inside a function, when
+      # LANG was not set in the environment. The cause was not found.
       export LC_ALL=C
 
       problems=0

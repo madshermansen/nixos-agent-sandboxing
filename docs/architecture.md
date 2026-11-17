@@ -314,3 +314,4 @@ GitHub is the first service. Others can be added later as new rules.
 | [`tests/github-broker.sh`](../tests/github-broker.sh) | Checks of the token swap, run on the Mac against a stand-in for GitHub |
 | [`tests/github-live.sh`](../tests/github-live.sh) | The round trip with a real token: clone, push, pull request |
 | [`tests/unit/`](../tests/unit) | Tests of the broker's decisions that need no network |
+| [`tests/commands.sh`](../tests/commands.sh) | Checks of the commands on the Mac, with stand-ins for QEMU and ssh |

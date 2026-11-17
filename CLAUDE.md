@@ -46,6 +46,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `tests/network-lock.sh` | Checks run inside the VM by `nix run .#check` |
 | `tests/github-broker.sh` | The token swap, checked on the Mac against a stand-in for GitHub |
 | `tests/github-live.sh` | The round trip with a real token, run inside the VM |
+| `tests/commands.sh` | The Mac-side commands, checked on the Mac with stand-ins for QEMU and ssh; no VM needed |
 | `tests/unit/` | pytest files for the broker's decisions; no network needed |
 | `docs/` | Setup, architecture, the threat model (`threat-model.md`), the decision log (`decisions.md`), advice for threads on the Mac (`local-threads.md`), diagrams |
 
@@ -65,6 +66,7 @@ nix run .#pair               # add the VM to the T3 app on the Mac
 nix run .#update-t3          # write the T3 app's version and its checksum into vm/t3.nix
 nix build .#vm --no-link     # build only
 tests/github-broker.sh       # check the token swap on the Mac, without the VM or a token
+tests/commands.sh            # check the Mac-side commands, without the VM
 nix fmt                      # format the Nix files; run before committing
 ```
 
@@ -213,11 +215,27 @@ The reply should name Linux and the host `agent-vm`.
   Stop the VM from the Mac with `nix run .#stop`.
 - **`nix run .#vm` holds its terminal.** To start the VM from a tool call,
   detach it and send the console to a file:
-  `nohup nix run .#vm > ~/.local/state/agent-vm/console.log 2>&1 < /dev/null &`.
+  `nohup nix run .#vm >> ~/.local/state/agent-vm/console.log 2>&1 < /dev/null &`.
+  Use `>>`, not `>`: the start command moves a large console.log aside
+  itself, and `>` would empty the file before it can.
   Then wait for SSH with `until nix run .#ssh -- true; do sleep 2; done`,
   which takes about a minute.
 - **`nix run .#status` exits 0 only when everything is up.** 1 means a line
-  says `FAIL`, 2 means the VM is not running. `warn` lines do not count.
+  says `FAIL`, 2 means the VM is not running or is still starting. `warn`
+  lines do not count.
+- **`nix run .#stop` waits for a VM that is still starting,** up to 90
+  seconds, and then shuts it down. If the start takes longer, stop fails
+  and leaves the broker alone. So after a stop that succeeded, nothing
+  runs.
+- **A `qemu.pid` proves nothing by itself.** After a crash its number can
+  belong to another program. Ask `vm_pid` in `darwin/commands.nix`, which
+  checks that the process is the QEMU of this state folder; never
+  `kill -0 $(cat qemu.pid)`. Whether a VM is starting is told by the lock
+  (`vm_lock_held`), not by a file.
+- **Pick lines out of `broker.log` by their fields, never by a word.** The
+  VM chooses the host and the path that are logged, so a host named
+  `started` gives a line with that word in it. The first field is the time
+  and the second the event; compare those, as `log_lines` in `status` does.
 - **A throwaway run (`nix run .#vm-fresh`) keeps nothing.** It starts from
   the normal disk, so it is signed in and paired, and its changes are in
   `throwaway.qcow2`, deleted at stop. It takes the same lock as the normal
@@ -231,12 +249,21 @@ The reply should name Linux and the host `agent-vm`.
   the environment and says so. Options after `nix run .#vm --` still reach
   QEMU, with a note. Keep it that way: either can undo the lock.
 - **Every ssh call goes through `agent-vm-ssh`,** which starts ssh with
-  `-F none` so that the user's `~/.ssh/config` cannot add a forward. Do not
-  call `ssh` directly in a new command.
-- **Do not write `LC_ALL=C command` inside a shell function.** The bash that
-  runs these commands (5.3) crashed with a segmentation fault about one time
-  in six on it. Set the variable once at the top of the script, as `status`
-  does.
+  `-F none` so that the user's `~/.ssh/config` cannot add a forward, and
+  refuses to start without the VM's own key, because ssh would then offer
+  the user's keys to the VM. Do not call `ssh` directly in a new command.
+- **Change `darwin/commands.nix`, then run `tests/commands.sh`.** It builds
+  the real commands with stand-ins for QEMU and ssh on ports of its own.
+  To make something replaceable in it, add an argument to `commands.nix`
+  with the real thing as its default, as `stopWaitSeconds` is.
+- **Avoid `LC_ALL=C command` inside a shell function.** Seen on one Mac on
+  2026-11-17, cause not found: the bash that runs these commands (5.3.20
+  from nixpkgs) ended with a segmentation fault in about one run in six of
+  a script as small as `plain() { LC_ALL=C tr -c 'a-z' '?'; }; echo x | plain`,
+  but only when `LANG` was not set in the environment; with `LANG` set
+  there was no fault in 300 runs, and a reviewer saw none in 300. Tool
+  calls and background services often run without `LANG`. `status` sets
+  `LC_ALL` once at the top instead, which never faulted.
 - **`compgen` does not exist in that bash.** Use `"${!PREFIX@}"` for the
   names of variables that start with a prefix.
 - **Two QEMU processes may be running.** The Linux builder is one too. Never
