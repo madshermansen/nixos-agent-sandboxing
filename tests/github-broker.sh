@@ -315,7 +315,14 @@ elif kind == "chunk-size":  # a chunked body whose first size line never ends
         f"POST /a HTTP/1.1\r\nHost: {host}:{port}\r\nTransfer-Encoding: chunked\r\n\r\n".encode(),
     )
 elif kind == "tls-hello":  # a first TLS message that claims to be 16 MiB long
-    flood(tunnel(encrypted=False), b"\x16\x03\x01\x40\x00\x01\xff\xff\xff")
+    # The message is cut into TLS records of 16 KiB, each with its five
+    # bytes in front, as a real message of that length would be. Filler
+    # without them is turned down by mitmproxy's own reader, which may
+    # happen before the broker's limit is reached; then the limit is not
+    # what was tested, and mitmproxy can stumble over the bytes that follow.
+    record = b"\x16\x03\x01\x40\x00"
+    piece = (record + b"a" * 0x4000) * 4
+    flood(tunnel(encrypted=False), record + b"\x01\xff\xff\xff" + b"a" * (0x4000 - 4))
 elif kind == "trailers":  # lines after a chunked body, not announced
     connection = tunnel()
     connection.sendall(
