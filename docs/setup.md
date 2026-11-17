@@ -8,6 +8,7 @@ How to get the agent VM running on a Mac and linked to T3 Code.
 - Nix with flakes, managed by [nix-darwin](https://github.com/nix-darwin/nix-darwin).
 - The T3 Code app.
 - A Claude account.
+- A GitHub token for the agent, kept in a password manager such as 1Password.
 
 ## 1. Add the Mac module
 
@@ -45,6 +46,35 @@ sudo darwin-rebuild switch --flake .
 
 Either way the module is read at the commit recorded in your `flake.lock`.
 To pick up changes to it, run `nix flake update nixt3` and apply again.
+
+## Before the first start: the GitHub token
+
+The agent uses GitHub with your token, but the token never enters the VM. It
+stays in your password manager, and the broker adds it to each request on
+the way out. The broker has to be told how to get it.
+
+1. Create a token for the agent on GitHub. Make it as narrow as the work
+   allows: a fine-grained token for the repos the agent should work on, with
+   read and write access to contents and pull requests.
+2. Store it in your password manager. With 1Password, save it in an item and
+   use "Copy Secret Reference" on the field; that gives an address of the
+   form `op://Private/agent-sandbox-github/credential`. Install the
+   [1Password CLI](https://developer.1password.com/docs/cli/) and turn on
+   its app integration, so that `op read` asks for Touch ID.
+3. Tell the broker the command that prints the token:
+
+   ```sh
+   mkdir -p ~/.config/nixt3
+   cp broker/tokens.example.yaml ~/.config/nixt3/tokens.yaml
+   chmod 600 ~/.config/nixt3/tokens.yaml
+   ```
+
+   Then put your own address or command in the file. It holds no token, only
+   how to get one. To keep it elsewhere, name it in `AGENT_BROKER_TOKENS`.
+
+The command is run each time the broker starts, so 1Password asks once per
+start. If the file or the command is missing or fails, the broker says what
+is wrong and does not start, and neither does the VM.
 
 ## 2. Start the VM
 
@@ -104,7 +134,9 @@ t3 environment link http://127.0.0.1:3774 --pairing-code <code>
 | Run one command in it | `nix run .#ssh -- <command>` |
 | Read the T3 server's log | `nix run .#ssh -- journalctl -u t3 -e` |
 | Watch what the VM asks the broker for | `nix run .#logs` |
-| Test the network lock | `nix run .#check` |
+| Test the network lock and the GitHub setup | `nix run .#check` |
+| Test GitHub end to end with the real token | `nix run .#ssh -- bash -s < tests/github-live.sh` |
+| Test the token swap without a VM or a token | `tests/github-broker.sh` |
 | Stop the VM and the broker | `nix run .#stop` |
 | Start over with a clean VM | Stop it, then delete `~/.local/state/agent-vm` |
 
@@ -133,6 +165,17 @@ When you end it, the VM has no way out until the next start.
 Every host on the list is a place the agent can send data to, so add only
 what a task needs.
 
+## Changing the GitHub token
+
+Change the command in `~/.config/nixt3/tokens.yaml`, or the secret it points
+to, and restart the broker: `nix run .#stop` and `nix run .#vm`, or
+`nix run .#broker` in a terminal while the VM keeps running. The broker reads
+the token once, when it starts.
+
+`tests/github-live.sh` checks the whole round trip from inside the VM: it
+clones this repo, pushes a branch, opens a pull request, and removes both
+again.
+
 ## Updating T3
 
 The T3 server in the VM should be the same version as the T3 app on the Mac.
@@ -145,6 +188,29 @@ When the app updates, change the version and checksum in
 **A program in the VM reports "CONNECT tunnel failed, response 403".**
 The broker refused the destination. `nix run .#logs` shows which host it was;
 see "Allowing a destination" above.
+
+**The VM does not start: "a token cannot be fetched".**
+The broker needs the GitHub token and could not get it. The message says
+which part is missing: the file `~/.config/nixt3/tokens.yaml`, the entry in
+it, or the command. See "Before the first start" above. When the VM is
+started in the background, the message is in `broker.log` in the state
+folder.
+
+**GitHub answers "Bad credentials" in the VM.**
+The broker added the token it was given, and GitHub does not accept it. The
+token has expired or been withdrawn, or the command in `tokens.yaml` prints
+something else. Fix it on the Mac and restart the broker.
+
+**A program in the VM is refused with "a token or password that is not this
+sandbox's own".**
+The request to GitHub carried a login other than the placeholder, for
+example a token in a git address or in `GH_TOKEN`. The broker never passes
+those on. Remove it; `git` and `gh` in the VM need no login of their own.
+
+**A program in the VM reports a certificate error for GitHub.**
+The VM trusts the broker's certificate only when it was started with
+`nix run .#vm`, which hands the certificate over. If the broker's folder in
+the state folder was deleted while the VM ran, restart the VM.
 
 **`nix shell` or `nix run` fails inside the VM.**
 Nix's download servers are not on the list of destinations. Add tools to

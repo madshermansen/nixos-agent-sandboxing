@@ -88,7 +88,7 @@
   <!-- Destinations -->
   <rect x="850" y="110" width="130" height="72" rx="10" fill="#ffffff" stroke="#15803d" stroke-width="1.5"/>
   <text x="915" y="140" text-anchor="middle" font-weight="600" fill="#0f172a">GitHub</text>
-  <text x="915" y="161" text-anchor="middle" fill="#166534" font-size="13">passed through</text>
+  <text x="915" y="161" text-anchor="middle" fill="#166534" font-size="13">opened, token added</text>
 
   <rect x="850" y="229" width="130" height="72" rx="10" fill="#ffffff" stroke="#15803d" stroke-width="1.5"/>
   <text x="915" y="259" text-anchor="middle" font-weight="600" fill="#0f172a">Anthropic</text>

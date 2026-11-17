@@ -25,6 +25,48 @@ let
     HTTPS_PROXY = brokerUrl;
     NO_PROXY = "127.0.0.1,localhost";
   };
+
+  # What programs in the VM use in place of a GitHub token. It is public and
+  # gives no access by itself: the broker on the Mac puts the real token in
+  # its place on the way out. Keep it equal to PLACEHOLDER in broker/swap.py.
+  githubPlaceholder = "nixt3-placeholder-not-a-real-token";
+
+  # The certificates this system trusts: the usual ones, and the broker's.
+  # The file is put together at boot, see the broker-ca service below. Every
+  # program that looks in the usual place finds it, because the usual place
+  # (/etc/ssl/certs/ca-certificates.crt) is made to point here.
+  trustedCertificates = "/run/broker-ca/ca-certificates.crt";
+
+  # For programs that do not look in the usual place by themselves. Node
+  # (and with it Claude Code and the T3 server) brings its own list and only
+  # adds to it what NODE_EXTRA_CA_CERTS names. The others are named for
+  # programs that bring a list of their own.
+  certificateVariables = {
+    SSL_CERT_FILE = trustedCertificates;
+    NIX_SSL_CERT_FILE = trustedCertificates;
+    CURL_CA_BUNDLE = trustedCertificates;
+    GIT_SSL_CAINFO = trustedCertificates;
+    NODE_EXTRA_CA_CERTS = trustedCertificates;
+    REQUESTS_CA_BUNDLE = trustedCertificates;
+  };
+
+  # gh and other GitHub tools read the token from these.
+  githubVariables = {
+    GH_TOKEN = githubPlaceholder;
+    GITHUB_TOKEN = githubPlaceholder;
+  };
+
+  # Everything a program in the VM needs in its environment to get out
+  # through the broker. Login shells and the T3 service both get it.
+  sandboxVariables = proxyVariables // certificateVariables // githubVariables;
+
+  # git asks this for a login when GitHub wants one, and gets the placeholder.
+  githubCredentialHelper = pkgs.writeShellScript "git-credential-placeholder" ''
+    if [ "$1" = get ]; then
+      echo username=x-access-token
+      echo password=${githubPlaceholder}
+    fi
+  '';
 in
 {
   imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ];
@@ -43,31 +85,45 @@ in
     sharedDirectories = lib.mkForce { };
 
     # The network is locked. The VM cannot reach the internet, the Mac, or
-    # even a name server. Only the forwards below work, and QEMU enforces
-    # this from outside the VM, so nothing inside it can lift the lock.
-    restrictNetwork = true;
-
-    forwardPorts = [
-      {
-        # The one way out: the broker on the Mac, which decides per request.
-        from = "guest";
-        guest.address = brokerAddress;
-        guest.port = brokerPort;
-        host.address = "127.0.0.1";
-        host.port = ports.broker;
-      }
-      {
-        from = "host";
-        host.address = "127.0.0.1";
-        host.port = ports.ssh;
-        guest.port = 22;
-      }
-      {
-        from = "host";
-        host.address = "127.0.0.1";
-        host.port = ports.t3;
-        guest.port = t3Port;
-      }
+    # even a name server. Only the three forwards below work, and QEMU
+    # enforces this from outside the VM, so nothing inside it can lift the
+    # lock.
+    #
+    # This is the whole of the VM's network, written out as the one option
+    # QEMU gets for it, instead of NixOS's `forwardPorts`. The reason is the
+    # way out: NixOS would run `nc` for each connection to the broker, and
+    # `nc` does not tell the VM when the broker closes a connection. A
+    # program in the VM whose request was refused then waited until its own
+    # time limit, or forever. `socat` ends when either side closes, and the
+    # VM sees that.
+    #
+    #   restrict=on  drops everything the VM sends, except to the forwards
+    #   guestfwd     the one way out: connections to the broker's address in
+    #                the VM are handed to a helper on the Mac, which passes
+    #                them to the broker on the Mac's localhost. The broker
+    #                decides per request.
+    #                  -b65536  pass data on in pieces of 64 KiB
+    #                  -t1      after one side has closed, wait a second for
+    #                           what the other side still sends, then end
+    #   hostfwd      two ports on the Mac's localhost that lead into the VM:
+    #                SSH and the T3 server
+    #
+    # No other option is read from the environment of the start command, so
+    # a variable left over in a shell cannot add a forward.
+    qemu.networkingOptions = lib.mkForce [
+      "-net nic,netdev=user.0,model=virtio"
+      (
+        "-netdev '"
+        + lib.concatStringsSep "," [
+          "user"
+          "id=user.0"
+          "restrict=on"
+          "guestfwd=tcp:${brokerAddress}:${toString brokerPort}-cmd:${hostPkgs.socat}/bin/socat -b65536 -t1 STDIO TCP:127.0.0.1:${toString ports.broker}"
+          "hostfwd=tcp:127.0.0.1:${toString ports.ssh}-:22"
+          "hostfwd=tcp:127.0.0.1:${toString ports.t3}-:${toString t3Port}"
+        ]
+        + "'"
+      )
     ];
   };
 
@@ -78,7 +134,77 @@ in
   # and connects directly gets no answer, because of the lock above.
   networking.proxy.default = brokerUrl;
   networking.proxy.noProxy = proxyVariables.NO_PROXY;
-  environment.sessionVariables = proxyVariables;
+  environment.sessionVariables = sandboxVariables;
+
+  # The broker opens the traffic to GitHub, to put the real token in. What
+  # it sends back is signed by a certificate authority of its own, which
+  # lives on the Mac. The Mac hands the authority's public certificate to
+  # the VM at start through QEMU's "fw_cfg", a way to give a VM a small file
+  # without sharing a folder. Only the certificate comes in; the key that
+  # signs stays on the Mac.
+  #
+  # This service adds that certificate to the ones the system trusts. It
+  # runs before anything that goes out, and again at every boot, so a new
+  # authority on the Mac is picked up by a restart.
+  boot.kernelModules = [ "qemu_fw_cfg" ];
+  systemd.services.broker-ca = {
+    description = "Trust the broker's certificate authority";
+    wantedBy = [ "multi-user.target" ];
+    before = [
+      "t3.service"
+      "sshd.service"
+      "getty.target"
+    ];
+    path = [ pkgs.kmod ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    script = ''
+      modprobe qemu_fw_cfg 2>/dev/null || true
+      from=/sys/firmware/qemu_fw_cfg/by_name/opt/nixt3/broker-ca/raw
+
+      mkdir -p /run/broker-ca
+      new=/run/broker-ca/ca-certificates.crt.new
+      cat ${config.security.pki.caBundle} > "$new"
+
+      # Without the broker's certificate the usual ones are still trusted,
+      # so destinations that are passed on untouched keep working. GitHub
+      # does not, and says so with a certificate error.
+      if [ ! -r "$from" ]; then
+        echo "The Mac passed no broker certificate. Start the VM with: nix run .#vm" >&2
+      elif ! grep -q "BEGIN CERTIFICATE" "$from" || grep -q "PRIVATE KEY" "$from"; then
+        echo "What the Mac passed is not a certificate alone. It is not trusted." >&2
+      else
+        install -m 444 "$from" /run/broker-ca/broker-ca.pem
+        { echo; cat "$from"; } >> "$new"
+      fi
+
+      chmod 444 "$new"
+      mv "$new" ${trustedCertificates}
+    '';
+  };
+  environment.etc = {
+    "ssl/certs/ca-certificates.crt".source = lib.mkForce trustedCertificates;
+    "ssl/certs/ca-bundle.crt".source = lib.mkForce trustedCertificates;
+    "pki/tls/certs/ca-bundle.crt".source = lib.mkForce trustedCertificates;
+  };
+
+  # GitHub goes through the broker, which can only read HTTPS. So git is
+  # told to use HTTPS for GitHub whatever kind of address it is given, and
+  # to log in with the placeholder.
+  programs.git = {
+    enable = true;
+    config = {
+      url."https://github.com/".insteadOf = [
+        "git@github.com:"
+        "ssh://git@github.com/"
+        "ssh://github.com/"
+        "git://github.com/"
+      ];
+      credential."https://github.com".helper = "${githubCredentialHelper}";
+    };
+  };
 
   # With the network locked the VM cannot ask a time server, and its clock
   # stops while the Mac sleeps. The VM's hardware clock follows the Mac's
@@ -155,7 +281,10 @@ in
     description = "T3 Code server";
     wantedBy = [ "multi-user.target" ];
     wants = [ "network-online.target" ];
-    after = [ "network-online.target" ];
+    after = [
+      "network-online.target"
+      "broker-ca.service"
+    ];
     # Agents started by T3 see the same tools as a login shell.
     path = [
       "/run/wrappers"
@@ -166,9 +295,11 @@ in
       NIX_LD = "/run/current-system/sw/share/nix-ld/lib/ld.so";
       NIX_LD_LIBRARY_PATH = "/run/current-system/sw/share/nix-ld/lib";
     }
-    # The agents T3 starts inherit these, so they reach the broker too.
+    # The agents T3 starts inherit these, so they reach the broker, trust
+    # its certificate and log in to GitHub with the placeholder, as a login
+    # shell does.
     // config.networking.proxy.envVars
-    // proxyVariables;
+    // sandboxVariables;
     serviceConfig = {
       User = "agent";
       WorkingDirectory = "/home/agent";
