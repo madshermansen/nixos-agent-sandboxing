@@ -59,6 +59,18 @@ let
       rm -f "$state/broker.pid"
     }
 
+    # Succeeds when a broker started with `nix run .#broker` in a terminal is
+    # running. It records its process id like the background one does.
+    foreground_broker_running() {
+      local pid
+      [ -f "$state/broker-foreground.pid" ] || return 1
+      pid=$(cat "$state/broker-foreground.pid")
+      case "$(/bin/ps -o command= -p "$pid" 2>/dev/null)" in
+        *mitmdump* | *agent-vm-broker-run*) return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+
     # Succeeds when something accepts connections on the broker's port.
     broker_port_open() {
       (exec 3<>/dev/tcp/127.0.0.1/${toString ports.broker}) 2>/dev/null
@@ -91,6 +103,11 @@ let
       #   termlog_verbosity    of mitmproxy's own messages, show only errors
       #   onboarding           no built-in web page that hands out mitmproxy's
       #                        certificate
+      #   body_size_limit      a request the broker reads is cut off at this
+      #                        size, so the VM cannot fill the Mac's memory;
+      #                        traffic passed on untouched is not affected
+      #   rawtcp               traffic in a tunnel that is neither TLS nor
+      #                        HTTP is dropped instead of passed on
       exec mitmdump \
         --listen-host 127.0.0.1 \
         --listen-port ${toString ports.broker} \
@@ -99,6 +116,8 @@ let
         --set flow_detail=0 \
         --set termlog_verbosity=error \
         --set onboarding=false \
+        --set body_size_limit=1m \
+        --set rawtcp=false \
         --scripts ${../broker/proxy.py} \
         "$@"
     '';
@@ -117,9 +136,16 @@ let
       stop_broker
 
       if broker_port_open; then
-        echo "agent-vm: localhost:${toString ports.broker} is taken, so no broker is started. If that is" >&2
-        echo "agent-vm: \`nix run .#broker\` in another terminal, the VM will use it." >&2
-        exit 0
+        if foreground_broker_running; then
+          echo "agent-vm: using the broker that \`nix run .#broker\` runs in another terminal." >&2
+          echo "agent-vm: it has the rules it was started with." >&2
+          exit 0
+        fi
+        # Whatever holds the port would become the VM's way out, with rules
+        # nobody chose. So the VM is not started.
+        echo "agent-vm: localhost:${toString ports.broker} is taken by a program that is not the broker." >&2
+        echo "agent-vm: not starting. Find it with: lsof -nP -iTCP:${toString ports.broker} -sTCP:LISTEN" >&2
+        exit 1
       fi
 
       # The broker must outlive this terminal. Job control (`set -m`) puts it
@@ -127,8 +153,12 @@ let
       # reach it, and it ignores the hangup signal sent when the terminal
       # closes.
       set -m
+      # The background broker always uses the repo's rules. A rules file
+      # named in the shell is for \`nix run .#broker\` only, so that one
+      # left over from an experiment cannot quietly replace them.
       (
         trap "" HUP
+        unset AGENT_BROKER_RULES
         exec ${brokerRun}/bin/agent-vm-broker-run
       ) >>"$state/broker.log" 2>&1 </dev/null &
       pid=$!
@@ -228,7 +258,14 @@ in
         echo "agent-vm: ends, the VM has no way out until a broker is started again." >&2
         stop_broker
       fi
+      if [ -n "''${AGENT_BROKER_RULES:-}" ]; then
+        echo "agent-vm: using the rules in $AGENT_BROKER_RULES, not the repo's." >&2
+      fi
 
+      # Recorded so that \`nix run .#vm\` can tell this broker from some
+      # other program on the port. \`exec\` keeps the process id.
+      mkdir -p "$state"
+      echo "$$" >"$state/broker-foreground.pid"
       exec ${brokerRun}/bin/agent-vm-broker-run "$@"
     '';
   };
@@ -289,7 +326,25 @@ in
   check = writeShellApplication {
     name = "agent-vm-check";
     text = ''
-      ${ssh}/bin/agent-vm-ssh bash -s <${../tests/network-lock.sh}
+      state=${stateDir}
+
+      # One check sends a TLS hello with the wrong site name. Only the
+      # broker's log can show that the broker is what stopped it.
+      count() { grep -c " tls tls-name-differs" "$state/broker.log" 2>/dev/null || true; }
+      before=$(count)
+
+      status=0
+      ${ssh}/bin/agent-vm-ssh bash -s <${../tests/network-lock.sh} || status=$?
+
+      echo "On the Mac:"
+      if [ "$(count)" -gt "$before" ]; then
+        echo "  ok    the broker logged the wrong site name as refused"
+      else
+        echo "  FAIL  the broker logged the wrong site name as refused"
+        echo "        (not checked when the broker runs in a terminal, where it has no log file)"
+        status=1
+      fi
+      exit "$status"
     '';
   };
 

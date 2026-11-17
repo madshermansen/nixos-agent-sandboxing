@@ -51,9 +51,11 @@ The only credential in the VM today is the Claude sign-in you do inside it.
    agent why and what to ask you for.
 
 The broker does not open the encrypted traffic it passes on. It checks that
-the site named inside the encrypted connection is the one the request asked
-for, because without that check an allowed site would also give access to
-every other site hosted on the same servers.
+the site named at the start of the encrypted connection is the one the
+request asked for, and refuses a connection that hides that name. This makes
+it harder to reach other sites that share servers with an allowed one. It is
+not a guarantee: what is sent later inside the encryption cannot be seen, so
+how strict the separation is depends on the hosting company.
 
 If `rules.yaml` is missing or has a mistake, the broker refuses to start, and
 the VM is not started without it. It never falls back to letting everything
@@ -108,6 +110,10 @@ and T3's data.
   reachable, because their address is not on the list; keep it that way.
 - **Programs on the Mac can use the broker's port.** Harmless today. Once the
   broker adds tokens, any local program could make requests with them.
+- **Wearing out the Mac.** QEMU starts a small helper program on the Mac for
+  each connection the VM opens. A program in the VM that opens thousands at
+  once can use up the processes your account may run, and slow the Mac down
+  until the VM is stopped.
 - **A bug in the broker.** It is the one program on the Mac that reads what
   the VM sends, and it runs with your rights. Confining it is planned.
 - **The Mac itself.** Everything here protects the Mac from the VM, not the

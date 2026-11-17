@@ -91,8 +91,12 @@ The reply should name Linux and the host `agent-vm`.
 - **Every listed host is a place data can be sent.** Add one only when a
   task needs it, with a `note` saying why.
 - **Log lines** are `time event host port how [reason]`, with the event one
-  of `started`, `allowed`, `refused`, `failed`. Never log paths, headers or
-  bodies.
+  of `allowed`, `refused`, `failed`. A `started` line, with the number of
+  destinations and the rules file, marks each broker start. Never log paths,
+  headers or bodies.
+- **Only a broker of ours may hold the port.** `nix run .#vm` refuses to
+  start when `localhost:8474` is taken by anything but a broker started with
+  `nix run .#broker`.
 - **mitmdump ignores an unknown `--set` option,** so the rules path is passed
   as the `AGENT_BROKER_RULES` variable.
 - **State files** in `~/.local/state/agent-vm`: `disk.qcow2`, `ssh_key`,

@@ -17,7 +17,9 @@ What the broker does in this phase:
       2026-01-31T12:00:01+01:00 refused example.com 443 connect host-not-listed
 
   The fields are the time, the decision, the host, the port, how the request
-  arrived, and for a refusal the reason. Nothing from inside a request is
+  arrived, and for a refusal the reason. The site named inside an encrypted
+  connection is checked too, but only its first, readable message: what is
+  sent after that cannot be seen here. Nothing from inside a request is
   logged: no paths, no headers, no bodies. Two more kinds of line exist:
   "started" when the broker starts, and "failed" when an allowed destination
   could not be reached.
@@ -45,6 +47,9 @@ RULES_ENV = "AGENT_BROKER_RULES"
 
 # Used for a destination that has no `ports` list.
 DEFAULT_PORTS = frozenset({443})
+
+# The number of the "encrypted client hello" part of a TLS hello message.
+ENCRYPTED_CLIENT_HELLO = 0xFE0D
 
 # The error mitmproxy is given for a connection stopped at the last gate.
 REFUSED_OUTGOING = "refused by the sandbox broker"
@@ -76,6 +81,8 @@ def load_rules(path: str) -> dict[str, frozenset[int]]:
             data = YAML(typ="safe").load(file)
     except OSError as error:
         raise RulesError(f"cannot read it: {error.strerror}") from error
+    except UnicodeDecodeError as error:
+        raise RulesError("it is not plain UTF-8 text") from error
     except YAMLError as error:
         raise RulesError(f"it is not valid YAML: {error}") from error
 
@@ -111,8 +118,15 @@ def load_rules(path: str) -> dict[str, frozenset[int]]:
                 f"{where}: `host` must be one exact host name such as "
                 "api.github.com, without https://, a port, a path or a wildcard"
             )
-        if _is_ip_address(host):
-            raise RulesError(f"{where}: `host` must be a name, not an IP address")
+        # Besides "127.0.0.1", programs also read "127.1", "0x7f.0.0.1" and
+        # "2130706433" as addresses. A real host name on the internet has a
+        # dot and does not end in a number, which rules all of those out,
+        # and "localhost" with them.
+        if _is_ip_address(host) or "." not in host or host.rsplit(".", 1)[1].isdigit():
+            raise RulesError(
+                f"{where}: `host` must be a full name such as api.github.com, "
+                "not an IP address or a short local name"
+            )
         if host in rules:
             raise RulesError(f"{where} is listed twice")
 
@@ -212,11 +226,17 @@ class Broker:
         """A program in the VM asks for a tunnel to host:port."""
         self.decide(flow, "connect")
 
-    def request(self, flow: http.HTTPFlow) -> None:
+    def requestheaders(self, flow: http.HTTPFlow) -> None:
         """A request the broker can read: plain HTTP, not inside TLS.
 
         mitmproxy sends it to flow.request.host and port, so those are what
         is checked, not the Host header.
+
+        The decision is made here, when only the first lines of the request
+        have arrived, and not after the whole request has been read. The
+        size of what may follow is capped by `body_size_limit` in the start
+        command. Together they keep a program in the VM from filling the
+        Mac's memory with a request that never ends.
         """
         self.decide(flow, "http")
 
@@ -236,11 +256,16 @@ class Broker:
             log("refused", "-", 0, "tls", "not-in-a-tunnel")
             return
         host, port = address[0], address[1]
-        if self.refusal(host, port) is not None:
+        reason = self.refusal(host, port)
+        if reason is not None:
             # The tunnel was refused already; this is only a safeguard.
-            log("refused", host, port, "tls", "host-not-listed")
+            log("refused", host, port, "tls", reason)
         elif name is None or name.lower() != host.lower():
             log("refused", host, port, "tls", "tls-name-differs", name or "-")
+        elif any(kind == ENCRYPTED_CLIENT_HELLO for kind, _ in data.client_hello.extensions):
+            # The message carries a second, encrypted site name that the
+            # broker cannot read, so the name it did read proves nothing.
+            log("refused", host, port, "tls", "tls-name-hidden")
         else:
             data.ignore_connection = True
 
@@ -256,7 +281,6 @@ class Broker:
         data.ssl_conn = SSL.Connection(SSL.Context(SSL.TLS_SERVER_METHOD))
         data.ssl_conn.set_accept_state()
 
-
     def server_connect(self, data: server_hooks.ServerConnectionHookData) -> None:
         """The last gate: mitmproxy is about to open a connection to a server.
 
@@ -267,8 +291,9 @@ class Broker:
         """
         address = data.server.address
         host, port = (address[0], address[1]) if address else ("-", 0)
-        if address is None or self.refusal(host, port) is not None:
-            log("refused", host, port, "outgoing", "host-not-listed")
+        reason = "no-address" if address is None else self.refusal(host, port)
+        if reason is not None:
+            log("refused", host, port, "outgoing", reason)
             data.server.error = REFUSED_OUTGOING
 
     def server_connect_error(self, data: server_hooks.ServerConnectionHookData) -> None:

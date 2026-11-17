@@ -56,6 +56,12 @@ curl -sv --max-time 15 https://example.com 2>&1 | grep -q "Refused by the sandbo
   pass "an allowed host on another port is refused" ||
   fail "an allowed host on another port is refused"
 
+# A tunnel to an allowed host, but the encrypted connection inside names a
+# different site. Certificate checking is off, so that only the broker can be
+# what stops it. Without the broker's check this would get an answer.
+must_fail "a tunnel cannot be used for a different site" \
+  curl -sk --max-time 15 --connect-to example.com:443:github.com:443 https://example.com
+
 must_work "GitHub's API answers" \
   curl -sf --max-time 15 https://api.github.com/zen
 
@@ -79,9 +85,33 @@ must_fail "a direct connection by address is blocked" \
 must_fail "names cannot be looked up" \
   timeout 6 getent hosts example.com
 
-must_fail "the Mac itself is out of reach" \
-  curl -s --noproxy '*' --max-time 6 http://10.0.2.2:3773
+# The VM is given no name server, so the check above would pass even without
+# the lock. These two ask QEMU's built-in name server and a public one
+# directly, with a hand-made question for "example.com".
+dns_answers() {
+  timeout 5 bash -c '
+    exec 3<>"/dev/udp/$1/53" || exit 1
+    printf "\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01" >&3
+    read -r -t 3 -n 1 -u 3
+  ' _ "$1"
+}
+must_fail "QEMU's own name server does not answer" dns_answers 10.0.2.3
+must_fail "a public name server is out of reach" dns_answers 1.1.1.1
 
+must_fail "QEMU's own name server refuses connections" \
+  timeout 6 bash -c 'exec 3<>/dev/tcp/10.0.2.3/53'
+
+must_fail "a direct connection over IPv6 is blocked" \
+  curl -s -6 --noproxy '*' --max-time 6 'https://[2606:4700:4700::1111]'
+
+# 10.0.2.2 is the Mac as seen from the VM. The broker listens on the Mac, so
+# something always answers on this port there; the VM must still not get to
+# it this way, only through the forward.
+must_fail "the Mac itself is out of reach" \
+  curl -s --noproxy '*' --max-time 6 http://10.0.2.2:8474
+
+# An address is used because the VM cannot look up names. It is one of
+# GitHub's; any address would do, since nothing may leave on port 22.
 must_fail "SSH to GitHub is blocked" \
   timeout 6 bash -c 'exec 3<>/dev/tcp/140.82.121.4/22'
 
