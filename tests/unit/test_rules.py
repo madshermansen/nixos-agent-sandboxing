@@ -20,9 +20,20 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
 
+def hosts_of(loaded):
+    """The rule for each host, out of what load_rules() returned.
+
+    These tests are about the hosts. The loader may hand back more than
+    that, as a pair whose first part is the hosts: the wiring of the GitHub
+    policy adds the policy as a second part. Both shapes are taken here, so
+    that these tests hold before and after that change.
+    """
+    return loaded[0] if isinstance(loaded, tuple) else loaded
+
+
 @pytest.fixture
 def load(proxy, tmp_path):
-    """load(text) writes `text` to a rules file and returns what the broker reads."""
+    """load(text) writes `text` to a rules file and returns the rule for each host."""
 
     def load(text: str | bytes):
         path = tmp_path / "rules.yaml"
@@ -30,7 +41,7 @@ def load(proxy, tmp_path):
             path.write_bytes(text)
         else:
             path.write_text(text, encoding="utf-8")
-        return proxy.load_rules(str(path))
+        return hosts_of(proxy.load_rules(str(path)))
 
     return load
 
@@ -83,15 +94,9 @@ def test_host_names_are_stored_in_lower_case(load):
     assert set(rules) == {"api.example.org"}
 
 
-def test_an_opened_destination_with_a_token(load):
-    rules = load(rules_with(entry(inspect=True, token="github")))
-    assert rules["example.org"].inspect is True
-    assert rules["example.org"].token == "github"
-
-
-def test_a_destination_may_be_opened_without_a_token(load):
-    rules = load(rules_with(entry(inspect=True)))
-    assert rules["example.org"].inspect is True
+def test_inspect_false_is_the_same_as_leaving_it_out(load):
+    rules = load(rules_with(entry(inspect=False)))
+    assert rules["example.org"].inspect is False
     assert rules["example.org"].token is None
 
 
@@ -100,14 +105,13 @@ def test_each_destination_keeps_its_own_settings(load):
         rules_with(
             entry("one.example.org"),
             entry("two.example.org", ports=[8443]),
-            entry("three.example.org", inspect=True, token="github"),
+            entry("three.example.org", ports=[443, 9000]),
         )
     )
     assert list(rules) == ["one.example.org", "two.example.org", "three.example.org"]
     assert rules["one.example.org"].ports == frozenset({443})
     assert rules["two.example.org"].ports == frozenset({8443})
-    assert rules["one.example.org"].token is None
-    assert rules["three.example.org"].token == "github"
+    assert rules["three.example.org"].ports == frozenset({443, 9000})
 
 
 def test_an_empty_list_is_valid_and_allows_nothing(proxy, load):
@@ -392,12 +396,26 @@ def test_the_host_is_checked_before_the_port(broker):
 
 @pytest.fixture(scope="module")
 def repo_rules(proxy):
-    return proxy.load_rules(str(REPO / "broker" / "rules.yaml"))
+    return hosts_of(proxy.load_rules(str(REPO / "broker" / "rules.yaml")))
 
 
 def test_the_rules_file_of_the_repo_has_no_mistake(repo_rules):
     """Otherwise the broker would not start, and neither would the VM."""
     assert repo_rules
+
+
+def test_the_repo_opens_github_and_names_its_token(repo_rules):
+    """An opened destination with a token, as the loader hands it on.
+
+    This is checked on the repo's own file and not on a made-up one: which
+    hosts may be opened at all, and what else the file must then hold, is
+    for the GitHub policy to say, and a made-up file would have to follow
+    it.
+    """
+    for host in ("github.com", "api.github.com"):
+        assert repo_rules[host].inspect is True, host
+        assert repo_rules[host].token == "github", host
+        assert repo_rules[host].ports == frozenset({443}), host
 
 
 def test_the_connectors_of_the_claude_account_stay_out_of_reach(proxy, repo_rules):
