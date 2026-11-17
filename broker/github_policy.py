@@ -97,8 +97,9 @@ class Repo:
     # May pull requests be merged from the sandbox? Only with `write`.
     merge: bool = False
     # GitHub's number for the repo, taken from the `id` in the rules. GraphQL
-    # names things by id instead of by owner and name, and this number is how
-    # an id is tied back to a listed repo. None when the rules give no `id`.
+    # names the repo by its id when a pull request is opened, and this number
+    # is how that id is tied back to a listed repo. None when the rules give
+    # no `id`.
     number: int | None = None
 
     @property
@@ -151,7 +152,7 @@ def load_policy(data: object) -> Policy:
             - repo: some-owner/some-repo
               note: Why the agent needs this repo.
               access: write          # or: read
-              id: R_kgDOExample      # optional; see docs/github-rules.md
+              id: R_kgDOExample      # optional; `gh pr create` needs it
               merge: false           # optional; only with access: write
           other_repos: refuse        # optional; or: read-public
     """
@@ -292,8 +293,17 @@ class Decision:
 class _Refusal(Exception):
     """Raised anywhere below to refuse the request being looked at."""
 
-    def __init__(self, reason: str, what: str, ask: str) -> None:
+    def __init__(self, reason: str, what: str, ask: str, *, other_way: bool = False) -> None:
         super().__init__(reason)
+        # Most refusals cannot be got around, and the agent is told not to
+        # try. A few have another request that is allowed, named in `ask`.
+        again = (
+            "Sending this request again will\n"
+            "not help. Another request will, and it is given below.\n"
+            if other_way
+            else "Trying again, or sending the same\n"
+            "request in another way or with another tool, will not help.\n"
+        )
         self.decision = Decision(
             allowed=False,
             reason=reason,
@@ -303,8 +313,7 @@ class _Refusal(Exception):
                 "This machine is a sandbox. Its requests to GitHub go through a\n"
                 "broker on the host. The broker adds the GitHub token, and lets\n"
                 "through only what the `github` rules in broker/rules.yaml of the\n"
-                "nixt3 repo on the host allow. Trying again, or sending the same\n"
-                "request in another way or with another tool, will not help.\n"
+                f"nixt3 repo on the host allow. {again}"
                 "\n"
                 f"{ask}\n"
             ),
@@ -326,11 +335,40 @@ ASK_MERGE = (
     "set `merge: true` on the repo in that file and restart the broker."
 )
 ASK_ID = (
-    "GraphQL names things by an id, and the broker can only tie an id to a\n"
-    "listed repo when the rules hold that repo's own `id`. If this is a listed\n"
-    "repo, tell the user that its entry needs an `id`; the command for it is\n"
-    "in docs/github-rules.md of the nixt3 repo. If it is another repo, tell\n"
-    "the user the task needs that repo listed."
+    "The broker knows a repo's id only from the `id` in that repo's entry in\n"
+    "the rules. If this is a listed repo, tell the user that its entry needs\n"
+    "an `id`; the command for it is in docs/github-rules.md of the nixt3\n"
+    "repo. If it is another repo, tell the user the task needs that repo\n"
+    "listed."
+)
+WHY_NOT_BY_ID = (
+    "GitHub finds a pull request, issue, comment or review by its id\n"
+    "whatever repo the id claims to be in, so the broker cannot keep such a\n"
+    "request to the allowed repos."
+)
+ASK_REST = (
+    WHY_NOT_BY_ID + " The REST API does the same job with the\n"
+    "repo in the address, and that is allowed in a repo listed with\n"
+    "`access: write`:\n"
+    "\n"
+    "    {call}\n"
+    "\n"
+    "Put your own values where the words are in capitals.{note}"
+)
+ASK_NO_REST = (
+    WHY_NOT_BY_ID + " GitHub has no other request for this job,\n"
+    "so it cannot be done from the sandbox. Tell the user what is needed and\n"
+    "let them do it."
+)
+ASK_READ_BY_NAME = (
+    WHY_NOT_BY_ID + " Read it by repo and number instead:\n"
+    "\n"
+    "    gh pr view NUMBER --repo OWNER/REPO --json statusCheckRollup,reviews,comments\n"
+    "    gh api repos/OWNER/REPO/pulls/NUMBER\n"
+    "    gh api repos/OWNER/REPO/commits/SHA/check-runs\n"
+    "\n"
+    "`gh pr checks` reads by id and does not work here. The first line above\n"
+    "gives the same checks."
 )
 ASK_NEVER = (
     "No rule allows this from the sandbox, on purpose. If the task needs it,\n"
@@ -1170,41 +1208,44 @@ def _json_object(headers: dict[str, list[str]], body: bytes) -> dict[str, object
 # ---------------------------------------------------------------------------
 
 # GraphQL names a thing by an id such as "PR_kwDOAbCdEf8AAAABPlDjjg" instead
-# of by repo and number. GitHub calls these ids opaque and does not promise
-# their make-up, but since 2021 it has been this: a few letters for the kind
-# of thing, an underscore, and a short list of numbers packed with
-# MessagePack and base64. For a thing that lives in a repo the list is
-# [0, the repo's number, the thing's own number], and for a repo itself it is
-# [0, the repo's number].
+# of by repo and number. An id is a few letters for the kind of thing, an
+# underscore, and a short list of numbers packed with MessagePack and
+# base64. For a repo the list is [0, the repo's number]. For a thing inside
+# a repo, such as a pull request, an issue, a comment or a review, it is
+# [0, the repo's number, the thing's own number].
 #
-# That is the only way to tell which repo an id belongs to without asking
-# GitHub, so it is used. If GitHub changes the make-up, ids stop being
-# understood and requests that need them are refused, which is the safe way
-# to fail. Older things have ids of another make-up that does not hold the
-# repo's number; those are refused for the same reason, except a repo's own
-# old id, which holds its number in plain text.
+# Only a repo's id says which repo it means. For everything else, GitHub
+# finds the thing by its own number, the last one, and does not look at the
+# repo's number in front of it. An id made of a listed repo's number and the
+# number of a pull request in some other repo is answered with that other
+# pull request. This was seen on GitHub, not read in its documentation: the
+# id of a real pull request with the repo's number replaced by 1 still gave
+# the same pull request.
+#
+# So an id of that kind proves nothing about the repo, and nothing else in
+# such a request does either. The only way to know would be to ask GitHub,
+# and this module asks nobody. A request that names its target only by such
+# an id is therefore refused, and the refusal names the REST request that
+# does the same job with the repo in its address (`BY_ID` below).
+#
+# A repo's own id is trusted: its one number is the repo, and there is no
+# second number for GitHub to go by instead. Repos from before 2021 have an
+# id of an older make-up, which holds the same number in plain text.
 NEW_ID = re.compile(r"([A-Z]{1,8})_([A-Za-z0-9_-]{4,64})")
 OLD_REPO_ID = re.compile(rb"010:Repository([1-9][0-9]{0,18})")
 OLD_ID_TEXT = re.compile(r"[A-Za-z0-9+/]{8,128}={0,2}")
 
-# The kinds of thing, by the letters their ids start with.
-PULL = "PR"
-ISSUE = "I"
-ISSUE_COMMENT = "IC"
-REVIEW = "PRR"
-REVIEW_COMMENT = "PRRC"
-REVIEW_THREAD = "PRRT"
+# The letter a repo's id starts with.
 REPO = "R"
 
 
-def _unpack(packed: bytes) -> tuple[int, ...] | None:
-    """Read a MessagePack list of two or three whole numbers, and only that."""
-    if not packed or packed[0] not in (0x92, 0x93):
+def _unpack(packed: bytes) -> tuple[int, int] | None:
+    """Read a MessagePack list of exactly two whole numbers, and only that."""
+    if not packed or packed[0] != 0x92:
         return None
-    count = packed[0] - 0x90
     numbers = []
     at = 1
-    for _ in range(count):
+    for _ in range(2):
         if at >= len(packed):
             return None
         first = packed[at]
@@ -1219,58 +1260,47 @@ def _unpack(packed: bytes) -> tuple[int, ...] | None:
         at += size
     if at != len(packed):
         return None
-    return tuple(numbers)
-
-
-def _id_parts(node_id: object) -> tuple[str, tuple[int, ...]] | None:
-    """Split an id of the newer make-up into its kind and its numbers."""
-    if not isinstance(node_id, str):
-        return None
-    match = NEW_ID.fullmatch(node_id)
-    if not match:
-        return None
-    text = match.group(2)
-    try:
-        packed = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
-    except (binascii.Error, ValueError):
-        return None
-    numbers = _unpack(packed)
-    if numbers is None or numbers[0] != 0:
-        return None
-    return match.group(1), numbers
+    return numbers[0], numbers[1]
 
 
 def _repo_number(node_id: object) -> int | None:
-    """The repo's number from a repo's id, of either make-up."""
-    parts = _id_parts(node_id)
-    if parts:
-        kind, numbers = parts
-        return numbers[1] if kind == REPO and len(numbers) == 2 else None
-    if isinstance(node_id, str) and OLD_ID_TEXT.fullmatch(node_id):
+    """The repo's number from a repo's id, or None for anything else.
+
+    "Anything else" includes the id of a thing inside a repo. That id holds
+    a repo's number too, but not one that can be believed.
+    """
+    if not isinstance(node_id, str):
+        return None
+    match = NEW_ID.fullmatch(node_id)
+    if match:
+        text = match.group(2)
         try:
-            match = OLD_REPO_ID.fullmatch(base64.b64decode(node_id, validate=True))
+            packed = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
         except (binascii.Error, ValueError):
             return None
-        if match:
-            return int(match.group(1))
+        numbers = _unpack(packed)
+        if match.group(1) != REPO or numbers is None or numbers[0] != 0:
+            return None
+        return numbers[1]
+    if OLD_ID_TEXT.fullmatch(node_id):
+        try:
+            old = OLD_REPO_ID.fullmatch(base64.b64decode(node_id, validate=True))
+        except (binascii.Error, ValueError):
+            return None
+        if old:
+            return int(old.group(1))
     return None
 
 
-def _repo_of_id(node_id: object, kinds: tuple[str, ...], policy: Policy) -> Repo:
-    """The listed repo that the thing with this id lives in, or a refusal."""
-    number = None
-    if REPO in kinds:
-        number = _repo_number(node_id)
-    if number is None:
-        parts = _id_parts(node_id)
-        if parts and parts[0] in kinds and parts[0] != REPO and len(parts[1]) == 3:
-            number = parts[1][1]
+def _listed_repo(node_id: object, policy: Policy) -> Repo:
+    """The listed repo with this id, or a refusal."""
+    number = _repo_number(node_id)
     repo = policy.find_number(number) if number is not None else None
     if repo is None:
         raise _Refusal(
             "graphql-id-not-listed",
-            "the request names something by an id that the broker cannot tie "
-            "to a listed repo.",
+            "the request names a repo by an id, and it is not the id of a "
+            "repo the broker has in its rules.",
             ASK_ID,
         )
     return repo
@@ -1674,7 +1704,7 @@ def _resolve(value: object, operation: _Operation, variables: dict[str, object])
 # Where a query may start. Each is checked below.
 #
 #   repository  one repo, by owner and name, which must be listed
-#   node        one thing by id, which must be in a listed repo
+#   node        one listed repo, by the repo's own id; nothing else by id
 #   search      issues and pull requests, kept to listed repos
 #   viewer      the account behind the token: its name and id only
 #   user        another account: its name and id only (to request a review)
@@ -1712,47 +1742,125 @@ CLOSED_FIELDS = {"collaborators": "collaborators", "deployKeys": "deploy-keys"}
 
 SEARCH_TYPES = frozenset({"ISSUE", "ISSUE_ADVANCED"})
 
-# The changes ("mutations") that are allowed, and for each one the names in
-# its input that hold an id, with the kinds of thing the id may be. Every id
-# that is present must belong to a listed `write` repo, and at least one must
-# be present. A mutation that is not here is refused.
-ON_PULL = {"pullRequestId": (PULL,)}
-ON_PULL_OR_ISSUE = (PULL, ISSUE)
-MUTATIONS: dict[str, dict[str, tuple[str, ...]]] = {
-    # Pull requests.
-    "createPullRequest": {"repositoryId": (REPO,), "headRepositoryId": (REPO,)},
-    "updatePullRequest": ON_PULL,
-    "closePullRequest": ON_PULL,
-    "reopenPullRequest": ON_PULL,
-    "markPullRequestReadyForReview": ON_PULL,
-    "convertPullRequestToDraft": ON_PULL,
-    "updatePullRequestBranch": ON_PULL,
-    "requestReviews": ON_PULL,
-    "requestReviewsByLogin": ON_PULL,
-    # Reviews.
-    "addPullRequestReview": ON_PULL,
-    "submitPullRequestReview": {"pullRequestId": (PULL,), "pullRequestReviewId": (REVIEW,)},
-    "updatePullRequestReview": {"pullRequestReviewId": (REVIEW,)},
-    "deletePullRequestReview": {"pullRequestReviewId": (REVIEW,)},
-    "addPullRequestReviewThread": {"pullRequestId": (PULL,), "pullRequestReviewId": (REVIEW,)},
-    "addPullRequestReviewThreadReply": {
-        "pullRequestReviewThreadId": (REVIEW_THREAD,),
-        "pullRequestReviewId": (REVIEW,),
-    },
-    "updatePullRequestReviewComment": {"pullRequestReviewCommentId": (REVIEW_COMMENT,)},
-    "deletePullRequestReviewComment": {"id": (REVIEW_COMMENT,)},
-    "resolveReviewThread": {"threadId": (REVIEW_THREAD,)},
-    "unresolveReviewThread": {"threadId": (REVIEW_THREAD,)},
-    # Comments, on pull requests and issues alike.
-    "addComment": {"subjectId": ON_PULL_OR_ISSUE},
-    "updateIssueComment": {"id": (ISSUE_COMMENT,)},
-    "deleteIssueComment": {"id": (ISSUE_COMMENT,)},
-    "addReaction": {"subjectId": (PULL, ISSUE, ISSUE_COMMENT, REVIEW, REVIEW_COMMENT)},
-    "removeReaction": {"subjectId": (PULL, ISSUE, ISSUE_COMMENT, REVIEW, REVIEW_COMMENT)},
-    # Labels.
-    "addLabelsToLabelable": {"labelableId": ON_PULL_OR_ISSUE},
-    "removeLabelsFromLabelable": {"labelableId": ON_PULL_OR_ISSUE},
+# The one change ("mutation") that is allowed, with the names in its input
+# that hold the id of a repo. The first must be there, and each one that is
+# there must be the id of a listed `write` repo. This is how `gh pr create`
+# opens a pull request. It can be allowed because a repo's id can be trusted
+# (see "Ids" above).
+MUTATIONS: dict[str, tuple[str, ...]] = {
+    "createPullRequest": ("repositoryId", "headRepositoryId"),
 }
+
+# Changes that name their target only by the id of a pull request, an issue,
+# a comment, a review or a review thread. That id does not prove a repo (see
+# "Ids" above), so each of these is refused, whatever id it is given.
+#
+# For each: the gh commands that send it, and the REST request that does the
+# same job with the repo in its address, as a line the agent can run. None
+# where GitHub has no such request.
+BY_ID: dict[str, tuple[str, str | None]] = {
+    # Comments, on pull requests and issues alike.
+    "addComment": (
+        "`gh pr comment` and `gh issue comment` send it",
+        "gh api repos/OWNER/REPO/issues/NUMBER/comments -f body='TEXT'",
+    ),
+    "updateIssueComment": (
+        "`gh pr comment --edit-last` sends it",
+        "gh api -X PATCH repos/OWNER/REPO/issues/comments/COMMENT_ID -f body='TEXT'",
+    ),
+    "deleteIssueComment": (
+        "`gh pr comment --delete-last` sends it",
+        "gh api -X DELETE repos/OWNER/REPO/issues/comments/COMMENT_ID",
+    ),
+    # Pull requests.
+    "updatePullRequest": (
+        "`gh pr edit` sends it",
+        "gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title='TITLE' -f body='TEXT'",
+    ),
+    "closePullRequest": (
+        "`gh pr close` sends it",
+        "gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f state=closed",
+    ),
+    "reopenPullRequest": (
+        "`gh pr reopen` sends it",
+        "gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f state=open",
+    ),
+    "updatePullRequestBranch": (
+        "`gh pr update-branch` sends it",
+        "gh api -X PUT repos/OWNER/REPO/pulls/NUMBER/update-branch",
+    ),
+    "requestReviews": (
+        "`gh pr edit --add-reviewer` and `gh pr create --reviewer` send it",
+        "gh api repos/OWNER/REPO/pulls/NUMBER/requested_reviewers -f 'reviewers[]=LOGIN'",
+    ),
+    "requestReviewsByLogin": (
+        "`gh pr edit --add-reviewer` and `gh pr create --reviewer` send it",
+        "gh api repos/OWNER/REPO/pulls/NUMBER/requested_reviewers -f 'reviewers[]=LOGIN'",
+    ),
+    "markPullRequestReadyForReview": ("`gh pr ready` sends it", None),
+    "convertPullRequestToDraft": ("`gh pr ready --undo` sends it", None),
+    # Reviews.
+    "addPullRequestReview": (
+        "`gh pr review` sends it",
+        "gh api repos/OWNER/REPO/pulls/NUMBER/reviews -f event=COMMENT -f body='TEXT'",
+    ),
+    "submitPullRequestReview": (
+        "",
+        "gh api repos/OWNER/REPO/pulls/NUMBER/reviews/REVIEW_ID/events -f event=COMMENT",
+    ),
+    "updatePullRequestReview": (
+        "",
+        "gh api -X PUT repos/OWNER/REPO/pulls/NUMBER/reviews/REVIEW_ID -f body='TEXT'",
+    ),
+    "deletePullRequestReview": (
+        "",
+        "gh api -X DELETE repos/OWNER/REPO/pulls/NUMBER/reviews/REVIEW_ID",
+    ),
+    "addPullRequestReviewThread": (
+        "",
+        "gh api repos/OWNER/REPO/pulls/NUMBER/comments -f body='TEXT' -f commit_id=SHA -f path=FILE -F line=LINE",
+    ),
+    "addPullRequestReviewThreadReply": (
+        "",
+        "gh api repos/OWNER/REPO/pulls/NUMBER/comments/COMMENT_ID/replies -f body='TEXT'",
+    ),
+    "updatePullRequestReviewComment": (
+        "",
+        "gh api -X PATCH repos/OWNER/REPO/pulls/comments/COMMENT_ID -f body='TEXT'",
+    ),
+    "deletePullRequestReviewComment": (
+        "",
+        "gh api -X DELETE repos/OWNER/REPO/pulls/comments/COMMENT_ID",
+    ),
+    "resolveReviewThread": ("", None),
+    "unresolveReviewThread": ("", None),
+    # Labels and reactions.
+    "addLabelsToLabelable": (
+        "`gh pr edit --add-label` sends it",
+        "gh api repos/OWNER/REPO/issues/NUMBER/labels -f 'labels[]=LABEL'",
+    ),
+    "removeLabelsFromLabelable": (
+        "`gh pr edit --remove-label` sends it",
+        "gh api -X DELETE repos/OWNER/REPO/issues/NUMBER/labels/LABEL",
+    ),
+    "addReaction": (
+        "",
+        "gh api repos/OWNER/REPO/issues/NUMBER/reactions -f content=+1",
+    ),
+    "removeReaction": (
+        "",
+        "gh api -X DELETE repos/OWNER/REPO/issues/NUMBER/reactions/REACTION_ID",
+    ),
+    # Merging.
+    "mergePullRequest": (
+        "`gh pr merge` sends it",
+        "gh api -X PUT repos/OWNER/REPO/pulls/NUMBER/merge",
+    ),
+    "enablePullRequestAutoMerge": ("`gh pr merge --auto` sends it", None),
+    "disablePullRequestAutoMerge": ("`gh pr merge --disable-auto` sends it", None),
+    "enqueuePullRequest": ("", None),
+}
+MERGE_NOTE = " This one also needs\n`merge: true` on the repo in the rules."
 
 # Mutations that only assign, and the names under which other mutations can
 # assign on the side. `agentAssignment` also holds the id of a repo for the
@@ -1765,13 +1873,22 @@ ASSIGNING_INPUTS = ("assigneeIds", "assignees", "agentAssignment")
 # Issues may be read and commented on, not created, edited or closed.
 ISSUE_MUTATIONS = frozenset({"createIssue", "updateIssue", "closeIssue", "reopenIssue"})
 
-# Allowed only in a repo with `merge: true`.
-MERGE_MUTATIONS: dict[str, dict[str, tuple[str, ...]]] = {
-    "mergePullRequest": ON_PULL,
-    "enablePullRequestAutoMerge": ON_PULL,
-    "disablePullRequestAutoMerge": ON_PULL,
-    "enqueuePullRequest": ON_PULL,
-}
+
+def _by_id(name: str) -> _Refusal:
+    """The refusal for a change that names its target only by an id."""
+    sent_by, call = BY_ID[name]
+    what = (
+        f"the GraphQL mutation `{name}` names what it changes only by an id, "
+        "and an id does not prove which repo that is in."
+    )
+    if sent_by:
+        what += f" ({sent_by}.)"
+    if call is None:
+        return _Refusal("graphql-by-id", what, ASK_NO_REST)
+    note = MERGE_NOTE if name == "mergePullRequest" else ""
+    return _Refusal(
+        "graphql-by-id", what, ASK_REST.format(call=call, note=note), other_way=True
+    )
 
 
 def _malformed(what: str) -> _Refusal:
@@ -1930,11 +2047,18 @@ def _query_start(
 
     if name == "node":
         node_id = _resolve(field.arguments.get("id", _UNKNOWN), operation, variables)
-        return _repo_of_id(
-            node_id,
-            (REPO, PULL, ISSUE, ISSUE_COMMENT, REVIEW, REVIEW_COMMENT, REVIEW_THREAD),
-            policy,
-        )
+        if _repo_number(node_id) is None:
+            # Not a repo's id, so most likely the id of a pull request or a
+            # comment, which proves nothing about the repo.
+            raise _Refusal(
+                "graphql-by-id",
+                "the query asks for something by its id, and an id does not "
+                "prove which repo that is in. Only a listed repo can be "
+                "asked for by id.",
+                ASK_READ_BY_NAME,
+                other_way=True,
+            )
+        return _listed_repo(node_id, policy)
 
     if name == "search":
         kind = _resolve(field.arguments.get("type", _UNKNOWN), operation, variables)
@@ -2021,18 +2145,19 @@ def _mutation(
     field: _Field, operation: _Operation, variables: dict[str, object], policy: Policy
 ) -> Repo:
     name = field.name
-    merging = name in MERGE_MUTATIONS
-    ids = MERGE_MUTATIONS.get(name) or MUTATIONS.get(name)
     if name in ASSIGNING:
         raise _never("assignees")
     if name in ISSUE_MUTATIONS:
         raise _never("issues")
-    if ids is None:
+    if name in BY_ID:
+        raise _by_id(name)
+    keys = MUTATIONS.get(name)
+    if keys is None:
         raise _Refusal(
             "graphql-mutation-not-allowed",
             f"the GraphQL mutation `{_show(name, 60)}` is not one the broker "
-            "lets through. It lets through the ones gh uses to open, edit, "
-            "comment on, review and close pull requests.",
+            "lets through. The one it lets through is `createPullRequest`, "
+            "which `gh pr create` sends.",
             ASK_UNKNOWN,
         )
     given = _resolve(field.arguments.get("input", _UNKNOWN), operation, variables)
@@ -2042,28 +2167,21 @@ def _mutation(
     if any(given.get(key) for key in ASSIGNING_INPUTS):
         raise _never("assignees")
 
-    repo = None
-    for key, kinds in ids.items():
+    if given.get(keys[0]) is None:
+        raise _malformed(
+            f"`{name}` does not say which repo it is about: its input has no "
+            f"`{keys[0]}`."
+        )
+    repos = []
+    for key in keys:
         if given.get(key) is None:
             continue
-        found = _repo_of_id(given[key], kinds, policy)
+        found = _listed_repo(given[key], policy)
         if not found.write:
             raise _Refusal(
                 "repo-read-only",
                 f"{found.full_name} is listed for reading only.",
                 ASK_WRITE,
             )
-        if merging and not found.merge:
-            raise _Refusal(
-                "merge",
-                f"merging pull requests in {found.full_name} is not allowed "
-                "from the sandbox.",
-                ASK_MERGE,
-            )
-        repo = repo or found
-    if repo is None:
-        raise _malformed(
-            f"`{name}` does not say what it is about: its input has no "
-            f"`{next(iter(ids))}`."
-        )
-    return repo
+        repos.append(found)
+    return repos[0]

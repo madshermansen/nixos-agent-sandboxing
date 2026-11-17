@@ -40,6 +40,13 @@ Anything the broker does not recognise is refused. That includes harmless
 requests nobody thought of; the rule is "allowed if known", not "refused if
 known to be bad".
 
+One thing to know before the rest: **most `gh pr` commands that change
+something are refused**, although the change itself is allowed. `gh` sends
+them in a form that names the pull request only by an id, and an id does not
+prove which repo it is in. The same change goes through with `gh api`, which
+names the repo. [Which `gh` commands work](#which-gh-commands-work) has the
+list, and the refusal the agent gets names the command to use instead.
+
 ## Listing a repo
 
 The rules are the `github` part of [`broker/rules.yaml`](../broker/rules.yaml),
@@ -67,7 +74,7 @@ Each repo has:
 | `repo` | One exact repo as `owner/name`. No wildcards, no `.git`. Upper and lower case are treated the same, as GitHub does. |
 | `note` | A few words on why the agent needs it. Required, so nobody has to guess later whether the entry can go. |
 | `access` | `read`: clone, fetch, and read pull requests, issues and checks. `write`: also push, work on pull requests, and comment. Required; there is no default. |
-| `id` | Optional. GitHub's id for the repo. Without it, `gh` cannot change anything in the repo; see below. |
+| `id` | Optional. GitHub's id for the repo. Without it, `gh pr create` is refused for the repo; see below. |
 | `merge` | Optional, `true` or `false`. Whether the agent may merge pull requests. Off unless you turn it on, and only with `access: write`. |
 
 Get the `id` with:
@@ -76,14 +83,13 @@ Get the `id` with:
 gh repo view your-name/your-repo --json id --jq .id
 ```
 
-**Why the `id`.** `gh` does most of its work through GraphQL, a second API
-that names things by an id (`PR_kwDO...`) instead of by repo and number. When
-`gh` comments on a pull request, the request holds only that id. The id has
-the repo's number inside it, and the `id` in the rules is how the broker
-knows that number belongs to a listed repo. A repo listed without `id` still
-works with `git` and with `gh` commands that only read; `gh pr create`,
-`gh pr comment` and the like are refused for it, with a message that says
-the entry needs an `id`.
+**Why the `id`.** `gh pr create` opens a pull request through GraphQL, a
+second API, and names the repo there by its id (`R_kgDO...`), not by owner
+and name. The `id` in the rules is how the broker knows which listed repo
+that is. A repo listed without `id` works with `git`, with every `gh` command
+that reads, and with `gh api`; only `gh pr create` is refused for it, with a
+message that says the entry needs an `id`. A pull request can also be opened
+without it: `gh api repos/OWNER/REPO/pulls -f title=... -f head=... -f base=...`.
 
 After a change to the file, restart the broker: `nix run .#broker`, or
 restart the VM. A mistake in the file stops the broker from starting, with a
@@ -152,7 +158,7 @@ On `api.github.com`, under `/repos/OWNER/NAME`:
 - **Changing**, in a `write` repo: creating and editing pull requests;
   comments, reviews, review requests, labels and reactions on them; updating
   a pull request's branch from its base; deleting a branch
-  (`DELETE /git/refs/heads/...`, which `gh pr close --delete-branch` uses).
+  (`DELETE /git/refs/heads/...`).
   In this API a pull request is also an issue with the same number, and its
   comments, labels and reactions are reached under `/issues/N`. The broker
   cannot tell from a number which of the two it is, so comments, labels and
@@ -172,22 +178,84 @@ broker reads the program and checks it.
 | Start | Check |
 | --- | --- |
 | `repository(owner:, name:)` | The repo is listed. This is nearly everything `gh` reads. |
-| `node(id:)` | The id belongs to a listed repo that has an `id` in the rules. `gh pr checks` uses this. |
+| `node(id:)` | Only with the id of a listed repo itself. Asking for a pull request, an issue or a comment by its id is refused; see below. |
 | `search` | Issues and pull requests only, and the search text names listed repos with `repo:owner/name` and nothing wider. `gh pr list --search` and `gh pr status` use this. |
 | `viewer`, `user(login:)` | Only an account's name and id. |
 | `rateLimit`, `__type`, `__schema` | About the API itself. |
 
-**Mutations** (changing) are allowed by name, and only these: the ones `gh`
-uses to create, edit, close, reopen and mark ready a pull request; to
-comment, review and react; to request reviews; and to add and remove labels.
-Each one names its target by
-id, and the id must belong to a `write` repo with an `id` in the rules. The
-merging ones need `merge: true`. The exact list is `MUTATIONS` in
-`github_policy.py`.
+**Mutations** (changing): one is allowed, `createPullRequest`, which is what
+`gh pr create` sends. It names the repo by the repo's id, and that id must be
+the `id` of a `write` repo in the rules. If the branch comes from another
+repo, that one must be a listed `write` repo too.
 
 Every other mutation is refused, including ones GitHub adds in the future.
-GitHub has about 285 of them; 26 are allowed, and 4 more with
-`merge: true`.
+GitHub has about 285 of them.
+
+#### Why a pull request cannot be changed by its id
+
+GraphQL names a pull request, an issue, a comment or a review by an id such
+as `PR_kwDO...`, and a request to comment on one holds that id and nothing
+else: no owner, no repo name, no number.
+
+The id does have a repo's number inside it, next to the pull request's own
+number, and an earlier version of this policy believed it. That was wrong.
+GitHub finds the pull request by its own number and does not look at the
+repo's number at all. An id made of a listed repo's number and the number of
+a pull request somewhere else is answered with that other pull request. This
+was seen on GitHub, not read in its documentation: the id of a real pull
+request with the repo's number replaced by 1 still gave the same pull
+request.
+
+So such an id proves nothing about the repo, and the broker cannot keep a
+request that rests on one to the allowed repos. A tricked agent could post
+your code as a comment on a pull request in any repo the token can write to.
+Every mutation that names its target that way is refused, and so is reading
+one thing by such an id.
+
+A repo's own id is different. It holds one number, the repo's, and GitHub
+has nothing else to go by. That is why `createPullRequest` can be allowed.
+
+The work itself is not lost. The REST API does the same changes with the
+repo in the address, where the broker can check it.
+
+### Which `gh` commands work
+
+| Command | From the sandbox | Use instead |
+| --- | --- | --- |
+| `gh pr create` | Works, in a repo with `id` in the rules | |
+| `gh pr list`, `gh pr view`, `gh pr diff`, `gh pr status` | Work | |
+| `gh issue list`, `gh issue view`, `gh repo view` | Work | |
+| `gh run list`, `gh release list`, `gh label list` | Work | |
+| `gh api repos/OWNER/REPO/...` | Works, for what the REST section above allows | |
+| `gh pr checks` | Refused: reads by id | `gh pr view NUMBER --json statusCheckRollup` |
+| `gh pr comment`, `gh issue comment` | Refused | `gh api repos/OWNER/REPO/issues/NUMBER/comments -f body='TEXT'` |
+| `gh pr comment --edit-last` | Refused | `gh api -X PATCH repos/OWNER/REPO/issues/comments/COMMENT_ID -f body='TEXT'` |
+| `gh pr edit` | Refused | `gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title='TITLE' -f body='TEXT'` |
+| `gh pr edit --add-label` | Refused | `gh api repos/OWNER/REPO/issues/NUMBER/labels -f 'labels[]=LABEL'` |
+| `gh pr edit --add-reviewer` | Refused | `gh api repos/OWNER/REPO/pulls/NUMBER/requested_reviewers -f 'reviewers[]=LOGIN'` |
+| `gh pr close` | Refused | `gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f state=closed` |
+| `gh pr reopen` | Refused | `gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f state=open` |
+| `gh pr review` | Refused | `gh api repos/OWNER/REPO/pulls/NUMBER/reviews -f event=COMMENT -f body='TEXT'` |
+| `gh pr update-branch` | Refused | `gh api -X PUT repos/OWNER/REPO/pulls/NUMBER/update-branch` |
+| `gh pr merge` | Refused | `gh api -X PUT repos/OWNER/REPO/pulls/NUMBER/merge`, in a repo with `merge: true` |
+| `gh pr ready`, `gh pr merge --auto` | Refused | Nothing: GitHub has no request for these that names the repo. Open the pull request ready, or do it yourself. |
+
+`gh pr create` with `--reviewer` or `--label` is expected to open the pull
+request and then fail, because `gh` adds those in a second request by id.
+This was not tried. Open the pull request without them and add them with the
+`gh api` lines above.
+
+In a comment, `NUMBER` is the number of the pull request or issue. In this
+API a pull request's comments, labels and reactions are reached under
+`/issues/NUMBER`.
+
+The agent does not need this table. When one of these is refused, the text
+it gets back names the `gh api` line to use, and the tests check that each
+of those lines is itself allowed. Which mutation each `gh` command sends was
+recorded for `gh pr create`, `gh pr comment`, `gh pr comment --edit-last` and
+`gh pr checks`; for the others it is taken from how `gh` is known to work,
+and the refusal does not depend on it: the mutation is refused by its own
+name, whichever command sent it.
 
 ## What is refused on every repo, and why
 
@@ -279,7 +347,28 @@ If the task needs this repo, tell the user. They can list it under
 
 The last paragraph depends on the refusal: list the repo, give it `write`,
 turn on `merge`, add its `id`, do it yourself (for what no rule allows), or
-send the request the plain way.
+send the request the plain way. Where another request does the same job and
+is allowed, the message says so and gives it as a line to run:
+
+```
+Refused by the sandbox broker: the GraphQL mutation `addComment` names what it changes only by an id, and an id does not prove which repo that is in. (`gh pr comment` and `gh issue comment` send it.)
+
+This machine is a sandbox. Its requests to GitHub go through a
+broker on the host. The broker adds the GitHub token, and lets
+through only what the `github` rules in broker/rules.yaml of the
+nixt3 repo on the host allow. Sending this request again will
+not help. Another request will, and it is given below.
+
+GitHub finds a pull request, issue, comment or review by its id
+whatever repo the id claims to be in, so the broker cannot keep such a
+request to the allowed repos. The REST API does the same job with the
+repo in the address, and that is allowed in a repo listed with
+`access: write`:
+
+    gh api repos/OWNER/REPO/issues/NUMBER/comments -f body='TEXT'
+
+Put your own values where the words are in capitals.
+```
 
 Besides the reasons in the table above, the log can show:
 
@@ -291,8 +380,9 @@ Besides the reasons in the table above, the log can show:
 | `not-recognised` | Not a kind of request the broker knows. |
 | `github-host-not-covered` | A host other than `github.com` and `api.github.com`. |
 | `graphql-query-not-allowed` | A GraphQL query that starts somewhere else than the allowed places. |
-| `graphql-mutation-not-allowed` | A GraphQL mutation that is not on the list. |
-| `graphql-id-not-listed` | An id that the broker cannot tie to a listed repo. |
+| `graphql-mutation-not-allowed` | A GraphQL mutation other than `createPullRequest`. |
+| `graphql-by-id` | A GraphQL request that names a pull request, issue, comment or review only by its id. |
+| `graphql-id-not-listed` | A repo's id that is not the `id` of a listed repo. |
 | `graphql-account` | More than name and id asked about an account. |
 | `graphql-search` | A search that is not kept to listed repos. |
 | `graphql-walks-away` | A query that leads from a listed repo to lists of other repos or gists. |
@@ -352,16 +442,23 @@ Read this part before trusting the rest.
   query that starts at a listed repo may be able to reach other things the
   token can read by a route that is not on the list. This is about reading,
   and a token limited to the listed repos closes it.
-- **Ids are trusted for their make-up.** The broker ties a GraphQL id to a
-  repo by the repo's number inside the id. GitHub does not promise how ids
-  are made, though this has held since 2021. If it changes, ids stop being
-  understood and `gh` commands that change things are refused until this
-  module is updated; they are not let through. Things created before 2021
-  have ids without a repo number, and cannot be changed through `gh` from
-  the sandbox.
-- **Ids of small things inside a change.** A change may hold ids of labels,
-  reviewers, milestones or projects. The broker checks the id of what is
-  being changed, not these. GitHub refuses ones that do not fit.
+- **A repo's id is believed.** `gh pr create` names the repo by an id, and
+  the broker reads the repo's number out of it. GitHub does not promise how
+  ids are made, though this has held since 2021 and GitHub was seen to go by
+  that number. If the make-up changes, the id is no longer understood and
+  `gh pr create` is refused until this module is updated; it is not let
+  through. No other id is believed.
+- **The numbers in a REST address.** `PATCH /repos/OWNER/NAME/issues/comments/ID`
+  names a comment by a number that is the same across all of GitHub. The
+  broker checks the repo in the address and relies on GitHub to answer only
+  for a comment that is in that repo. For reading this was seen to hold: a
+  comment, a review comment and a review from another repo, asked for under
+  a listed repo's address, each gave "not found". For changing it could not
+  be tried without changing someone else's comment, and is taken to work the
+  same way.
+- **`gh pr ready` and resolving a review thread** cannot be done from the
+  sandbox at all. GitHub offers them only in the form that names a pull
+  request by id.
 - **Search.** The check on search text follows GitHub's search language as
   documented. It is the weakest check here. It is about reading.
 - **Mentions and links.** A comment that mentions a person notifies them. One
@@ -379,6 +476,24 @@ Read this part before trusting the rest.
   refuses what it does not know and what it fails on, and it has tests for
   every item on this page, but it can be wrong.
 
+## Possible later work
+
+**Asking GitHub which repo an id is in.** The `gh pr` commands above are
+refused because nothing in the request proves the repo. The broker could
+find out: before passing on a change by id, send GitHub a query of its own,
+`node(id: ...) { ... on PullRequest { repository { nameWithOwner } } }`, and
+let the change through only if the answer is a listed `write` repo. Then
+`gh pr comment`, `gh pr edit`, `gh pr close`, `gh pr ready` and the rest
+would work as they are.
+
+It is not built, for three reasons. The decision would stop being a pure
+function that can be tested without a network, which is what makes it
+checkable today. The broker would make requests of its own with the token,
+and every one of those needs the same care as the ones it guards. And
+between the question and the change there is a gap in which the answer
+could, in principle, stop being true. None of these rules it out; it is a
+piece of work of its own, in `proxy.py` and not in this module.
+
 ## How this was checked against GitHub
 
 - The REST paths come from GitHub's published description of its API
@@ -391,10 +506,13 @@ Read this part before trusting the rest.
   owner and repo names without regard to case, and does not accept `.git`,
   a trailing slash or an encoded letter in an API path was observed against
   a public repo.
-- The make-up of ids was observed on public repos, for repos, pull requests,
-  issues, comments, reviews and review comments. Review threads (`PRRT_`)
-  have no REST form to check against and follow the same pattern as far as
-  is known.
+- That GitHub ignores the repo's number in the id of a pull request, and
+  goes by it in the id of a repo, was observed on this project's repo, after
+  a review of this policy found that it had been assumed the other way.
+- Each REST request a refusal points to was checked against GitHub's
+  description of its API, for the path, the method and the names in the
+  body. Commenting and editing a comment that way were also done for real,
+  on this policy's own pull request.
 
 The tests are in
 [`tests/unit/test_github_policy.py`](../tests/unit/test_github_policy.py).

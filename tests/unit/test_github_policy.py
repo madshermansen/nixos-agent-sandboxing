@@ -10,10 +10,18 @@ The repos in these tests are made up. Four are listed in the rules:
     octo-org/no-id      write, but the rules hold no id for it
 
 Everything else, such as other-org/secret, is a repo that is not listed.
+
+About ids. GraphQL names things by ids, which hold numbers. A repo's id
+holds the repo's number, and GitHub goes by it. The id of a thing inside a
+repo (a pull request, an issue, a comment, a review) holds a repo's number
+too, but GitHub ignores that number and finds the thing by its own. So such
+an id only CLAIMS a repo. `claims()` below builds one, and no test may expect
+anything to be allowed on the strength of it.
 """
 
 import base64
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -1117,12 +1125,31 @@ def test_an_uncompressed_body_may_say_so():
 # These are shapes recorded from gh 2.102 with GH_DEBUG=api, with the repo
 # names swapped for the made-up ones. The long field lists are shortened.
 
-PR_ID = node_id("PR", APP, 5)
-ISSUE_ID = node_id("I", APP, 6)
-COMMENT_ID = node_id("IC", APP, 7)
-REVIEW_ID = node_id("PRR", APP, 8)
-REVIEW_COMMENT_ID = node_id("PRRC", APP, 9)
-THREAD_ID = node_id("PRRT", APP, 10)
+# The kinds of thing that live inside a repo, by the letters their ids start
+# with: pull request, issue, issue comment, review, review comment and review
+# thread.
+INSIDE_KINDS = ["PR", "I", "IC", "PRR", "PRRC", "PRRT"]
+
+
+def claims(kind: str, repo_number: int, own: int = 5) -> str:
+    """The id of a thing that claims to be inside the repo with this number.
+
+    GitHub does not check the claim. It finds the thing by `own`, its own
+    number, in whatever repo that is. The same bytes are both "pull request 5
+    of this repo" and "a forged id for pull request 5 of another repo", and
+    nothing in the id tells which.
+    """
+    return node_id(kind, repo_number, own)
+
+
+# Says it is a pull request in octo-org/app. Nothing may be allowed for that.
+PR_ID = claims("PR", APP)
+
+# The id of octo-org/app itself, which can be trusted.
+APP_ID = node_id("R", APP)
+
+ADD_COMMENT = "mutation($input: AddCommentInput!) { addComment(input: $input) { clientMutationId } }"
+CREATE_PR = "mutation($input: CreatePullRequestInput!) { createPullRequest(input: $input) { clientMutationId } }"
 REPO_VARS = {"owner": "octo-org", "repo": "app"}
 
 GH_QUERIES = [
@@ -1178,21 +1205,6 @@ GH_QUERIES = [
           }
         }""",
         {"headRefName": "my-branch", "owner": "octo-org", "repo": "app", "states": None},
-    ),
-    # gh pr checks 1: the pull request by its id
-    (
-        """query PullRequestStatusChecks($id: ID!, $endCursor: String) {
-          node(id: $id) {
-            ...on PullRequest {
-              statusCheckRollup: commits(last: 1) {nodes {commit {statusCheckRollup {
-                contexts(first:100,after:$endCursor) {nodes {__typename
-                  ...on StatusContext {context,state,isRequired(pullRequestId: $id)},
-                  ...on CheckRun {name,status,conclusion,isRequired(pullRequestId: $id)}},
-                  pageInfo{hasNextPage,endCursor}}}}}}
-            }
-          }
-        }""",
-        {"id": PR_ID},
     ),
     # gh asks what the API knows before some commands
     (
@@ -1293,130 +1305,271 @@ def test_queries_gh_sends_are_allowed(query, variables):
             refused(gql(query, elsewhere, policy=used), "repo-not-listed")
 
 
-GH_MUTATIONS = [
-    # gh pr create
-    (
-        "mutation PullRequestCreate($input: CreatePullRequestInput!) {"
-        " createPullRequest(input: $input) { pullRequest { id url } } }",
-        {"repositoryId": "REPO", "baseRefName": "main", "headRefName": "x", "title": "t", "body": "b", "draft": False},
-    ),
-    # gh pr edit
-    (
-        "mutation PullRequestUpdate($input: UpdatePullRequestInput!) {"
-        " updatePullRequest(input: $input) { __typename } }",
-        {"pullRequestId": "PR", "title": "new", "body": "new"},
-    ),
-    # gh pr comment, gh issue comment
-    (
-        "mutation CommentCreate($input: AddCommentInput!) {"
-        " addComment(input: $input) { commentEdge { node { url } } } }",
-        {"subjectId": "PR", "body": "hello"},
-    ),
-    (
-        "mutation CommentCreate($input: AddCommentInput!) {"
-        " addComment(input: $input) { commentEdge { node { url } } } }",
-        {"subjectId": "ISSUE", "body": "hello"},
-    ),
-    (
-        "mutation CommentUpdate($input: UpdateIssueCommentInput!) {"
-        " updateIssueComment(input: $input) { issueComment { url } } }",
-        {"id": "COMMENT", "body": "edited"},
-    ),
-    ("mutation($input: DeleteIssueCommentInput!) { deleteIssueComment(input: $input) { clientMutationId } }", {"id": "COMMENT"}),
-    # gh pr close, reopen, ready
-    (
-        "mutation PullRequestClose($input: ClosePullRequestInput!) {"
-        " closePullRequest(input: $input) { pullRequest { id } } }",
-        {"pullRequestId": "PR"},
-    ),
-    (
-        "mutation PullRequestReopen($input: ReopenPullRequestInput!) {"
-        " reopenPullRequest(input: $input) { pullRequest { id } } }",
-        {"pullRequestId": "PR"},
-    ),
-    (
-        "mutation PullRequestReadyForReview($input: MarkPullRequestReadyForReviewInput!) {"
-        " markPullRequestReadyForReview(input: $input) { pullRequest { id } } }",
-        {"pullRequestId": "PR"},
-    ),
-    ("mutation($input: ConvertPullRequestToDraftInput!) { convertPullRequestToDraft(input: $input) { pullRequest { id } } }", {"pullRequestId": "PR"}),
-    ("mutation($input: UpdatePullRequestBranchInput!) { updatePullRequestBranch(input: $input) { pullRequest { id } } }", {"pullRequestId": "PR"}),
-    # gh pr review
-    (
-        "mutation PullRequestReviewAdd($input: AddPullRequestReviewInput!) {"
-        " addPullRequestReview(input: $input) { clientMutationId } }",
-        {"pullRequestId": "PR", "event": "COMMENT", "body": "looks fine"},
-    ),
-    ("mutation($input: SubmitPullRequestReviewInput!) { submitPullRequestReview(input: $input) { clientMutationId } }", {"pullRequestReviewId": "REVIEW", "event": "COMMENT"}),
-    ("mutation($input: AddPullRequestReviewThreadReplyInput!) { addPullRequestReviewThreadReply(input: $input) { clientMutationId } }", {"pullRequestReviewThreadId": "THREAD", "body": "done"}),
-    ("mutation($input: ResolveReviewThreadInput!) { resolveReviewThread(input: $input) { thread { id } } }", {"threadId": "THREAD"}),
-    ("mutation($input: UpdatePullRequestReviewCommentInput!) { updatePullRequestReviewComment(input: $input) { clientMutationId } }", {"pullRequestReviewCommentId": "REVIEW_COMMENT", "body": "x"}),
-    ("mutation($input: RequestReviewsInput!) { requestReviews(input: $input) { clientMutationId } }", {"pullRequestId": "PR", "userIds": ["U_x"], "union": True}),
-    ("mutation($input: RequestReviewsByLoginInput!) { requestReviewsByLogin(input: $input) { clientMutationId } }", {"pullRequestId": "PR", "userLogins": ["someone"]}),
-    # labels, reactions
-    ("mutation($input: AddLabelsToLabelableInput!) { addLabelsToLabelable(input: $input) { __typename } }", {"labelableId": "PR", "labelIds": ["LA_x"]}),
-    ("mutation($input: AddReactionInput!) { addReaction(input: $input) { reaction { content } } }", {"subjectId": "COMMENT", "content": "THUMBS_UP"}),
-]
+REPOSITORY_INFO = (
+    "query RepositoryInfo($owner: String!, $name: String!) {"
+    " repository(owner: $owner, name: $name) {name,owner{id,login},description} }"
+)
 
-KINDS = {
-    "REPO": ("R",),
-    "PR": ("PR", 5),
-    "ISSUE": ("I", 6),
-    "COMMENT": ("IC", 7),
-    "REVIEW": ("PRR", 8),
-    "REVIEW_COMMENT": ("PRRC", 9),
-    "THREAD": ("PRRT", 10),
+# gh pr checks asks for the pull request by its id.
+PR_CHECKS = """query PullRequestStatusChecks($id: ID!, $endCursor: String) {
+  node(id: $id) {
+    ...on PullRequest {
+      statusCheckRollup: commits(last: 1) {nodes {commit {statusCheckRollup {
+        contexts(first:100,after:$endCursor) {nodes {__typename
+          ...on StatusContext {context,state,isRequired(pullRequestId: $id)},
+          ...on CheckRun {name,status,conclusion,isRequired(pullRequestId: $id)}},
+          pageInfo{hasNextPage,endCursor}}}}}}
+    }
+  }
+}"""
+
+
+def test_gh_pr_checks_reads_by_id_and_is_refused():
+    for number in (APP, LIBRARY, OTHER):
+        decision = refused(gql(PR_CHECKS, {"id": claims("PR", number)}), "graphql-by-id")
+    # The message gives the agent a way on, and that way is allowed: it is
+    # the PullRequestByNumber query in the list above.
+    assert "gh pr view NUMBER --repo OWNER/REPO --json statusCheckRollup" in decision.message
+    assert "`gh pr checks` reads by id and does not work here" in decision.message
+    assert "Another request will" in decision.message
+    allowed(ask("GET", "api.github.com/repos/octo-org/app/pulls/7"), "api-read")
+    allowed(ask("GET", "api.github.com/repos/octo-org/app/commits/0123abc/check-runs"), "api-read")
+
+
+# gh pr create, as recorded when the pull request for this module was opened.
+CREATE_PR_AS_GH = (
+    "mutation PullRequestCreate($input: CreatePullRequestInput!) {"
+    " createPullRequest(input: $input) { pullRequest { id url } } }"
+)
+
+
+def pr_input(repo_number: int) -> dict:
+    return {
+        "repositoryId": node_id("R", repo_number),
+        "baseRefName": "main",
+        "headRefName": "my-branch",
+        "title": "t",
+        "body": "b",
+        "draft": False,
+        "maintainerCanModify": True,
+    }
+
+
+def test_opening_a_pull_request_as_gh_does():
+    decision = allowed(gql(CREATE_PR_AS_GH, {"input": pr_input(APP)}), "graphql-write", "octo-org/app")
+    assert decision.with_token
+    allowed(gql(CREATE_PR_AS_GH, {"input": pr_input(SHIPPING)}), "graphql-write", "octo-org/shipping")
+    refused(gql(CREATE_PR_AS_GH, {"input": pr_input(LIBRARY)}), "repo-read-only")
+    for used in (POLICY, PUBLIC):
+        decision = refused(gql(CREATE_PR_AS_GH, {"input": pr_input(OTHER)}, policy=used), "graphql-id-not-listed")
+        assert "`id`" in decision.message
+
+
+def test_a_write_repo_without_an_id_cannot_open_a_pull_request_with_gh():
+    # The rules hold no id for octo-org/no-id, so no id means that repo.
+    assert POLICY.find("octo-org", "no-id").write
+    refused(gql(CREATE_PR_AS_GH, {"input": pr_input(4242)}), "graphql-id-not-listed")
+    # git, the REST API and queries by name still work for it. That
+    # includes opening a pull request through the REST API.
+    allowed(ask("POST", "github.com/octo-org/no-id/git-receive-pack"), "git-write")
+    allowed(ask("POST", "api.github.com/repos/octo-org/no-id/pulls", {"title": "t"}), "api-write")
+    allowed(gql(REPOSITORY_INFO, {"owner": "octo-org", "name": "no-id"}), "graphql-read")
+
+
+def test_one_change_is_allowed_through_graphql_and_it_names_a_repo():
+    # Adding a mutation here needs an argument that proves the repo. The id
+    # of a pull request, an issue, a comment or a review does not.
+    assert policy_module.MUTATIONS == {"createPullRequest": ("repositoryId", "headRepositoryId")}
+
+
+# ---------------------------------------------------------------------------
+# GraphQL: changes named only by an id
+# ---------------------------------------------------------------------------
+#
+# Each of these names what it changes by the id of a pull request, an issue,
+# a comment, a review or a review thread, and by nothing else. GitHub applies
+# it to whatever has that id, in any repo the token reaches, so none of them
+# can be allowed.
+
+ONCE_ALLOWED_BY_ID = {
+    "addComment", "updateIssueComment", "deleteIssueComment", "addReaction", "removeReaction",
+    "updatePullRequest", "closePullRequest", "reopenPullRequest", "markPullRequestReadyForReview",
+    "convertPullRequestToDraft", "updatePullRequestBranch", "requestReviews", "requestReviewsByLogin",
+    "addPullRequestReview", "submitPullRequestReview", "updatePullRequestReview", "deletePullRequestReview",
+    "addPullRequestReviewThread", "addPullRequestReviewThreadReply", "updatePullRequestReviewComment",
+    "deletePullRequestReviewComment", "resolveReviewThread", "unresolveReviewThread",
+    "addLabelsToLabelable", "removeLabelsFromLabelable",
+    "mergePullRequest", "enablePullRequestAutoMerge", "disablePullRequestAutoMerge", "enqueuePullRequest",
 }
 
-
-def fill(given: dict, repo_number: int) -> dict:
-    """Put real-looking ids of things in the given repo into an input."""
-    filled = {}
-    for key, value in given.items():
-        if isinstance(value, str) and value in KINDS:
-            kind, *own = KINDS[value]
-            value = node_id(kind, repo_number, *own)
-        filled[key] = value
-    return filled
+# Every name an input uses for an id.
+ID_KEYS = [
+    "id", "subjectId", "pullRequestId", "issueId", "labelableId", "assignableId", "pullRequestReviewId",
+    "pullRequestReviewThreadId", "pullRequestReviewCommentId", "threadId", "repositoryId", "headRepositoryId",
+]
 
 
-@pytest.mark.parametrize(("query", "given"), GH_MUTATIONS)
-def test_changes_gh_makes_are_allowed_in_a_write_repo(query, given):
-    decision = allowed(gql(query, {"input": fill(given, APP)}), "graphql-write", "octo-org/app")
-    assert decision.with_token
-    allowed(gql(query, {"input": fill(given, SHIPPING)}), "graphql-write", "octo-org/shipping")
+def mutation(name: str) -> str:
+    return f"mutation($input: X!) {{ {name}(input: $input) {{ clientMutationId }} }}"
 
 
-@pytest.mark.parametrize(("query", "given"), GH_MUTATIONS)
-def test_changes_are_refused_in_a_read_repo_through_graphql(query, given):
-    refused(gql(query, {"input": fill(given, LIBRARY)}), "repo-read-only")
+def test_every_change_once_allowed_by_such_an_id_is_now_refused_by_name():
+    assert ONCE_ALLOWED_BY_ID <= set(policy_module.BY_ID)
+    assert not ONCE_ALLOWED_BY_ID & set(policy_module.MUTATIONS)
 
 
-@pytest.mark.parametrize(("query", "given"), GH_MUTATIONS)
-@pytest.mark.parametrize("used", [POLICY, PUBLIC])
-def test_changes_are_refused_elsewhere_through_graphql(query, given, used):
-    decision = refused(gql(query, {"input": fill(given, OTHER)}, policy=used), "graphql-id-not-listed")
-    assert "`id`" in decision.message
+def test_the_forged_id_from_the_review_is_refused():
+    # octo-org/app's number in front, and the number of some pull request
+    # elsewhere behind it. GitHub would comment on that other pull request.
+    forged = node_id("PR", APP, 999999)
+    decision = refused(gql(ADD_COMMENT, {"input": {"subjectId": forged, "body": "x"}}), "graphql-by-id")
+    assert "does not prove which repo" in decision.message
+    for name, key in [
+        ("updateIssueComment", "id"),
+        ("deleteIssueComment", "id"),
+        ("closePullRequest", "pullRequestId"),
+    ]:
+        kind = "IC" if key == "id" else "PR"
+        refused(gql(mutation(name), {"input": {key: node_id(kind, APP, 999999)}}), "graphql-by-id")
+    read = "query($id: ID!) { node(id: $id) { ... on PullRequest { title body } } }"
+    refused(gql(read, {"id": forged}), "graphql-by-id")
 
 
-def test_a_write_repo_without_an_id_cannot_be_changed_through_graphql():
-    # Nothing ties an id to octo-org/no-id, so its ids are unknown ids.
-    assert POLICY.find("octo-org", "no-id").write
-    query, given = GH_MUTATIONS[0]
-    refused(gql(query, {"input": fill(given, 4242)}), "graphql-id-not-listed")
-    # git, REST and queries by name still work for it.
-    allowed(ask("POST", "github.com/octo-org/no-id/git-receive-pack"), "git-write")
-    allowed(ask("POST", "api.github.com/repos/octo-org/no-id/pulls", {}), "api-write")
-    allowed(gql(GH_QUERIES[10][0], {"owner": "octo-org", "name": "no-id"}), "graphql-read")
+@pytest.mark.parametrize("name", sorted(policy_module.BY_ID))
+@pytest.mark.parametrize("kind", [*INSIDE_KINDS, "R"])
+def test_a_change_named_only_by_an_id_is_refused_whatever_the_id_claims(name, kind):
+    for number in (APP, SHIPPING, LIBRARY, OTHER):
+        for own in (5, 999999):
+            # The same id under every name, so that no name is the lucky one.
+            the_id = node_id("R", number) if kind == "R" else claims(kind, number, own)
+            given = dict.fromkeys(ID_KEYS, the_id)
+            for used in (POLICY, PUBLIC):
+                decision = refused(gql(mutation(name), {"input": given}, policy=used), "graphql-by-id")
+                assert f"`{name}`" in decision.message
 
 
-def test_merging_through_graphql_needs_the_merge_switch():
-    for name in ("mergePullRequest", "enablePullRequestAutoMerge", "disablePullRequestAutoMerge", "enqueuePullRequest"):
-        query = f"mutation($input: X!) {{ {name}(input: $input) {{ clientMutationId }} }}"
-        allowed(gql(query, {"input": {"pullRequestId": node_id("PR", SHIPPING, 5)}}), "graphql-write")
-        refused(gql(query, {"input": {"pullRequestId": node_id("PR", APP, 5)}}), "merge")
-        refused(gql(query, {"input": {"pullRequestId": node_id("PR", LIBRARY, 5)}}), "repo-read-only")
-        refused(gql(query, {"input": {"pullRequestId": node_id("PR", OTHER, 5)}}), "graphql-id-not-listed")
+@pytest.mark.parametrize(
+    ("query", "given"),
+    [
+        # gh pr comment, as recorded
+        (
+            "mutation CommentCreate($input: AddCommentInput!) {"
+            " addComment(input: $input) { commentEdge { node { url } } } }",
+            {"subjectId": claims("PR", APP), "body": "hello"},
+        ),
+        # gh pr comment --edit-last, as recorded
+        (
+            "mutation CommentUpdate($input: UpdateIssueCommentInput!) {"
+            " updateIssueComment(input: $input) { issueComment { url } } }",
+            {"id": claims("IC", APP), "body": "edited"},
+        ),
+        # gh pr edit, gh pr close, gh pr ready, gh pr review, gh pr merge
+        (
+            "mutation PullRequestUpdate($input: UpdatePullRequestInput!) {"
+            " updatePullRequest(input: $input) { __typename } }",
+            {"pullRequestId": claims("PR", APP), "title": "new", "body": "new"},
+        ),
+        (
+            "mutation PullRequestClose($input: ClosePullRequestInput!) {"
+            " closePullRequest(input: $input) { pullRequest { id } } }",
+            {"pullRequestId": claims("PR", APP)},
+        ),
+        (
+            "mutation PullRequestReadyForReview($input: MarkPullRequestReadyForReviewInput!) {"
+            " markPullRequestReadyForReview(input: $input) { pullRequest { id } } }",
+            {"pullRequestId": claims("PR", APP)},
+        ),
+        (
+            "mutation PullRequestReviewAdd($input: AddPullRequestReviewInput!) {"
+            " addPullRequestReview(input: $input) { clientMutationId } }",
+            {"pullRequestId": claims("PR", APP), "event": "COMMENT", "body": "looks fine"},
+        ),
+        (
+            "mutation PullRequestMerge($input: MergePullRequestInput!) {"
+            " mergePullRequest(input: $input) { clientMutationId } }",
+            {"pullRequestId": claims("PR", SHIPPING), "mergeMethod": "SQUASH"},
+        ),
+    ],
+)
+def test_the_changes_gh_sends_by_id_are_refused(query, given):
+    refused(gql(query, {"input": given}), "graphql-by-id")
+
+
+def rest_call(line: str, repo: str):
+    """Turn a `gh api ...` line from a refusal into a request to ask about."""
+    words = shlex.split(line)
+    assert words[:2] == ["gh", "api"]
+    words = words[2:]
+    method, path, fields = None, None, {}
+    while words:
+        word = words.pop(0)
+        if word == "-X":
+            method = words.pop(0)
+        elif word in ("-f", "-F"):
+            key, _, value = words.pop(0).partition("=")
+            if key.endswith("[]"):
+                fields.setdefault(key[:-2], []).append(value)
+            else:
+                fields[key] = value
+        else:
+            assert path is None, line
+            path = word
+    # gh sends POST when there are fields and no method is given.
+    method = method or ("POST" if fields else "GET")
+    assert path.startswith("repos/OWNER/REPO/"), line
+    fill = {"OWNER/REPO": repo, "NUMBER": "7", "COMMENT_ID": "5", "REVIEW_ID": "8", "REACTION_ID": "3", "LABEL": "bug"}
+    for word, value in fill.items():
+        path = path.replace(word, value)
+    assert not any(part.isupper() and len(part) > 2 for part in path.split("/")), path
+    return method, f"api.github.com/{path}", fields or b""
+
+
+WITH_REST = sorted(name for name, (_, call) in policy_module.BY_ID.items() if call)
+WITHOUT_REST = sorted(name for name, (_, call) in policy_module.BY_ID.items() if not call)
+
+
+@pytest.mark.parametrize("name", WITH_REST)
+def test_the_rest_request_a_refusal_names_is_allowed_in_a_write_repo(name):
+    call = policy_module.BY_ID[name][1]
+    message = refused(gql(mutation(name), {"input": dict.fromkeys(ID_KEYS, PR_ID)}), "graphql-by-id").message
+    # The agent is shown this very line, and told that it is a way on.
+    assert f"\n    {call}\n" in message
+    assert "Another request will" in message and "in another way or with another tool" not in message
+    assert "access: write" in message
+
+    assert rest_call(call, "x/y")[0] != "GET"
+    allowed(ask(*rest_call(call, "octo-org/shipping")), "api-write", "octo-org/shipping")
+    if name == "mergePullRequest":
+        assert "merge: true" in message
+        refused(ask(*rest_call(call, "octo-org/app")), "merge")
+    else:
+        allowed(ask(*rest_call(call, "octo-org/app")), "api-write", "octo-org/app")
+    refused(ask(*rest_call(call, "octo-org/library")), "repo-read-only")
+    for used in (POLICY, PUBLIC):
+        refused(ask(*rest_call(call, "other-org/public"), policy=used), "repo-not-listed")
+
+
+@pytest.mark.parametrize("name", WITHOUT_REST)
+def test_a_change_with_no_rest_request_says_so(name):
+    message = refused(gql(mutation(name), {"input": dict.fromkeys(ID_KEYS, PR_ID)}), "graphql-by-id").message
+    assert "cannot be done from the sandbox" in message
+    assert "gh api" not in message and "Another request will" not in message
+
+
+def test_the_changes_a_refusal_can_point_to():
+    # Enough to open a pull request with gh and do the rest through REST.
+    assert set(WITH_REST) >= {
+        "addComment", "updateIssueComment", "deleteIssueComment", "updatePullRequest", "closePullRequest",
+        "reopenPullRequest", "addPullRequestReview", "submitPullRequestReview", "addPullRequestReviewThread",
+        "addPullRequestReviewThreadReply", "addLabelsToLabelable", "removeLabelsFromLabelable",
+        "addReaction", "removeReaction", "mergePullRequest",
+    }
+    # GitHub has no REST request for these.
+    assert set(WITHOUT_REST) == {
+        "markPullRequestReadyForReview", "convertPullRequestToDraft", "resolveReviewThread",
+        "unresolveReviewThread", "enablePullRequestAutoMerge", "disablePullRequestAutoMerge",
+        "enqueuePullRequest",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1465,10 +1618,9 @@ def test_merging_through_graphql_needs_the_merge_switch():
     ],
 )
 def test_other_changes_are_refused_through_graphql(name):
-    given = {"repositoryId": node_id("R", APP), "pullRequestId": PR_ID, "subjectId": PR_ID, "id": ISSUE_ID}
-    query = f"mutation($input: X!) {{ {name}(input: $input) {{ clientMutationId }} }}"
-    decision = refused(gql(query, {"input": given}), "graphql-mutation-not-allowed")
-    assert name not in policy_module.MUTATIONS and name not in policy_module.MERGE_MUTATIONS
+    given = dict.fromkeys(ID_KEYS, node_id("R", APP))
+    decision = refused(gql(mutation(name), {"input": given}), "graphql-mutation-not-allowed")
+    assert name not in policy_module.MUTATIONS and name not in policy_module.BY_ID
     assert name in decision.message
 
 
@@ -1482,14 +1634,13 @@ def test_other_changes_are_refused_through_graphql(name):
 )
 def test_assigning_is_refused_through_graphql(name):
     query = f"mutation($input: X!) {{ {name}(input: $input) {{ clientMutationId }} }}"
-    decision = refused(gql(query, {"input": {"assignableId": ISSUE_ID, "actorIds": ["BOT_x"]}}), "assignees")
+    decision = refused(gql(query, {"input": {"assignableId": claims("I", APP), "actorIds": ["BOT_x"]}}), "assignees")
     assert "second agent" in decision.message
 
 
 @pytest.mark.parametrize(
     ("name", "given"),
     [
-        ("updatePullRequest", {"pullRequestId": PR_ID}),
         ("createPullRequest", {"repositoryId": node_id("R", APP), "title": "t"}),
     ],
 )
@@ -1545,23 +1696,25 @@ def test_reading_who_can_be_assigned_is_allowed():
 @pytest.mark.parametrize(
     ("name", "given"),
     [
-        ("createIssue", {"repositoryId": "REPO", "title": "t", "body": "b"}),
-        ("updateIssue", {"id": "ISSUE", "title": "new"}),
-        ("closeIssue", {"issueId": "ISSUE"}),
-        ("reopenIssue", {"issueId": "ISSUE"}),
+        ("createIssue", {"repositoryId": "R", "title": "t", "body": "b"}),
+        ("updateIssue", {"id": "I", "title": "new"}),
+        ("closeIssue", {"issueId": "I"}),
+        ("reopenIssue", {"issueId": "I"}),
     ],
 )
 def test_issues_are_not_created_edited_or_closed_through_graphql(name, given):
-    query = f"mutation($input: X!) {{ {name}(input: $input) {{ clientMutationId }} }}"
     for number in (APP, SHIPPING, OTHER):
-        decision = refused(gql(query, {"input": fill(given, number)}), "issues")
+        ids = {"R": node_id("R", number), "I": claims("I", number)}
+        filled = {key: ids.get(value, value) for key, value in given.items()}
+        decision = refused(gql(mutation(name), {"input": filled}), "issues")
         assert "commenting on them is" in decision.message
 
 
 def test_issues_can_be_read_and_commented_on():
     allowed(ask("GET", "api.github.com/repos/octo-org/app/issues/7"), "api-read")
     allowed(ask("POST", "api.github.com/repos/octo-org/app/issues/7/comments", {"body": "x"}), "api-write")
-    allowed(gql(ADD_COMMENT, {"input": {"subjectId": ISSUE_ID, "body": "x"}}), "graphql-write")
+    # Through the REST API, that is. `gh issue comment` names the issue by id.
+    refused(gql(ADD_COMMENT, {"input": {"subjectId": claims("I", APP), "body": "x"}}), "graphql-by-id")
     refused(ask("POST", "api.github.com/repos/octo-org/app/issues", {"title": "t"}), "issues")
     refused(ask("PATCH", "api.github.com/repos/octo-org/app/issues/7", {"state": "closed"}), "issues")
 
@@ -1571,62 +1724,76 @@ def test_subscriptions_are_refused():
 
 
 # ---------------------------------------------------------------------------
-# GraphQL: ids
+# GraphQL: the id of a repo
 # ---------------------------------------------------------------------------
-
-ADD_COMMENT = "mutation($input: AddCommentInput!) { addComment(input: $input) { clientMutationId } }"
-CREATE_PR = "mutation($input: CreatePullRequestInput!) { createPullRequest(input: $input) { clientMutationId } }"
 
 
 @pytest.mark.parametrize(
-    "subject",
+    "repo_id",
     [
-        node_id("PR", OTHER, 5),
-        node_id("I", OTHER, 6),
-        node_id("R", APP),  # a repo is not something to comment on
-        node_id("IC", APP, 7),  # nor a comment
-        node_id("D", APP, 7),  # a discussion
-        node_id("T", APP, 7),  # a team of the organization numbered like the repo
+        node_id("R", OTHER),
+        # Ids of things inside octo-org/app are not the id of octo-org/app.
+        *[claims(kind, APP) for kind in INSIDE_KINDS],
+        node_id("R", APP, 5),  # a repo's letter on an id with one number too many
+        node_id("R"),  # and with one too few
         node_id("U", APP),  # the user numbered like the repo
-        node_id("PR", APP),  # too few numbers
-        node_id("PR", APP, 5, 6),  # too many
-        "PR_" + base64.urlsafe_b64encode(b"\x93\x01\xce\x00\x00\x03\xe9\x05").decode().rstrip("="),  # not 0 first
-        "PR_" + base64.urlsafe_b64encode(b"\x93\x00\xa4\x31\x30\x30\x31\x05").decode().rstrip("="),  # text, not a number
-        "PR_" + base64.urlsafe_b64encode(b"\x93\x00\xce\x00\x00\x03\xe9").decode().rstrip("="),  # cut short
-        "PR_" + base64.urlsafe_b64encode(b"\x93\x00\xce\x00\x00\x03\xe9\x05\x05").decode().rstrip("="),  # too long
-        base64.b64encode(b"011:PullRequest5").decode(),  # the older make-up: no repo inside
-        old_repo_id(APP),
-        PR_ID.lower(),
-        PR_ID + "=",
-        " " + PR_ID,
-        PR_ID + "\n",
-        "pr_" + PR_ID[3:],
-        "PR_",
-        "PR_!!!!",
+        node_id("O", APP),  # the organization numbered like the repo
+        node_id("T", APP, 7),  # a team of that organization
+        node_id("D", APP, 7),  # a discussion
+        "R_" + base64.urlsafe_b64encode(b"\x92\x01\xce\x00\x00\x03\xe9").decode().rstrip("="),  # not 0 first
+        "R_" + base64.urlsafe_b64encode(b"\x92\x00\xa4\x31\x30\x30\x31").decode().rstrip("="),  # text, not a number
+        "R_" + base64.urlsafe_b64encode(b"\x92\x00\xce\x00\x00\x03").decode().rstrip("="),  # cut short
+        "R_" + base64.urlsafe_b64encode(b"\x92\x00\xce\x00\x00\x03\xe9\x05").decode().rstrip("="),  # too long
+        "R_" + base64.urlsafe_b64encode(b"\x92\x00\xd2\x00\x00\x03\xe9").decode().rstrip("="),  # a signed number
+        "R_" + base64.urlsafe_b64encode(b"\x93\x00\xcd\x03\xe9\x00").decode().rstrip("="),  # three numbers
+        "R_" + base64.urlsafe_b64encode(b"\x93\x00\xcd\x03\xe9").decode().rstrip("="),  # says three, holds two
+        base64.b64encode(b"011:PullRequest1001").decode(),  # the older make-up, of a pull request
+        base64.b64encode(b"010:Repository1001x").decode(),
+        base64.b64encode(b"010:Repository01001").decode(),
+        base64.b64encode(b"04:User1001").decode(),
+        old_repo_id(OTHER),
+        APP_ID.lower(),
+        APP_ID + "=",
+        " " + APP_ID,
+        APP_ID + "\n",
+        "r_" + APP_ID[2:],
+        "R_",
+        "R_!!!!",
         "",
-        "octo-org/app#5",
+        "octo-org/app",
+        "1001",
         5,
         1001,
         True,
-        None,
-        [PR_ID],
-        {"id": PR_ID},
+        [APP_ID],
+        {"id": APP_ID},
     ],
 )
-def test_an_id_that_is_not_plainly_a_thing_in_a_write_repo_is_refused(subject):
-    decision = gql(ADD_COMMENT, {"input": {"subjectId": subject, "body": "x"}})
-    assert not decision.allowed
-    assert decision.reason in ("graphql-id-not-listed", "graphql-malformed")
+def test_only_the_id_of_a_listed_repo_opens_a_pull_request(repo_id):
+    for used in (POLICY, PUBLIC):
+        refused(gql(CREATE_PR, {"input": {"repositoryId": repo_id, "title": "t"}}, policy=used), "graphql-id-not-listed")
+        # Nor as the repo the branch comes from.
+        both = {"repositoryId": APP_ID, "headRepositoryId": repo_id, "title": "t"}
+        refused(gql(CREATE_PR, {"input": both}, policy=used), "graphql-id-not-listed")
+
+
+def test_the_same_repo_number_packed_in_other_ways_is_the_same_repo():
+    # MessagePack can write 1001 in two, four or eight bytes. GitHub reads
+    # the same number from each, and so does the broker.
+    for packed in (b"\x92\x00\xcd\x03\xe9", b"\x92\x00\xce\x00\x00\x03\xe9", b"\x92\x00\xcf" + (1001).to_bytes(8, "big")):
+        repo_id = "R_" + base64.urlsafe_b64encode(packed).decode().rstrip("=")
+        allowed(gql(CREATE_PR, {"input": {"repositoryId": repo_id}}), "graphql-write", "octo-org/app")
 
 
 def test_a_repo_id_of_the_older_make_up_is_understood():
     old = load_policy({"repos": [{"repo": "a/b", "note": "n", "access": "write", "id": old_repo_id(77)}]})
-    # The repo is old, so gh sends its old id; new things in it have new ids.
+    # The repo is old, so gh sends its old id.
     allowed(gql(CREATE_PR, {"input": {"repositoryId": old_repo_id(77)}}, policy=old), "graphql-write", "a/b")
     allowed(gql(CREATE_PR, {"input": {"repositoryId": node_id("R", 77)}}, policy=old), "graphql-write")
-    allowed(gql(ADD_COMMENT, {"input": {"subjectId": node_id("PR", 77, 1)}}, policy=old), "graphql-write")
     refused(gql(CREATE_PR, {"input": {"repositoryId": old_repo_id(78)}}, policy=old), "graphql-id-not-listed")
     refused(gql(CREATE_PR, {"input": {"repositoryId": old_repo_id(770)}}, policy=old), "graphql-id-not-listed")
+    # A thing inside the old repo is still only named by an id.
+    refused(gql(ADD_COMMENT, {"input": {"subjectId": claims("PR", 77)}}, policy=old), "graphql-by-id")
 
 
 def test_a_pull_request_from_another_repo_must_come_from_a_listed_one():
@@ -1638,15 +1805,9 @@ def test_a_pull_request_from_another_repo_must_come_from_a_listed_one():
     # The other way round: into an unlisted repo from a listed one.
     swapped = {**base, "repositoryId": node_id("R", OTHER), "headRepositoryId": node_id("R", APP)}
     refused(gql(CREATE_PR, {"input": swapped}), "graphql-id-not-listed")
-
-
-def test_every_id_in_a_change_must_check_out():
-    submit = "mutation($input: X!) { submitPullRequestReview(input: $input) { clientMutationId } }"
-    allowed(gql(submit, {"input": {"pullRequestId": PR_ID, "event": "COMMENT"}}))
-    allowed(gql(submit, {"input": {"pullRequestId": PR_ID, "pullRequestReviewId": REVIEW_ID}}))
-    mixed = {"pullRequestId": PR_ID, "pullRequestReviewId": node_id("PRR", OTHER, 8)}
-    refused(gql(submit, {"input": mixed}), "graphql-id-not-listed")
-    refused(gql(submit, {"input": {"event": "COMMENT"}}), "graphql-malformed")
+    # The repo the pull request goes into must be named; the other alone
+    # will not do.
+    refused(gql(CREATE_PR, {"input": {"headRepositoryId": node_id("R", APP), "title": "t"}}), "graphql-malformed")
 
 
 @pytest.mark.parametrize(
@@ -1656,29 +1817,51 @@ def test_every_id_in_a_change_must_check_out():
         {},
         {"input": None},
         {"input": "text"},
-        {"input": [{"subjectId": PR_ID}]},
+        {"input": [{"repositoryId": APP_ID}]},
         {"input": {}},
-        {"input": {"body": "x"}},
-        {"input": {"subjectId": None, "body": "x"}},
-        {"Input": {"subjectId": PR_ID}},
+        {"input": {"title": "x"}},
+        {"input": {"repositoryId": None, "title": "x"}},
+        {"Input": {"repositoryId": APP_ID}},
     ],
 )
 def test_a_change_without_a_usable_input_is_refused(variables):
-    refused(gql(ADD_COMMENT, variables), "graphql-malformed")
+    refused(gql(CREATE_PR, variables), "graphql-malformed")
 
 
-def test_reading_one_thing_by_its_id():
-    query = "query($id: ID!) { node(id: $id) { ... on PullRequest { title } } }"
-    for thing in (PR_ID, ISSUE_ID, COMMENT_ID, REVIEW_ID, REVIEW_COMMENT_ID, THREAD_ID, node_id("R", APP)):
-        allowed(gql(query, {"id": thing}), "graphql-read", "octo-org/app")
-    allowed(gql(query, {"id": node_id("PR", LIBRARY, 1)}), "graphql-read", "octo-org/library")
+READ_BY_ID = "query($id: ID!) { node(id: $id) { ... on Repository { name } ... on PullRequest { title } } }"
+
+
+def test_a_listed_repo_can_be_read_by_its_own_id():
+    allowed(gql(READ_BY_ID, {"id": node_id("R", APP)}), "graphql-read", "octo-org/app")
+    allowed(gql(READ_BY_ID, {"id": node_id("R", LIBRARY)}), "graphql-read", "octo-org/library")
+    old = load_policy({"repos": [{"repo": "a/b", "note": "n", "access": "read", "id": old_repo_id(77)}]})
+    allowed(gql(READ_BY_ID, {"id": old_repo_id(77)}, policy=old), "graphql-read", "a/b")
     for used in (POLICY, PUBLIC):
-        refused(gql(query, {"id": node_id("PR", OTHER, 1)}, policy=used), "graphql-id-not-listed")
-        refused(gql(query, {"id": node_id("U", APP)}, policy=used), "graphql-id-not-listed")
-        refused(gql(query, {"id": node_id("T", APP, 1)}, policy=used), "graphql-id-not-listed")
-        refused(gql(query, {}, policy=used), "graphql-id-not-listed")
-    refused(gql("{ node { id } }"), "graphql-id-not-listed")
+        refused(gql(READ_BY_ID, {"id": node_id("R", OTHER)}, policy=used), "graphql-id-not-listed")
+        refused(gql(READ_BY_ID, {"id": node_id("R", 4242)}, policy=used), "graphql-id-not-listed")
+
+
+@pytest.mark.parametrize("kind", [*INSIDE_KINDS, "U", "T", "D", "LA", "C", "REF"])
+def test_nothing_inside_a_repo_can_be_read_by_its_id(kind):
+    for number in (APP, LIBRARY, SHIPPING, OTHER):
+        for own in (5, 999999):
+            for used in (POLICY, PUBLIC):
+                decision = refused(gql(READ_BY_ID, {"id": claims(kind, number, own)}, policy=used), "graphql-by-id")
+    assert "Read it by repo and number instead" in decision.message
+
+
+def test_other_ways_to_ask_by_id_are_refused():
+    refused(gql(READ_BY_ID, {}), "graphql-by-id")
+    refused(gql(READ_BY_ID, {"id": None}), "graphql-by-id")
+    refused(gql(READ_BY_ID, {"id": 1001}), "graphql-by-id")
+    refused(gql("{ node { id } }"), "graphql-by-id")
+    refused(gql('{ nodes(ids: ["%s"]) { id } }' % APP_ID), "graphql-query-not-allowed")
     refused(gql('{ nodes(ids: ["%s"]) { id } }' % PR_ID), "graphql-query-not-allowed")
+    # An alias, a fragment and a second operation do not hide it.
+    refused(gql('{ repository: node(id: "%s") { id } }' % PR_ID), "graphql-by-id")
+    refused(gql('query { ...f } fragment f on Query { node(id: "%s") { id } }' % PR_ID), "graphql-by-id")
+    both = 'query Good { viewer { login } } query Bad { node(id: "%s") { id } }' % PR_ID
+    refused(gql(both, operation="Good"), "graphql-by-id")
 
 
 # ---------------------------------------------------------------------------
@@ -1836,8 +2019,8 @@ def test_several_operations_need_a_pick():
 
 
 def test_the_kind_follows_the_picked_operation():
-    change = "mutation Change($input: X!) { addComment(input: $input) { clientMutationId } }"
-    variables = {"input": {"subjectId": PR_ID, "body": "x"}}
+    change = "mutation Change($input: X!) { createPullRequest(input: $input) { clientMutationId } }"
+    variables = {"input": {"repositoryId": APP_ID, "title": "x"}}
     assert allowed(gql(f"{GOOD} {change}", variables, "Change")).kind == "graphql-write"
     assert allowed(gql(f"{GOOD} {change}", variables, "Good")).kind == "graphql-read"
 
@@ -1872,11 +2055,24 @@ def test_an_alias_does_not_hide_what_is_asked_for():
     refused(gql('mutation { addComment: deleteRepository(input: {repositoryId: "x"}) { clientMutationId } }'), "graphql-mutation-not-allowed")
     refused(
         gql(
-            'mutation($a: X!, $b: X!) { one: addComment(input: $a) { clientMutationId }'
-            " two: addComment(input: $b) { clientMutationId } }",
-            {"a": {"subjectId": PR_ID}, "b": {"subjectId": node_id("PR", OTHER, 1)}},
+            'mutation($a: X!, $b: X!) { one: createPullRequest(input: $a) { clientMutationId }'
+            " two: createPullRequest(input: $b) { clientMutationId } }",
+            {"a": {"repositoryId": APP_ID}, "b": {"repositoryId": node_id("R", OTHER)}},
         ),
         "graphql-id-not-listed",
+    )
+    # An allowed name as the label of a refused change.
+    refused(
+        gql('mutation($a: X!) { createPullRequest: addComment(input: $a) { clientMutationId } }', {"a": {"subjectId": PR_ID}}),
+        "graphql-by-id",
+    )
+    refused(
+        gql(
+            'mutation($a: X!, $b: X!) { one: createPullRequest(input: $a) { clientMutationId }'
+            " two: closePullRequest(input: $b) { clientMutationId } }",
+            {"a": {"repositoryId": APP_ID}, "b": {"pullRequestId": PR_ID}},
+        ),
+        "graphql-by-id",
     )
     # Many aliases of allowed things are fine.
     allowed(
@@ -1953,20 +2149,37 @@ def test_a_default_value_is_used_only_when_no_value_is_sent():
 
 
 def test_a_change_written_into_the_query_instead_of_variables():
-    inline = 'mutation { addComment(input: {subjectId: "%s", body: "x"}) { clientMutationId } }'
-    allowed(gql(inline % PR_ID), "graphql-write", "octo-org/app")
-    refused(gql(inline % node_id("PR", OTHER, 1)), "graphql-id-not-listed")
+    inline = 'mutation { createPullRequest(input: {repositoryId: "%s", title: "x"}) { clientMutationId } }'
+    allowed(gql(inline % APP_ID), "graphql-write", "octo-org/app")
+    refused(gql(inline % node_id("R", OTHER)), "graphql-id-not-listed")
     # Partly from a variable.
-    mixed = 'mutation($id: ID!) { addComment(input: {subjectId: $id, body: "x"}) { clientMutationId } }'
-    allowed(gql(mixed, {"id": PR_ID}), "graphql-write")
-    refused(gql(mixed, {"id": node_id("PR", OTHER, 1)}), "graphql-id-not-listed")
+    mixed = 'mutation($id: ID!) { createPullRequest(input: {repositoryId: $id, title: "x"}) { clientMutationId } }'
+    allowed(gql(mixed, {"id": APP_ID}), "graphql-write")
+    refused(gql(mixed, {"id": node_id("R", OTHER)}), "graphql-id-not-listed")
     refused(gql(mixed, {}), "graphql-malformed")
     # The same name twice in one input, or the input given twice.
-    twice = 'mutation { addComment(input: {subjectId: "%s", subjectId: "%s"}) { clientMutationId } }'
-    refused(gql(twice % (PR_ID, node_id("PR", OTHER, 1))), "graphql-malformed")
-    refused(gql('mutation { addComment(input: {subjectId: "%s"}, input: {}) { clientMutationId } }' % PR_ID), "graphql-malformed")
-    refused(gql('mutation { addComment(input: {subjectId: "%s"}, other: 1) { clientMutationId } }' % PR_ID), "graphql-malformed")
-    refused(gql("mutation { addComment { clientMutationId } }"), "graphql-malformed")
+    twice = 'mutation { createPullRequest(input: {repositoryId: "%s", repositoryId: "%s"}) { clientMutationId } }'
+    refused(gql(twice % (APP_ID, node_id("R", OTHER))), "graphql-malformed")
+    refused(gql('mutation { createPullRequest(input: {repositoryId: "%s"}, input: {}) { clientMutationId } }' % APP_ID), "graphql-malformed")
+    refused(gql('mutation { createPullRequest(input: {repositoryId: "%s"}, other: 1) { clientMutationId } }' % APP_ID), "graphql-malformed")
+    refused(gql("mutation { createPullRequest { clientMutationId } }"), "graphql-malformed")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        (
+            "mutation Bad($input: X!) { closePullRequest(input: $input) { clientMutationId } }",
+            {"input": {"pullRequestId": PR_ID}},
+        ),
+        ('query Bad($id: ID!) { node(id: $id) { id } }', {"id": PR_ID}),
+    ],
+)
+def test_a_change_by_id_is_not_hidden_next_to_an_allowed_operation(bad):
+    text, variables = bad
+    for picked in ("Good", "Bad"):
+        refused(gql(f"{GOOD} {text}", variables, picked), "graphql-by-id")
+        refused(gql(f"{text} {GOOD}", variables, picked), "graphql-by-id")
 
 
 def test_directives_do_not_switch_a_check_off():
@@ -2035,10 +2248,10 @@ def test_what_is_closed_in_the_rest_api_is_closed_in_graphql(inner, reason):
 
 def test_a_change_may_not_walk_away_in_what_it_asks_back():
     query = (
-        "mutation($input: X!) { addComment(input: $input) {"
-        " subject { ... on PullRequest { repository { owner { repositories(first: 100) { nodes { name } } } } } } } }"
+        "mutation($input: X!) { createPullRequest(input: $input) {"
+        " pullRequest { repository { owner { repositories(first: 100) { nodes { name } } } } } } }"
     )
-    refused(gql(query, {"input": {"subjectId": PR_ID}}), "graphql-walks-away")
+    refused(gql(query, {"input": {"repositoryId": APP_ID}}), "graphql-walks-away")
 
 
 def test_walks_that_gh_itself_makes_are_left_alone():
@@ -2295,6 +2508,8 @@ def all_refusals():
     yield gql("query($o: String!, $n: String!) { repository(owner: $o, name: $n) { id } }", {"o": HOSTILE, "n": HOSTILE})
     yield gql(SEARCH, {"q": HOSTILE, "type": "ISSUE"})
     yield gql(ADD_COMMENT, {"input": {"subjectId": HOSTILE}})
+    yield gql(CREATE_PR, {"input": {"repositoryId": HOSTILE}})
+    yield gql("query($id: ID!) { node(id: $id) { id } }", {"id": HOSTILE})
 
 
 def test_a_refusal_explains_itself_and_carries_nothing_hostile():
@@ -2302,7 +2517,8 @@ def test_a_refusal_explains_itself_and_carries_nothing_hostile():
         "repo-not-listed", "repo-read-only", "merge", "not-recognised", "github-host-not-covered",
         "host-differs", "header-repeated", "method-override", "path-odd", "query-odd", "body-odd",
         "graphql-malformed", "graphql-query-not-allowed", "graphql-mutation-not-allowed",
-        "graphql-id-not-listed", "graphql-account", "graphql-search", "graphql-walks-away", "policy-error",
+        "graphql-id-not-listed", "graphql-by-id", "graphql-account", "graphql-search", "graphql-walks-away",
+        "policy-error",
     }
     count = 0
     for decision in all_refusals():
@@ -2316,7 +2532,7 @@ def test_a_refusal_explains_itself_and_carries_nothing_hostile():
         assert "A" * 100 not in decision.message
         # It ends by saying what to do next.
         assert decision.message.endswith(".\n")
-    assert count == 18
+    assert count == 20
 
 
 def test_messages_say_what_to_ask_the_user_for():
@@ -2326,6 +2542,11 @@ def test_messages_say_what_to_ask_the_user_for():
     assert "docs/github-rules.md" in refused(ask("GET", "api.github.com/users/someone")).message
     assert "plain way" in refused(ask("GET", "api.github.com/repos/octo-org/app/")).message
     assert "Use git instead" in refused(ask("PUT", "api.github.com/repos/octo-org/app/contents/x", {})).message
+    by_id = refused(gql(ADD_COMMENT, {"input": {"subjectId": PR_ID, "body": "x"}})).message
+    assert "`gh pr comment` and `gh issue comment` send it" in by_id
+    assert "gh api repos/OWNER/REPO/issues/NUMBER/comments -f body='TEXT'" in by_id
+    no_id = refused(gql(CREATE_PR, {"input": {"repositoryId": node_id("R", OTHER)}})).message
+    assert "its entry needs" in no_id and "an `id`" in no_id
 
 
 @pytest.mark.parametrize(
@@ -2362,7 +2583,8 @@ def test_no_rules_means_no_repo_is_reachable():
     refused(ask("GET", "github.com/octo-org/app/info/refs?service=git-upload-pack", policy=empty), "repo-not-listed")
     refused(ask("GET", "api.github.com/repos/octo-org/app", policy=empty), "repo-not-listed")
     refused(gql(GOOD, policy=empty), "repo-not-listed")
-    refused(gql(ADD_COMMENT, {"input": {"subjectId": PR_ID}}, policy=empty), "graphql-id-not-listed")
+    refused(gql(CREATE_PR, {"input": {"repositoryId": APP_ID}}, policy=empty), "graphql-id-not-listed")
+    refused(gql(ADD_COMMENT, {"input": {"subjectId": PR_ID}}, policy=empty), "graphql-by-id")
 
 
 def test_bytes_and_bytearray_bodies_are_both_read():
