@@ -55,6 +55,29 @@ jobs:
       - name: nix flake check
         run: nix flake check -L
 
+      # The broker test reaches its stand-in server by names that end in
+      # ".localhost". A recent macOS reads every such name as the machine
+      # itself. The one on this runner does not, and the broker then cannot
+      # find the stand-in. So a name that does not resolve here is added to
+      # the runner's own list of hosts. The runner is thrown away after the
+      # job, which is why `sudo` is fine here and nowhere else in this repo.
+      - name: Point the stand-in's names at this machine
+        run: |
+          sw_vers
+          for name in standin.localhost unopened.localhost; do
+            if python3 -c 'import socket, sys; socket.getaddrinfo(sys.argv[1], 443)' "$name" 2>/dev/null; then
+              echo "$name resolves by itself"
+            else
+              echo "127.0.0.1 $name" | sudo tee -a /etc/hosts
+            fi
+          done
+          # Make macOS read the list again.
+          sudo dscacheutil -flushcache
+          sudo killall -HUP mDNSResponder || true
+          for name in standin.localhost unopened.localhost; do
+            python3 -c 'import socket, sys; print(sys.argv[1], "is", socket.getaddrinfo(sys.argv[1], 443)[0][4][0])' "$name"
+          done
+
       # A real broker against a stand-in server on this machine. Nothing in
       # it leaves the runner.
       #

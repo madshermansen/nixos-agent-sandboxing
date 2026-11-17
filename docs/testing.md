@@ -104,6 +104,14 @@ The script can also be run by hand, as `tests/github-broker.sh`. It then
 uses the Mac's own `python3`, `openssl` and `curl`, and builds the broker
 from the checkout it is in.
 
+The stand-in is reached by the names `standin.localhost` and
+`unopened.localhost`. A recent macOS reads every name that ends in
+`.localhost` as the machine itself. macOS 15 does not: there the broker
+cannot find the stand-in, and every check that needs it fails with
+`nodename nor servname provided` in the broker's log. On such a Mac, add the
+line `127.0.0.1 standin.localhost unopened.localhost` to `/etc/hosts`. CI
+does this by itself.
+
 ### Known to fail now and then
 
 One check, "a first TLS message that never ends: logged", fails in about one
