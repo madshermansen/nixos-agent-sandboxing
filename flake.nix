@@ -21,6 +21,9 @@
         inherit ports;
         vm = self.nixosConfigurations.agent-vm.config.system.build.vm;
       };
+
+      # The tests that need no VM, see tests/default.nix and docs/testing.md.
+      tests = hostPkgs.callPackage ./tests { inherit self ports; };
     in
     {
       nixosConfigurations.agent-vm = nixpkgs.lib.nixosSystem {
@@ -51,5 +54,13 @@
       };
 
       formatter.${hostSystem} = hostPkgs.nixfmt-tree;
+
+      # `nix flake check` runs every test that needs neither the VM nor the
+      # Linux builder. `nix develop` opens a shell with the tools for working
+      # on the repo. `nix run .#test-broker` checks a real broker on the Mac
+      # against a stand-in server.
+      checks.${hostSystem} = tests.checks;
+      devShells.${hostSystem}.default = tests.devShell;
+      apps.${hostSystem} = tests.apps;
     };
 }
