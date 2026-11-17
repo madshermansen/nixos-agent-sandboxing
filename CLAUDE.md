@@ -4,8 +4,8 @@ Pronounced "nixty-three".
 
 A headless NixOS VM for running coding agents from T3 Code on a Mac. Its
 network is locked: the only way out is a broker on the Mac, which passes on
-listed destinations. Planned: the broker also holds the keys, so the VM never
-does.
+listed destinations. The broker also holds the GitHub token and adds it on
+the way out, so the VM never does.
 
 Read [PLAN.md](PLAN.md) for the phases and [docs/architecture.md](docs/architecture.md)
 for how the parts fit. The current phase is recorded at the bottom of this file.
@@ -37,9 +37,15 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `vm/agent-instructions.md` | What the agent in the VM is told about the sandbox; installed as `/etc/claude-code/CLAUDE.md` |
 | `broker/rules.yaml` | The destinations the VM may reach |
 | `broker/proxy.py` | The broker: a mitmproxy script that applies the rules |
+| `broker/swap.py` | The decisions about one opened request, among them the token swap; no mitmproxy in it |
+| `broker/fetch_tokens.py` | Fetches the tokens before the broker starts |
+| `broker/tokens.example.yaml` | Example of `~/.config/nixt3/tokens.yaml`, which says where each token is kept |
 | `darwin/commands.nix` | The Mac-side commands behind every `nix run .#…` |
 | `darwin/default.nix` | nix-darwin module for the Mac |
 | `tests/network-lock.sh` | Checks run inside the VM by `nix run .#check` |
+| `tests/github-broker.sh` | The token swap, checked on the Mac against a stand-in for GitHub |
+| `tests/github-live.sh` | The round trip with a real token, run inside the VM |
+| `tests/unit/` | pytest files for the broker's decisions; no network needed |
 | `docs/` | Setup, architecture, diagrams |
 
 ## Commands
@@ -54,6 +60,7 @@ nix run .#ssh                # shell in the VM as `agent`
 nix run .#ssh -- <command>   # one command in the VM
 nix run .#pair               # add the VM to the T3 app on the Mac
 nix build .#vm --no-link     # build only
+tests/github-broker.sh       # check the token swap on the Mac, without the VM or a token
 nix fmt                      # format the Nix files; run before committing
 ```
 
@@ -92,8 +99,10 @@ The reply should name Linux and the host `agent-vm`.
   task needs it, with a `note` saying why.
 - **Log lines** are `time event host port how [reason]`, with the event one
   of `allowed`, `refused`, `failed`. A `started` line, with the number of
-  destinations and the rules file, marks each broker start. Never log paths,
-  headers or bodies.
+  destinations and the rules file, marks each broker start. For a request to
+  an opened destination, the method, the path without its query string and
+  the answer's status are added. Never log query strings, headers, bodies or
+  tokens.
 - **Only a broker of ours may hold the port.** `nix run .#vm` refuses to
   start when `localhost:8474` is taken by anything but a broker started with
   `nix run .#broker`.
@@ -103,6 +112,53 @@ The reply should name Linux and the host `agent-vm`.
   `qemu.pid`, `qmp.sock`, `broker.pid`, `broker.log`, `broker/`, `console.log`.
 - **The broker runs with the user's rights on the Mac** and is the one Mac
   program the VM can talk to. Treat everything it receives as hostile.
+
+## GitHub through the broker
+
+- **The VM holds a placeholder, the Mac holds the token.** `git` and `gh` in
+  the VM log in with `nixt3-placeholder-not-a-real-token`. The broker puts
+  the real token in its place. The placeholder is written in three files:
+  `broker/swap.py`, `vm/default.nix` and `tests/network-lock.sh`; a unit
+  test checks that they agree.
+- **`inspect: true` in `rules.yaml` makes the broker open a destination,**
+  and `token: <name>` makes it swap the placeholder there. Only GitHub's
+  hosts have them. Never mark Anthropic: its traffic is passed on unread.
+- **A login that is not the placeholder is refused, not removed.** Keep it
+  that way. Cookies are left out of the request.
+- **A token is added only on a checked connection.** The tunnel, the name in
+  the VM's encrypted connection, the Host header and the certificate of the
+  server must all be the host from the rules. Clear text inside a tunnel is
+  refused for every destination.
+- **`proxy.py` runs no programs and reads no token from a file or the
+  environment.** `fetch_tokens.py` gets the tokens first, and they reach the
+  broker on an inherited pipe, number 3. This is so the broker can be
+  confined without access to the password manager.
+- **Where a token is kept is not in the repo.** `rules.yaml` names it;
+  `~/.config/nixt3/tokens.yaml` on the Mac (or `AGENT_BROKER_TOKENS`) gives
+  the command that prints it. A missing file, entry or failing command
+  stops the broker from starting.
+- **Never call the user's password manager from a test.** Use a tokens file
+  whose command prints a made-up token, as `tests/github-broker.sh` does.
+  GitHub answers "Bad credentials" to a made-up token and "Requires
+  authentication" to no login, which is enough to show the swap happened.
+- **The broker speaks HTTP/1.1 where it opens traffic** (`http2=false`).
+  The body handling relies on it: in HTTP/2 a request can carry a body
+  without declaring one.
+- **Bodies are not held in memory.** A request body is read in full only
+  when it is declared to be at most 1 MiB; everything else is passed on in
+  pieces. `body_size_limit` must stay off: it cuts off a large push or
+  clone before the broker's code runs.
+- **The VM does not see a connection being closed.** QEMU's forward runs
+  `nc` per connection, and `nc` does not pass a close from the broker on.
+  An answer that ends by closing the connection is therefore re-framed as
+  chunked in `proxy.py`. Keep that in mind when a program in the VM hangs.
+- **The VM trusts the broker's certificate authority,** handed over at start
+  with QEMU's `-fw_cfg` and read in the VM from
+  `/sys/firmware/qemu_fw_cfg/by_name/opt/nixt3/broker-ca/raw`. The trusted
+  list is built at boot in `/run/broker-ca`, and `/etc/ssl/certs` points
+  there. The private key (`broker/mitmproxy-ca.pem` in the state folder)
+  must never be passed to the VM.
+- **Phase 5 hooks in at one place:** `Broker.policy()` in `proxy.py`.
 
 ## Things that are easy to get wrong
 
@@ -203,11 +259,19 @@ Update this section when a phase is finished or a decision is made.
 - **Phase 3, the network lock:** done. `nix run .#check` passes all checks,
   and a T3 thread in the locked VM reached Claude and was refused
   `example.com`.
-- **Next, phase 4:** GitHub through the broker, with the token read from
-  1Password. The repo the agent may push to is this one.
-- **Decided:** the GitHub token is kept in 1Password. The broker reads it
-  once at start through a command named in `rules.yaml` and keeps it in
-  memory. It is never written to the repo, the VM, a Nix file or the Nix
-  store, which every program on the Mac can read.
+- **Phase 4, GitHub through the broker:** built, and checked with a made-up
+  token: `nix run .#check` passes, `tests/github-broker.sh` passes, and a T3
+  thread in the VM read a GitHub repo through the broker. Not done yet: the
+  final check with a real token, `tests/github-live.sh` (push a branch, open
+  a pull request). It waits for the user's token in 1Password.
+- **Next, phase 5:** limits on which repos and actions the agent may use.
+- **Decided:** the GitHub token is kept in 1Password. `rules.yaml` names it
+  only as `github`. `~/.config/nixt3/tokens.yaml` on the Mac names the
+  command that prints it. That command is run once per broker start, and
+  the token is handed to the broker through a pipe and kept in memory. It is
+  never written to the repo, the VM, a Nix file or the Nix store, which
+  every program on the Mac can read.
+- **Decided:** a request to GitHub with a login other than the placeholder
+  is refused, not passed on without it.
 - **Open decision:** where Claude's own login lives. For now it is signed in
   inside the VM.

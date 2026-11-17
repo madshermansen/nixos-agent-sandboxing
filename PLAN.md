@@ -56,7 +56,7 @@ After phase 4 there is a usable sandboxed agent. Phase 5 narrows what it can do,
 - **How work is done.** Each phase is one pull request on its own branch. A separate agent reviews it, the findings are fixed, the phase's check is run in the VM, and then it is merged.
 - **The broker is not put in a container.** On a Mac that would mean a second VM, and the broker could no longer ask 1Password for the token. It will be confined with macOS's own tools in phase 6.
 - **The test repo for the agent's pushes is this repo itself.**
-- **Where the GitHub token is kept: 1Password.** The broker reads it once when it starts, which asks for Touch ID, and keeps it in memory only. Other programs on the Mac cannot read it silently, which they could from the Keychain. The cost is one prompt per broker start. `rules.yaml` names a command that prints the token, so someone else can use a different store without changing the broker.
+- **Where the GitHub token is kept: 1Password.** The broker reads it once when it starts, which asks for Touch ID, and keeps it in memory only. Other programs on the Mac cannot read it silently, which they could from the Keychain. The cost is one prompt per broker start. `rules.yaml` names the token only by a short name. A file on the user's Mac, outside the repo (`~/.config/nixt3/tokens.yaml`), names the command that prints it, so someone else can use a different store without changing the broker or the repo.
 
 ## Open decisions
 

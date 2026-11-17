@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# Checks the network lock from inside the VM. Run it from the Mac with
+# Checks the network lock from inside the VM, and how the VM uses GitHub
+# through the broker without holding a token. Run it from the Mac with
 # `nix run .#check`.
 #
 # Most checks here must FAIL to pass: the point of the lock is what the VM
 # cannot do. A check that hangs counts as blocked, so each one has a time
 # limit.
+#
+# No check needs a real GitHub token. With a made-up token on the Mac, GitHub
+# answers "Bad credentials", which still shows that the broker put something
+# in place of the placeholder. tests/github-live.sh is the check that needs a
+# real one.
 
 set -u
 
@@ -74,6 +80,119 @@ case "$(status_of https://api.anthropic.com/v1/models)" in
   *) pass "Anthropic's API answers" ;;
 esac
 
+echo "GitHub, which the broker opens to put the token in:"
+
+# What programs in the VM use in place of a token. Keep it equal to
+# PLACEHOLDER in broker/swap.py.
+placeholder="nixt3-placeholder-not-a-real-token"
+
+# Prints who signed the certificate the VM is shown for a host. curl checks
+# the certificate as usual, so an answer also means the VM trusts the signer.
+issuer_of() {
+  curl -sv -o /dev/null --max-time 15 "https://$1/" 2>&1 | grep -i '^\* *issuer:' | head -n 1
+}
+
+for host in github.com api.github.com; do
+  case "$(issuer_of "$host")" in
+    *mitmproxy*) pass "$host is opened: its certificate is the broker's, and curl trusts it" ;;
+    *) fail "$host is opened: its certificate is the broker's, and curl trusts it" ;;
+  esac
+done
+
+# Claude's traffic must stay unread: the certificate is Anthropic's own.
+case "$(issuer_of api.anthropic.com)" in
+  "" | *mitmproxy*) fail "Anthropic is passed on untouched: its certificate is its own" ;;
+  *) pass "Anthropic is passed on untouched: its certificate is its own" ;;
+esac
+
+# Node brings its own list of certificate authorities, so it is checked
+# apart from curl. This opens a tunnel and lets Node check the certificate.
+must_work "Node trusts the broker's certificate for GitHub" timeout 20 node -e '
+  const proxy = new URL(process.env.HTTPS_PROXY);
+  const ask = require("http").request({
+    host: proxy.hostname, port: proxy.port, method: "CONNECT", path: "api.github.com:443",
+  });
+  ask.on("connect", (answer, socket) => {
+    const secure = require("tls").connect({ socket, servername: "api.github.com" }, () => process.exit(0));
+    secure.on("error", () => process.exit(1));
+  });
+  ask.on("error", () => process.exit(2));
+  ask.end();
+'
+
+# gh is written in Go, which reads certificates in its own way. Whatever
+# GitHub answers, gh must get the answer and not complain about the
+# certificate. With a made-up token on the Mac the answer is an error.
+answer=$(timeout 30 gh api zen 2>&1)
+if [ $? -eq 124 ] || echo "$answer" | grep -qiE "x509|certificate|tls"; then
+  fail "gh gets an answer from GitHub and trusts the broker's certificate"
+else
+  pass "gh gets an answer from GitHub and trusts the broker's certificate"
+fi
+
+[ "${GH_TOKEN:-}" = "$placeholder" ] &&
+  pass "gh's token in the VM is the placeholder" ||
+  fail "gh's token in the VM is the placeholder"
+
+printf 'protocol=https\nhost=github.com\n\n' | timeout 10 git credential fill 2>/dev/null | grep -qx "password=$placeholder" &&
+  pass "git's password for GitHub in the VM is the placeholder" ||
+  fail "git's password for GitHub in the VM is the placeholder"
+
+# The T3 server starts the agents, so they get its environment.
+t3_pid=$(systemctl show --property MainPID --value t3)
+tr '\0' '\n' <"/proc/$t3_pid/environ" 2>/dev/null | grep -qx "GH_TOKEN=$placeholder" &&
+  pass "the T3 server, and so each agent, has the placeholder too" ||
+  fail "the T3 server, and so each agent, has the placeholder too"
+
+# GitHub tells a request without a login from one with a wrong token. So its
+# answer shows whether the broker put a token in place of the placeholder,
+# also when the token on the Mac is a made-up one.
+curl -s --max-time 15 https://api.github.com/user | grep -q "Requires authentication" &&
+  pass "without a login, GitHub asks for one" ||
+  fail "without a login, GitHub asks for one"
+
+# GitHub ends its answer to a wrong token by closing the connection, which
+# the VM cannot see. The broker has to mark the end, or curl waits in vain.
+answer=$(curl -s --max-time 15 -H "Authorization: token $placeholder" https://api.github.com/user) ||
+  answer="curl did not get a whole answer"
+case "$answer" in
+  *'"login"'*) pass "with the placeholder, the broker adds a token, and GitHub accepts it" ;;
+  *"Bad credentials"*) pass "with the placeholder, the broker adds a token (GitHub does not know it: is it a made-up one?)" ;;
+  *) fail "with the placeholder, the broker adds a token" ;;
+esac
+
+curl -s --max-time 15 -H "Authorization: token some-other-token" https://api.github.com/zen |
+  grep -q "Refused by the sandbox broker" &&
+  pass "a request with any other token is refused by the broker" ||
+  fail "a request with any other token is refused by the broker"
+
+curl -s --max-time 15 -H "Host: gist.github.com" https://github.com/ | grep -q "names another site" &&
+  pass "a request that names another site than its connection is refused" ||
+  fail "a request that names another site than its connection is refused"
+
+# A tunnel is for an encrypted connection. Clear text sent through one must
+# not be passed on, least of all with a token. --proxytunnel makes curl open
+# a tunnel for an http:// address. The first host is opened by the broker,
+# the second is passed on untouched.
+for host in github.com api.anthropic.com; do
+  curl -s --max-time 15 --proxytunnel -H "Authorization: token $placeholder" "http://$host:443/" |
+    grep -q "was not encrypted" &&
+    pass "clear text inside a tunnel to $host is refused" ||
+    fail "clear text inside a tunnel to $host is refused"
+done
+
+must_work "git uses HTTPS for a git@github.com: address" \
+  timeout 30 git ls-remote git@github.com:octocat/Hello-World.git HEAD
+
+must_work "git uses HTTPS for an ssh://git@github.com/ address" \
+  timeout 30 git ls-remote ssh://git@github.com/octocat/Hello-World.git HEAD
+
+# About 10 MB, far more than the broker reads into memory at once.
+scratch=$(mktemp -d)
+must_work "a large download gets through: a shallow clone of git itself" \
+  timeout 180 git clone --quiet --depth 1 --no-checkout https://github.com/git/git "$scratch/git"
+rm -rf "$scratch"
+
 echo "Around the broker:"
 
 must_fail "a direct connection by name is blocked" \
@@ -123,6 +242,29 @@ must_fail "the agent user has no sudo" \
 # The mount table would list a shared folder as type 9p or virtiofs.
 must_fail "no folder is shared with the Mac" \
   grep -Eq ' (9p|virtiofs) ' /proc/mounts
+
+# A real GitHub token starts with one of these. The placeholder does not.
+token_shape='(gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50,})'
+
+if cat /proc/[0-9]*/environ 2>/dev/null | tr '\0' '\n' | grep -Eq "$token_shape"; then
+  fail "no program in the VM has something that looks like a GitHub token in its environment"
+else
+  pass "no program in the VM has something that looks like a GitHub token in its environment"
+fi
+
+# Everything the agent user can read where a token could have been left:
+# its home folder with git's and gh's settings and every clone, and the
+# system's settings and scratch folders. Program files are skipped.
+found=$(timeout 300 grep -rIlsE "$token_shape" /home/agent /etc /run /tmp /var/tmp 2>/dev/null)
+search_status=$?
+if [ "$search_status" -eq 124 ]; then
+  fail "no file in the VM holds something that looks like a GitHub token (the search took too long)"
+elif [ -n "$found" ]; then
+  fail "no file in the VM holds something that looks like a GitHub token"
+  echo "$found" | head -n 5 | sed 's/^/          /'
+else
+  pass "no file in the VM holds something that looks like a GitHub token"
+fi
 
 echo
 if [ "$failures" -eq 0 ]; then

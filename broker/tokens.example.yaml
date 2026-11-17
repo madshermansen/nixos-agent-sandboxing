@@ -1,0 +1,47 @@
+# Where the broker gets its tokens. This is an example: copy it to
+#
+#   ~/.config/nixt3/tokens.yaml
+#
+# on your Mac, change it to fit, and make it yours alone:
+#
+#   mkdir -p ~/.config/nixt3
+#   cp broker/tokens.example.yaml ~/.config/nixt3/tokens.yaml
+#   chmod 600 ~/.config/nixt3/tokens.yaml
+#
+# To keep the file somewhere else, put its path in the environment variable
+# AGENT_BROKER_TOKENS.
+#
+# Why this is not part of rules.yaml: that file is public and the same for
+# everyone. It only says "this destination needs the token called github".
+# Where you keep that token is yours to decide, and nobody else's business.
+#
+# The file holds no token, only how to get one. Each entry has:
+#
+#   command   A program and its arguments, as a list. It is run once, each
+#             time the broker starts, without a shell, as you. It must print
+#             the token and nothing else, and end with status 0.
+#
+# The token goes from that program straight into the broker's memory. It is
+# not written to a file, the VM, or a log. If the file, an entry or a command
+# is missing or fails, the broker refuses to start and says what is wrong.
+#
+# The name of each entry (`github` below) is the one a destination in
+# rules.yaml has as its `token`.
+
+tokens:
+  # With 1Password: `op read` and the secret's address, which you get from
+  # "Copy Secret Reference" in the 1Password app. This asks for Touch ID
+  # each time the broker starts.
+  github:
+    command: ["op", "read", "op://Private/agent-sandbox-github/credential"]
+
+  # With another password manager, name its command instead. Two examples:
+  #
+  # github:
+  #   command: ["pass", "show", "github/agent-sandbox-token"]
+  #
+  # github:
+  #   command: ["security", "find-generic-password", "-s", "agent-sandbox-github", "-w"]
+  #
+  # The second reads the macOS Keychain, which hands a secret to any program
+  # of yours without asking, so it protects the token less than 1Password.
