@@ -36,9 +36,9 @@ Each phase ends with a check that proves it works.
 | --- | --- | --- |
 | 0 | Create the repo with the layout and `PLAN.md` | The repo exists |
 | 1 | Linux builder through the repo's nix-darwin module. A minimal headless NixOS VM with open network, reachable by SSH from the Mac. T3 server in the VM, linked to the T3 app. | A T3 thread runs `uname` and prints Linux |
-| 2 | The real VM: tool list, Claude Code, persistent disk, no shared folders, a test repo cloned inside. Uses a temporary GitHub token. | The agent commits a change in the clone and pushes a branch |
+| 2 | The real VM: tool list, Claude Code, persistent disk, no shared folders, a test repo cloned inside. The first plan gave it a temporary GitHub token; none was used. | The agent commits a change in the clone. Pushing a branch moved to phase 4, because no token was put in the VM. |
 | 3 | Lock the network. The proxy on the Mac passes listed destinations through and adds no keys yet. | `curl https://example.com` fails in the VM. Claude and `git fetch` still work. |
-| 4 | GitHub through the proxy: token in 1Password, a placeholder in the VM, a key-adding rule. `git` in the VM uses HTTPS so the proxy can see it. Remove the temporary token. | The agent pushes a branch and opens a PR. A search of the VM finds no real token. |
+| 4 | GitHub through the proxy: token in 1Password, a placeholder in the VM, a key-adding rule. `git` in the VM uses HTTPS so the proxy can see it. | The agent pushes a branch and opens a PR. A search of the VM finds no real token. |
 | 5 | GitHub limits: a list of allowed repos, and refusals for settings, secrets and repo deletion. | Requests to an unlisted repo are refused. So are changing repo settings and writing Actions secrets. |
 | 6 | Docs, the VM and broker as background services, the broker confined so a bug in it cannot reach the rest of the Mac, and Claude's built-in sandbox for local Mac threads | It is used for a normal working day |
 

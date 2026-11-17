@@ -110,7 +110,11 @@ The reply should name Linux and the host `agent-vm`.
 - **mitmdump ignores an unknown `--set` option,** so the rules path is passed
   as the `AGENT_BROKER_RULES` variable.
 - **State files** in `~/.local/state/agent-vm`: `disk.qcow2`, `ssh_key`,
-  `qemu.pid`, `qmp.sock`, `broker.pid`, `broker.log`, `broker/`, `console.log`.
+  `ssh_key.pub`, `qemu.pid`, `qmp.sock`, `broker.pid`,
+  `broker-foreground.pid` (written by `nix run .#broker`), `broker.log`,
+  `broker/` (mitmproxy's files, among them the certificate authority and its
+  private key), `console.log` (only when the VM is started detached, as
+  below), and the folder `in-use` while an agent holds the VM.
 - **The broker runs with the user's rights on the Mac** and is the one Mac
   program the VM can talk to. Treat everything it receives as hostile.
 
@@ -197,8 +201,10 @@ The reply should name Linux and the host `agent-vm`.
   `sharedDirectories` are deliberate. Do not add a shared folder to move a
   file; use SSH.
 - **The `agent` user has no `sudo`.** Add tools to
-  `environment.systemPackages`. It also cannot power the VM off; stop it from
-  the Mac with `nix run .#stop`.
+  `environment.systemPackages`. It also cannot power the VM off: only root
+  may ask systemd for that, because polkit, which could allow a logged-in
+  user, is off in the VM (asked over SSH, the answer was "Access denied").
+  Stop the VM from the Mac with `nix run .#stop`.
 - **`nix run .#vm` holds its terminal.** To start the VM from a tool call,
   detach it and send the console to a file:
   `nohup nix run .#vm > ~/.local/state/agent-vm/console.log 2>&1 < /dev/null &`.

@@ -17,6 +17,7 @@ on 2026-11-17. The setting names are copied from these pages:
 | --- | --- |
 | Sandboxing | <https://code.claude.com/docs/en/sandboxing> |
 | Settings reference | <https://code.claude.com/docs/en/settings-reference> |
+| Settings | <https://code.claude.com/docs/en/settings> |
 | Sandbox environments | <https://code.claude.com/docs/en/sandbox-environments> |
 | Permissions | <https://code.claude.com/docs/en/permissions> |
 
@@ -56,10 +57,10 @@ Three things run **outside** the sandbox, and matter most:
 | What it can read | Nothing on the Mac | Most of the Mac, unless you list paths to deny |
 | What it can write | Its own disk | The project folder and a temporary folder |
 | Where the boundary is | QEMU, a separate machine with its own kernel | A macOS rule on a process that shares the Mac's kernel |
-| Who can lift it | Nobody inside the VM | Your settings. By default Claude can also ask to run a command outside it. |
+| Who can lift it | Nobody inside the VM | Your settings, and the settings files of the repository the thread runs in. By default Claude can also ask to run a command outside it. |
 | Network list | [`broker/rules.yaml`](../broker/rules.yaml): exact hosts, port 443 unless listed | `sandbox.network.allowedDomains`: wildcards allowed, every port unless you give one |
-| An unlisted host | Always refused | Depends on the permission mode: you are asked, or in `bypassPermissions` mode it is allowed without asking. `strictAllowlist` makes it a refusal. |
-| Checks the site name inside the encryption | Yes, the first message | Not stated. The documentation says the decision is made from the host name the program gives, and names domain fronting as a limit. |
+| An unlisted host | Always refused | In a terminal session it depends on the permission mode: you are asked, or in `bypassPermissions` mode it is allowed without asking. `strictAllowlist` makes it a refusal. |
+| Checks the site name inside the encryption | Yes, the first message | Not stated. The documentation says the decision is made from the host name the program gives, and names domain fronting as a limit ([what that is](threat-model.md#words-used-on-this-page)). |
 | Keys in reach | The Claude sign-in in the VM | Whatever you can read, unless denied |
 
 The documentation says the same in its own words: the sandboxed Bash tool
@@ -85,6 +86,38 @@ There are two ways.
 If `~/.claude/settings.json` already has content, add the keys below to what
 is there. Do not replace the file.
 
+### Your own settings are not a lock
+
+Claude Code reads settings from several files, and yours rank lowest. The
+order, highest first, is: managed settings, the `--settings` flag, a
+project's `.claude/settings.local.json`, a project's `.claude/settings.json`,
+then your `~/.claude/settings.json`. (Settings, "Settings precedence".)
+
+So the repository a thread runs in can undo much of what is below:
+
+- **It can turn the sandbox off** with `"enabled": false`. By that order, a
+  project file's value wins over yours.
+- **It can take commands out of the sandbox** with `excludedCommands`, add
+  folders that may be written with `filesystem.allowWrite`, and turn on
+  `network.allowLocalBinding`.
+- **It cannot** turn `allowUnsandboxedCommands` back on when your settings
+  say `false`, remove a `deny` entry of yours, or add hosts once your
+  settings set `strictAllowlist`. Both need Claude Code v2.1.285 or later.
+
+Only two things stop a repository from loosening the sandbox: managed
+settings, which an organization hands out, and starting `claude` with
+`--settings`. The documentation gives this example for one session:
+
+```sh
+claude --settings '{"sandbox": {"enabled": true, "allowUnsandboxedCommands": false}}'
+```
+
+That cannot be done for a thread that T3 starts.
+
+**Before you start a thread in a repo you cloned, look at its `.claude`
+folder.** A `settings.json` there with a `sandbox` part, or with hooks, is
+written by whoever wrote the repo.
+
 ### The base
 
 ```json
@@ -101,13 +134,16 @@ is there. Do not replace the file.
 | --- | --- | --- |
 | `sandbox.enabled` | Turns the sandbox on for shell commands. Default `false`. | The point of this page |
 | `sandbox.failIfUnavailable` | Claude Code exits at start when the sandbox cannot start. Default `false`, which means commands then run **without** a sandbox. | It fails closed, like the broker |
-| `sandbox.allowUnsandboxedCommands` | `false` makes Claude Code ignore a request to run a command outside the sandbox. Default `true`. The `/sandbox` panel calls `false` "Strict sandbox mode". | Without it, the boundary can be asked away |
+| `sandbox.allowUnsandboxedCommands` | `false` makes Claude Code ignore a request to run a command outside the sandbox. Default `true`. The `/sandbox` panel calls `false` "Strict sandbox mode". Commands that match an `excludedCommands` entry still run outside. | Without it, the boundary can be asked away |
 
 With only this, commands still go through the usual permission prompts.
-What happens when a command wants a new host depends on the permission mode
-of the thread. In the usual modes you are asked. In `bypassPermissions` mode
-the host is allowed without a prompt (Sandboxing, "Hosts outside your allowed
-domains"). The next block closes that.
+
+What happens when a command wants a new host is documented for a session in
+a terminal: it depends on the permission mode. In the usual modes you are
+asked. In `bypassPermissions` mode the host is allowed without a prompt.
+(Sandboxing, "Hosts outside your allowed domains".) What a T3 thread does
+there is not documented and was not checked. The next block removes the
+question.
 
 ### Tighter: a fixed list of hosts
 
@@ -125,7 +161,7 @@ domains"). The next block closes that.
 | Setting | What it does |
 | --- | --- |
 | `sandbox.network.allowedDomains` | Hosts that sandboxed commands may reach without a prompt. A `:port` limits an entry to one port; without it every port is allowed. |
-| `sandbox.network.strictAllowlist` | `true` refuses every other host instead of asking. It is read from user or managed settings only; a repository cannot turn it on or off. Needs Claude Code v2.1.219 or later. |
+| `sandbox.network.strictAllowlist` | `true` refuses every host outside the allowlist instead of asking. The allowlist is `allowedDomains` plus the hosts in your `WebFetch(domain:...)` allow rules. It is read from user settings, managed settings and `--settings`; a repository cannot turn it on or off. Needs Claude Code v2.1.219 or later. |
 
 List what your own work needs. The sandbox covers shell commands only, so
 Claude Code's own connection to Anthropic should need no entry. Do not list
@@ -166,7 +202,7 @@ and variables you list are restricted."
 | --- | --- |
 | `sandbox.credentials.files` | With `"mode": "deny"`, sandboxed commands cannot read the path |
 | `sandbox.credentials.envVars` | With `"mode": "deny"`, the variable is removed before each sandboxed command |
-| `permissions.deny` with `Read(...)` | Stops Claude's own file tools, which the sandbox does not cover. The documentation calls this a best effort. |
+| `permissions.deny` with `Read(...)` | Stops Claude's own file tools, which the sandbox does not cover; the documentation calls this a best effort. The same paths are also denied to sandboxed commands. |
 
 The paths are examples. Put in the key files that exist on your Mac.
 
@@ -175,9 +211,16 @@ Two things to know before you add more paths:
 - **`~/.ssh` and git.** On macOS, git over SSH does not work inside the
   sandbox at all (Sandboxing, "`git` over SSH fails with the sandbox on").
   Use HTTPS addresses for git in sandboxed threads.
+- **This repo's tokens file.** `~/.config/nixt3/tokens.yaml` names a program
+  that is run as you each time the broker starts. A thread that can change
+  it can choose that program. A sandboxed command cannot write there by
+  default. For Claude's own file tools, add `"Edit(~/.config/nixt3/**)"` to
+  `permissions.deny`.
 - **This repo's state folder.** `~/.local/state/agent-vm` holds the SSH key
-  that opens the VM. A local thread that can read it can get a shell in the
-  VM. Denying the folder protects the VM from local threads. It also breaks
+  that opens the VM, and the private key of the broker's certificate
+  authority. A local thread that can read it can get a shell in the VM, or
+  pose as any site towards it. Denying the folder protects the VM from
+  local threads. It also breaks
   `nix run .#ssh` and the other commands for a local thread that is meant to
   work on this repo. Choose per project.
 
@@ -215,12 +258,25 @@ Taken from "Limitations" on the Sandboxing page, and from the tables above:
   `network.allowLocalBinding` and `filesystem.disabled` each open the
   boundary again. Leave them out unless you know why you need one.
 
-For this project, one more: **the broker's port.** The documentation says a
-sandboxed command on macOS cannot connect to a server on the Mac's localhost
-unless `network.allowLocalBinding` is `true`. That would keep sandboxed
-commands away from `localhost:8474`. Claude's other tools and unsandboxed
-programs are not held back by it. This matters once the broker attaches a
-token, which is planned; see [threat-model.md](threat-model.md).
+For this project, one more: **the broker's port.** While the broker runs, it
+adds your GitHub token for any program on the Mac that connects to
+`localhost:8474` and sends the placeholder. See
+[threat-model.md](threat-model.md). A thread on the Mac is such a program.
+What the sandbox does about it:
+
+- **A direct connection is blocked.** The documentation says a sandboxed
+  command on macOS cannot connect to a server on the Mac's localhost unless
+  `network.allowLocalBinding` is `true`.
+- **A connection through the sandbox's own proxy is not blocked by that.**
+  To the proxy, `localhost:8474` is a host like any other. It is refused
+  only when `strictAllowlist` is on and neither `localhost` nor `127.0.0.1`
+  is on the allowlist. Without `strictAllowlist`, the permission mode
+  decides.
+- **Everything outside the sandbox can reach it:** Claude's other tools,
+  hooks, MCP servers, and any other program of yours.
+
+So the sandbox narrows this and does not close it. Stopping the broker when
+the VM is not in use does: `nix run .#stop`.
 
 ## Not confirmed
 
