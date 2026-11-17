@@ -66,24 +66,56 @@ def load_policy(data: dict, opened: Iterable[str]) -> github_policy.Policy | Non
     return github_policy.load_policy(data["github"])
 
 
-def refusal_answer(host: str, text: str) -> tuple[bytes, str]:
-    """The body of a 403 for a refused request, and its Content-Type.
+def refusal_answer(host: str, target: str, text: str) -> tuple[int, bytes, str]:
+    """How a refused request is answered: the status, the body, its type.
 
     The text is for the agent in the VM: it says what was refused and, for
-    several refusals, which command to use instead. So it has to be shown.
+    several refusals, which command to use instead. So it has to be shown,
+    and each program shows only what it expects. There are three cases, each
+    tried with the real program:
 
-    git shows the body of a refusal as it is, line by line. `gh` does not:
-    it expects what GitHub's API sends for an error, JSON with a `message`,
-    and shows that message. Given plain text it shows only the status line,
-    and the agent would never see the way on. So a refusal on the API's
-    host is sent the way the API sends its own.
+    - **git** shows the body of a 403 as it is, line by line. So for
+      github.com the answer is a 403 with the text.
+    - **gh, for the REST API,** expects what the API sends for an error: a
+      403 with JSON that has a `message`, and shows that message. Given
+      plain text it shows only the status line.
+    - **gh, for GraphQL,** is two programs in one. Its reading commands show
+      the `message` of a 403 like the above. The commands that change
+      something (`gh pr close` and the like) do not: they print the whole
+      body of a 403 as one line with every quote and line break escaped.
+      Both show cleanly what GraphQL itself sends when it refuses: the
+      status 200, and a body with `errors` in place of data. So a refused
+      GraphQL request is answered that way. It is still a refusal: nothing
+      was sent to GitHub, and no program reads such a body as a success.
     """
-    if host.lower() == github_policy.API_HOST:
-        return (
-            json.dumps({"message": text}).encode("ascii"),
-            "application/json; charset=utf-8",
-        )
-    return text.encode("utf-8"), "text/plain; charset=utf-8"
+    if host.lower() != github_policy.API_HOST:
+        return 403, text.encode("utf-8"), "text/plain; charset=utf-8"
+    if target.partition("?")[0] == "/graphql":
+        body = {"data": None, "errors": [{"type": "FORBIDDEN", "message": text}]}
+        return 200, json.dumps(body).encode("ascii"), "application/json; charset=utf-8"
+    return 403, json.dumps({"message": text}).encode("ascii"), "application/json; charset=utf-8"
+
+
+# Added to the refusal of a GraphQL query that asks for something not on the
+# policy's list. Some `gh` commands that change something first read more
+# than the list allows (`gh pr edit` reads who can be assigned), and are
+# refused at that read, before their change is ever sent. The policy's text
+# for that refusal is about reading. This says what to do when the aim was
+# to change something. It is added here and not in github_policy.py, so that
+# the policy stays as it was reviewed; what is allowed does not change.
+CHANGE_INSTEAD = """
+If this came from a `gh` command that changes a pull request or an issue,
+such as `gh pr edit`: the command reads more than is allowed before it
+changes anything. Make the change with `gh api`, which is allowed in a repo
+listed with `access: write`:
+
+    gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title='TITLE' -f body='TEXT'
+    gh api repos/OWNER/REPO/issues/NUMBER/comments -f body='TEXT'
+    gh api repos/OWNER/REPO/issues/NUMBER/labels -f 'labels[]=LABEL'
+    gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f state=closed
+
+Put your own values where the words are in capitals.
+"""
 
 
 def when_to_decide(host: str, body_is_small: bool) -> str:
@@ -150,7 +182,7 @@ def plan(
 
     policy     From load_policy() above.
     token      The real token for this host, or None when it has none.
-    method     As sent.
+    method     As sent, in the letters it was sent in.
     host       The host the tunnel was opened for, in lower case.
     target     What followed the method in the request's first line: the
                path, and the query string if there is one, exactly as sent.
@@ -158,6 +190,12 @@ def plan(
                that was sent twice appearing twice.
     authority  The host the request itself names, from its Host header.
     body       The whole body as sent, or None when it was not read.
+
+    "As sent" is meant strictly: proxy.py hands over the bytes that arrived
+    and that will be sent on, each byte read as one character, and not the
+    tidied form that mitmproxy offers for convenience (its `method` is in
+    upper case whatever was sent). The policy accepts plain ASCII only, so a
+    request it allows is one whose text and bytes are the same thing.
 
     The token is in the result only when the request carried the
     placeholder and the policy allows the token. A request without a login
@@ -180,7 +218,10 @@ def plan(
         method, host, path, query, body, policy, headers=headers, authority=authority
     )
     if not decision.allowed:
-        return Plan(False, reason=decision.reason or "policy", message=decision.message)
+        message = decision.message
+        if decision.reason == "graphql-not-on-list":
+            message += CHANGE_INSTEAD
+        return Plan(False, reason=decision.reason or "policy", message=message)
 
     authorization = None
     if decision.with_token and credential.action == "swap":

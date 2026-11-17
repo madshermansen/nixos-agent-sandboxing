@@ -10,9 +10,11 @@ The broker opens the traffic to GitHub, as described in
 [architecture.md](architecture.md), and asks that module about every request
 before it adds the token and before anything is sent. A refused request
 never leaves the Mac: the program in the VM gets a 403 with a text that says
-what was refused and what to do instead. `git` shows that text as `remote:`
-lines, and `gh` shows it after `HTTP 403:`. A broker whose rules open a
-GitHub host but have no `github` part does not start.
+what was refused and what to do instead. Each program shows it in its own
+way, and the broker words the answer so that each does show it: `git` as
+lines that start with `remote:`, `gh api` after `gh:` or `HTTP 403:`, and
+the other `gh` commands after `GraphQL:`. A broker whose rules open a GitHub
+host but have no `github` part does not start.
 
 ## Why
 
@@ -335,7 +337,7 @@ repo in the address, where the broker can check it.
 | `gh pr checks` | Refused: reads by id | `gh pr view NUMBER --json statusCheckRollup` |
 | `gh pr comment`, `gh issue comment` | Refused | `gh api repos/OWNER/REPO/issues/NUMBER/comments -f body='TEXT'` |
 | `gh pr comment --edit-last` | Refused | `gh api -X PATCH repos/OWNER/REPO/issues/comments/COMMENT_ID -f body='TEXT'` |
-| `gh pr edit` | Refused | `gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title='TITLE'`, or `-f body='TEXT'`, or both. What is left out stays as it is. |
+| `gh pr edit` | Refused, already at what it reads first: who can be assigned. So its refusal is the one for a read that is not on the list; the broker adds the line on the right to it. | `gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title='TITLE'`, or `-f body='TEXT'`, or both. What is left out stays as it is. |
 | `gh pr edit --add-label` | Refused | `gh api repos/OWNER/REPO/issues/NUMBER/labels -f 'labels[]=LABEL'` |
 | `gh pr edit --add-reviewer` | Refused | `gh api repos/OWNER/REPO/pulls/NUMBER/requested_reviewers -f 'reviewers[]=LOGIN'` |
 | `gh pr close` | Refused | `gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f state=closed` |

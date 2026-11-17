@@ -176,6 +176,32 @@ def test_other_headers_stay(name):
     assert not swap.drops_header(name)
 
 
+# --- The Connection header ----------------------------------------------------
+
+
+@pytest.mark.parametrize("values", [[], ["close"], ["keep-alive"], ["Keep-Alive"], [" CLOSE "], ["keep-alive", "close"]])
+def test_a_connection_header_that_says_the_usual_is_accepted(values):
+    assert swap.connection_is_plain(values)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ["keep-alive, Authorization"],
+        ["keep-alive, Content-Type, Authorization"],
+        ["Authorization"],
+        ["close, Host"],
+        ["Upgrade"],
+        ["keep-alive", "Cookie"],
+        [""],
+        ["keep-alive,"],
+        ["keep-alive\tAuthorization"],
+    ],
+)
+def test_a_connection_header_that_names_other_headers_is_not(values):
+    assert not swap.connection_is_plain(values)
+
+
 # --- The secret wrapper ------------------------------------------------------
 
 

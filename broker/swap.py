@@ -185,6 +185,21 @@ def drops_header(name: str) -> bool:
     return name in DROPPED_HEADERS or name.startswith("x-forwarded-")
 
 
+def connection_is_plain(values: list[str]) -> bool:
+    """Whether a request's Connection headers say nothing but the usual.
+
+    `Connection: close` and `Connection: keep-alive` say what to do with the
+    connection afterwards. The header can also name other headers, as in
+    `Connection: keep-alive, Authorization`, which tells the next server on
+    the way to remove them before it passes the request on. GitHub's own
+    front servers are such a server. A request could in that way have a
+    header taken out that the broker's decision rested on, after the
+    decision was made. Nothing in the VM needs that, so only the two plain
+    values are accepted.
+    """
+    return all(value.strip().lower() in ("close", "keep-alive") for value in values)
+
+
 def reads_body(
     http1: bool, content_lengths: list[str], has_transfer_encoding: bool
 ) -> bool:

@@ -24,12 +24,24 @@ from the user's own computer, and it is limited on purpose.
   it. Every other repo is refused, for reading too. So are merging, and
   anything that changes a repo's settings, secrets or who has access.
 - `gh pr create` works, and so do the `gh` commands that read (`gh pr view`,
-  `gh pr list`, `gh issue view`, `gh repo view`). `gh pr comment`, `gh pr
-  edit`, `gh pr close`, `gh pr review` and `gh pr checks` are refused, and
-  the refusal names the `gh api` line that does the same job. Use that line.
+  `gh pr list`, `gh issue view`, `gh repo view`).
+- `gh pr comment`, `gh pr edit`, `gh pr close`, `gh pr review` and
+  `gh pr checks` are refused. The change itself is allowed; use `gh api`,
+  which names the repo in its address:
+
+      gh api repos/OWNER/REPO/issues/NUMBER/comments -f body='TEXT'
+      gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title='TITLE' -f body='TEXT'
+      gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f state=closed
+      gh api repos/OWNER/REPO/pulls/NUMBER/reviews -f event=COMMENT -f body='TEXT'
+      gh pr view NUMBER --json statusCheckRollup
+
+  In that order: comment, edit (leave out what should stay as it is),
+  close, review, and checks. A refusal names the line for other cases.
 - A refusal from the broker is final. It starts with `Refused by the sandbox
-  broker` and says what to do. Do not try the same thing another way; if the
-  task needs something that is refused, stop and tell the user what and why.
+  broker` and says what to do; `gh` prints it after `GraphQL:` or
+  `HTTP 403:`, and git as lines that start with `remote:`. Read all of it.
+  Do not try the same thing another way; if the task needs something that
+  is refused, stop and tell the user what and why.
 - The token you can see here (`GH_TOKEN`, and the password git uses) is a
   placeholder, not a secret. The broker puts the user's real token in its
   place on the way out. The real token is never in this machine, so do not

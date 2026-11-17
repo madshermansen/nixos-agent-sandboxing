@@ -147,29 +147,92 @@ def test_the_agent_and_the_checks_are_told_about_the_listed_repos():
 
 # --- How a refusal is worded for the program that gets it ----------------------
 
+REFUSAL = "Refused by the sandbox broker: no.\n\nUse:\n\n    gh api -X PATCH repos/a/b/pulls/1 -f state=closed\n"
 
-def test_a_refusal_on_the_api_is_json_with_a_message_as_githubs_own_errors_are():
+
+def test_a_refusal_for_git_is_a_403_in_plain_text_which_git_shows_line_by_line():
+    text = "Refused by the sandbox broker: no.\n\nMore, with an \u00e9.\n"
+    status, body, content_type = github_request.refusal_answer(GIT, "/a/b/info/refs?service=git-upload-pack", text)
+    assert status == 403 and content_type.startswith("text/plain")
+    assert body.decode("utf-8") == text
+
+
+def test_a_refusal_on_the_rest_api_is_a_403_with_a_json_message_as_githubs_own_errors_are():
     """`gh` shows the `message` of a JSON error, and only the status line of
     a plain-text one. The message is where the agent is told the way on."""
-    text = "Refused by the sandbox broker: no.\n\nUse:\n\n    gh api -X PATCH repos/a/b/pulls/1 -f state=closed\n"
     for host in (API, "API.GitHub.com"):
-        body, content_type = github_request.refusal_answer(host, text)
-        assert content_type.startswith("application/json")
-        assert json.loads(body) == {"message": text}
+        status, body, content_type = github_request.refusal_answer(host, "/repos/a/b/pulls/1", REFUSAL)
+        assert status == 403 and content_type.startswith("application/json")
+        assert json.loads(body) == {"message": REFUSAL}
         body.decode("ascii")
 
 
-def test_a_refusal_for_git_is_plain_text_which_git_shows_line_by_line():
-    text = "Refused by the sandbox broker: no.\n\nMore, with an \u00e9.\n"
-    body, content_type = github_request.refusal_answer(GIT, text)
-    assert content_type.startswith("text/plain")
-    assert body.decode("utf-8") == text
+@pytest.mark.parametrize("target", ["/graphql", "/graphql?x=y"])
+def test_a_refused_graphql_request_is_answered_the_way_graphql_refuses(target):
+    """The `gh` commands that change something print the body of a 403 as
+    one escaped line. They show a GraphQL error cleanly, and so do the
+    commands that read. Seen with gh 2.102."""
+    status, body, content_type = github_request.refusal_answer(API, target, REFUSAL)
+    assert status == 200 and content_type.startswith("application/json")
+    answer = json.loads(body)
+    assert answer["data"] is None
+    assert answer["errors"] == [{"type": "FORBIDDEN", "message": REFUSAL}]
+    body.decode("ascii")
+
+
+@pytest.mark.parametrize("target", ["/graphql/x", "/graphqlx", "/repos/a/graphql", "/"])
+def test_only_the_graphql_address_is_answered_that_way(target):
+    status, body, _ = github_request.refusal_answer(API, target, REFUSAL)
+    assert status == 403 and json.loads(body) == {"message": REFUSAL}
+
+
+def test_a_graphql_answer_for_github_dot_com_is_still_plain_text():
+    status, _, content_type = github_request.refusal_answer(GIT, "/graphql", REFUSAL)
+    assert status == 403 and content_type.startswith("text/plain")
 
 
 def test_every_refusal_of_the_policy_fits_in_a_json_message():
     result = plan("GET", API, "/repos/someone-else/repo")
-    body, _ = github_request.refusal_answer(API, result.message)
+    _, body, _ = github_request.refusal_answer(API, "/repos/someone-else/repo", result.message)
     assert json.loads(body)["message"] == result.message
+
+
+def test_a_read_that_is_not_on_the_list_also_names_the_way_to_make_a_change():
+    """`gh pr edit` reads who can be assigned before it changes anything,
+    and is refused at that read. The policy's text is about reading; the
+    agent wanted to change a title."""
+    body = graphql(
+        'query { repository(owner: "some-owner", name: "listed") '
+        "{ pullRequest(number: 5) { assignedActors(first: 5) { nodes { __typename } } } } }"
+    )
+    result = plan("POST", API, "/graphql", body=body)
+    assert (result.allowed, result.reason) == (False, "graphql-not-on-list")
+    assert result.message.startswith("Refused by the sandbox broker: ")
+    assert "gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title='TITLE'" in result.message
+    assert "`gh pr edit`" in result.message
+
+
+def test_other_refusals_are_the_policys_text_unchanged():
+    decision = github_policy.decide(
+        "GET", API, "/repos/someone-else/repo", "", None, POLICY,
+        headers=[("Host", API)], authority=API,
+    )
+    result = plan("GET", API, "/repos/someone-else/repo")
+    assert result.message == decision.message
+    assert github_request.CHANGE_INSTEAD not in result.message
+
+
+def test_each_line_named_for_a_change_is_itself_allowed_in_a_write_repo():
+    """The hint must not send the agent to something that is refused."""
+    requests = [
+        ("PATCH", "/repos/some-owner/listed/pulls/5", b'{"title":"T","body":"B"}'),
+        ("POST", "/repos/some-owner/listed/issues/5/comments", b'{"body":"B"}'),
+        ("POST", "/repos/some-owner/listed/issues/5/labels", b'{"labels":["L"]}'),
+        ("PATCH", "/repos/some-owner/listed/pulls/5", b'{"state":"closed"}'),
+    ]
+    assert github_request.CHANGE_INSTEAD.count("gh api") == len(requests) + 1
+    for method, target, body in requests:
+        assert plan(method, API, target, body=body).allowed, target
 
 
 # --- When a request is decided on ---------------------------------------------
@@ -342,6 +405,16 @@ def test_the_target_is_split_at_the_first_question_mark_only():
         assert (seen["path"], seen["query"]) == ("/repos/a/b", "")
     finally:
         github_policy.decide = original
+
+
+@pytest.mark.parametrize("method", ["get", "Get", "gET", "delete", "Post", "PoSt", "patch", "GET ", " GET", "GE T", ""])
+def test_a_method_in_another_spelling_is_refused_not_read_as_the_usual_one(method):
+    """The policy is given the method as it was sent. `delete` is not DELETE:
+    the broker passes on what it was sent, and must not judge something else."""
+    result = plan(method, API, "/repos/some-owner/listed/issues/comments/5", body=b"")
+    assert not result.allowed
+    result = plan(method, GIT, "/some-owner/listed/info/refs?service=git-upload-pack")
+    assert not result.allowed
 
 
 def test_every_header_reaches_the_policy_also_one_sent_twice():

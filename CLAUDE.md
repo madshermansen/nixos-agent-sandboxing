@@ -42,6 +42,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `broker/github_request.py` | Joins policy and swap for one request; pure, no mitmproxy |
 | `broker/fetch_tokens.py` | Fetches the tokens before the broker starts |
 | `broker/limits.py` | Size limits that mitmproxy lacks, patched into it; tied to the exact mitmproxy version |
+| `broker/settings.py` | Which of mitmproxy's settings the broker agrees to run with; pure, no mitmproxy |
 | `broker/tokens.example.yaml` | Example of `~/.config/nixt3/tokens.yaml`, which says where each token is kept |
 | `darwin/commands.nix` | The Mac-side commands behind every `nix run .#…` |
 | `darwin/default.nix` | nix-darwin module for the Mac |
@@ -195,16 +196,43 @@ The reply should name Linux and the host `agent-vm`.
   the broker sends on the same. Do not tidy a request before the policy is
   asked, and do not hand it a decoded or normalised form: a difference
   between what is judged and what is sent is a way around the policy.
+- **mitmproxy's accessors are not the bytes.** `request.method` is in upper
+  case whatever was sent, while the bytes that go out keep their spelling;
+  `request.authority` is decoded. For anything that is judged, read
+  `request.data` and `request.headers.fields` (`as_sent()` in `proxy.py`).
+  A method that is not in capitals is refused as `odd-method`.
+- **The one thing rewritten on purpose is a JSON body.** The policy writes
+  out again what it read, and that copy is sent, so GitHub reads what was
+  judged. A number may change its spelling (`1e2` leaves as `100.0`).
+- **Each request is decided by itself.** Never remember a decision for a
+  connection: a listed request may be followed by an unlisted one on the
+  same connection.
+- **The broker runs only with mitmproxy settings it knows.** A
+  `config.yaml` or `config.yml` in the broker's folder, or any setting that
+  differs from what `darwin/commands.nix` sets, stops it from starting:
+  settings such as `map_remote` and `modify_headers` change a request after
+  it was judged. A new `--set` in the start command needs an entry in
+  `broker/settings.py`; a unit test compares the two.
+- **A `Connection` header may say `close` or `keep-alive` only** on opened
+  hosts. Anything else can name headers for GitHub's front servers to drop.
 - **The API is decided after the body, git before it.** For
   `api.github.com` the body is read first (at most 1 MiB, not compressed,
   with a declared length) and a request whose body cannot be read that way
   is refused. For `github.com` the decision is made from the first lines
   and the body streams.
-- **A refusal on `api.github.com` is JSON with a `message`,** like GitHub's
-  own errors, because `gh` shows that message and only the status line of
-  a plain-text answer. The message is where the agent is told which
-  `gh api` line to use instead. For git it stays plain text, which git
-  shows line by line.
+- **A refusal is worded for the program that gets it,** because the text is
+  where the agent is told which `gh api` line to use instead, and each
+  program shows only what it expects. For git: a 403 in plain text, shown
+  as `remote:` lines. For the REST API: a 403 with JSON that has a
+  `message`, as GitHub's own errors are; `gh api` shows it. For
+  `POST /graphql`: the status 200 with `errors` in place of data, as
+  GraphQL itself refuses; the `gh pr` commands print the body of a 403 as
+  one escaped line, and this form cleanly. `refusal_answer()` in
+  `github_request.py`; each form was tried with the real `gh`.
+- **`gh pr edit` is refused at a read,** not at its change: it first asks
+  who can be assigned, which is not on the policy's list. The broker adds
+  the `gh api` lines for changes to that refusal (`CHANGE_INSTEAD` in
+  `github_request.py`), without changing what the policy allows.
 - **`with_token` false means no login at all.** With
   `other_repos: read-public` the policy allows reading unlisted repos
   without the token. The broker then removes the Authorization header, the

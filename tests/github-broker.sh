@@ -384,6 +384,46 @@ elif kind == "trailers":  # lines after a chunked body, not announced
     except (OSError, ssl.SSLError):
         answer = b""
     print("answered " + answer.split(b"\r\n")[0].decode("latin-1") if answer else "closed")
+elif kind == "requests":
+    # Several requests, one after the other on ONE connection, each given as
+    # its first line without the version: "GET /path". They are sent exactly
+    # as written, so a method in small letters or a "#" in the address
+    # arrives at the broker as it stands. curl cannot do either: it opens a
+    # connection per call here, and it cuts a "#" off.
+    #
+    # Prints one line per answer: "arrived with the token", "arrived without
+    # a login", or "refused", after the status.
+    import json
+
+    placeholder, lines = sys.argv[7], sys.argv[8:]
+    connection = tunnel()
+    connection.settimeout(15)
+    reader = connection.makefile("rb")
+    for line in lines:
+        try:
+            connection.sendall(
+                f"{line} HTTP/1.1\r\nHost: {host}\r\nAuthorization: token {placeholder}\r\n\r\n".encode()
+            )
+            status = reader.readline().split()[1].decode()
+            length = 0
+            while (header := reader.readline()) not in (b"\r\n", b""):
+                name, _, value = header.partition(b":")
+                if name.lower() == b"content-length":
+                    length = int(value)
+            body = reader.read(length)
+        except (OSError, ssl.SSLError, IndexError, ValueError):
+            print("closed")
+            break
+        try:
+            report = json.loads(body)
+        except ValueError:
+            report = {}
+        if "authorization" not in report:
+            print(status, "refused")
+        elif report["authorization"]:
+            print(status, "arrived with the token")
+        else:
+            print(status, "arrived without a login")
 elif kind.startswith("hidden-"):
     # A header hidden from the broker inside the value of another one: on a
     # continuation line (a line that starts with a space), or after a lone
@@ -501,6 +541,13 @@ requests = {
         {},
     ),
     "my-repos": ("query { viewer { repositories(first: 5) { nodes { name } } } }", {}),
+    # What `gh pr edit` reads before it changes anything: who can be
+    # assigned. That is not on the policy's list.
+    "read-before-an-edit": (
+        'query { repository(owner: "madshermansen", name: "nixt3") '
+        "{ pullRequest(number: 5) { assignedActors(first: 5) { nodes { __typename } } } } }",
+        {},
+    ),
 }
 for name, (query, variables) in requests.items():
     with open(f"{folder}/{name}.json", "w") as file:
@@ -525,8 +572,10 @@ fi
 
 # start_broker <log file> [variable=value...]: starts the broker in the
 # background with this test's state folder and port, and this repo's rules
-# unless a variable names other ones. Every broker started here sends its
+# unless a variable names other ones. What is in `extra` is added to
+# mitmproxy's arguments. Every broker started here sends its
 # connections to the stand-in.
+extra=()
 start_broker() {
   local log=$1
   shift
@@ -534,7 +583,7 @@ start_broker() {
     AGENT_BROKER_TOKENS="$work/tokens.yaml" BROKER_TEST_FAIL="$work/fail" \
     BROKER_TEST_STAND_IN="$server_port" "$@" \
     "$broker" --listen-port "$broker_port" --scripts "$work/redirect.py" --scripts "$work/inject.py" \
-    --set ssl_verify_upstream_trusted_ca="$work/ca.pem" >"$log" 2>&1 &
+    --set ssl_verify_upstream_trusted_ca="$work/ca.pem" ${extra[@]+"${extra[@]}"} >"$log" 2>&1 &
   broker_pid=$!
 }
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
@@ -588,6 +637,66 @@ start_broker "$work/other-host.log" AGENT_BROKER_RULES="$work/other-host.yaml"
 if wait "$broker_pid"; then fail "an opened host that is not GitHub: the broker does not start"; else pass "an opened host that is not GitHub: the broker does not start"; fi
 check "an opened host that is not GitHub: the message says why" grep -q "can open only" "$work/other-host.log"
 
+# mitmproxy's own settings. Some of them change a request after the broker
+# has judged it, and mitmproxy reads a settings file from its folder without
+# being asked. The broker must not run with either. See broker/settings.py.
+#
+# must_not_start <description> <words of the message> [variable=value...]
+must_not_start() {
+  local what=$1 words=$2 log
+  shift 2
+  log="$work/setting-$RANDOM.log"
+  start_broker "$log" "$@"
+  # A broker that does start would keep running. It gets ten seconds to
+  # give up by itself, and is then stopped and counted as a failure.
+  for _ in $(seq 100); do
+    kill -0 "$broker_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$broker_pid" 2>/dev/null; then
+    kill "$broker_pid" 2>/dev/null
+    wait "$broker_pid" 2>/dev/null
+    fail "$what: the broker does not start (it did, and was stopped)"
+  elif wait "$broker_pid"; then
+    fail "$what: the broker does not start"
+  elif grep -q "$words" "$log"; then
+    pass "$what: the broker does not start, and says why"
+  else
+    fail "$what: the broker does not start, and says why"
+  fi
+}
+mkdir -p "$work/state-with-file/broker"
+printf 'map_remote:\n  - "|%s/info/refs|%s/info/refs"\n' "$listed" "$unlisted" >"$work/state-with-file/broker/config.yaml"
+must_not_start "a settings file in the broker's folder" "config.yaml is a settings file" AGENT_VM_STATE="$work/state-with-file"
+mkdir -p "$work/state-with-yml/broker"
+: >"$work/state-with-yml/broker/config.yml"
+must_not_start "an empty settings file under its other name" "config.yml is a settings file" AGENT_VM_STATE="$work/state-with-yml"
+
+extra=(--set "map_remote=|$listed/info/refs|$unlisted/info/refs")
+must_not_start "a setting that sends a request elsewhere after it was judged (map_remote)" '`map_remote` is set'
+extra=(--map-remote "|$listed/info/refs|$unlisted/info/refs")
+must_not_start "the same setting given as an option of its own" '`map_remote` is set'
+extra=(--set "modify_headers=/~q/Authorization/token something-else")
+must_not_start "a setting that rewrites headers (modify_headers)" '`modify_headers` is set'
+extra=(--set "modify_body=/~q/main/other")
+must_not_start "a setting that rewrites bodies (modify_body)" '`modify_body` is set'
+extra=(--mode "upstream:http://127.0.0.1:9")
+must_not_start "sending everything through another proxy (mode)" '`mode` is set'
+extra=(--set "stickyauth=.")
+must_not_start "a setting that adds an earlier login to later requests (stickyauth)" '`stickyauth` is set'
+extra=(--set "save_stream_file=$work/flows")
+must_not_start "a setting that writes the traffic to a file (save_stream_file)" '`save_stream_file` is set'
+extra=(--set "ssl_insecure=true")
+must_not_start "certificate checks turned off (ssl_insecure)" '`ssl_insecure` is set'
+extra=(--listen-host 0.0.0.0)
+must_not_start "listening on every address, not only this Mac's own" '`listen_host` must be'
+extra=(--flow-detail 2)
+must_not_start "mitmproxy printing the traffic into the log (flow_detail)" '`flow_detail` must be'
+extra=()
+# mitmproxy creates the file when it is given the setting, before the
+# broker's check runs. It must stay empty.
+if [ -s "$work/flows" ]; then fail "nothing was written to the traffic file"; else pass "nothing was written to the traffic file"; fi
+
 if port_open "$broker_port"; then fail "nothing listens after a failed start"; else pass "nothing listens after a failed start"; fi
 
 start_broker "$work/broker.log"
@@ -603,6 +712,11 @@ ca="$work/state/broker/mitmproxy-ca-cert.pem"
 through() { curl -s --max-time 60 --proxy "http://127.0.0.1:$broker_port" --cacert "$ca" "$@"; }
 # field <name>: reads one field of the stand-in's report from standard input.
 field() { python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)[sys.argv[1]]))' "$1" 2>/dev/null; }
+
+# graphql_error: reads the message of the first error of a GraphQL answer.
+graphql_error() {
+  python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)["errors"][0]["message"]))' 2>/dev/null
+}
 
 # logged <pattern>: whether the broker's log has a matching line. The log is
 # written a moment after the event, so this waits for it briefly.
@@ -669,8 +783,10 @@ turned_away() {
   address=${!#}
   before=$(count)
   answer=$(through --http1.1 "${login[@]}" "$@")
-  # For the API the refusal is wrapped as JSON, as GitHub's own errors are.
+  # For the API the refusal is wrapped as JSON: the way GraphQL reports an
+  # error for a GraphQL request, the way the REST API does for the rest.
   case "$address" in
+    "$api/graphql") answer=$(printf '%s' "$answer" | graphql_error | sed 's/^"//') ;;
     "$api"*) answer=$(printf '%s' "$answer" | field message | sed 's/^"//') ;;
   esac
   case "$answer" in
@@ -803,10 +919,20 @@ turned_away "a header that asks for another method than the one sent is refused"
   -H "X-HTTP-Method-Override: DELETE" "${json[@]}" --data-binary '{"body":"x"}' "$api/repos/$listed/issues/7/comments"
 
 before=$(count)
-through --http1.1 "${login[@]}" -H "Connection: Upgrade" -H "Upgrade: websocket" "$api/repos/$listed" |
+through --http1.1 "${login[@]}" -H "Upgrade: websocket" "$api/repos/$listed" |
   grep -q "another protocol" && [ "$(count)" = "$before" ] &&
   pass "a request to switch to another protocol is refused" ||
   fail "a request to switch to another protocol is refused"
+
+# A Connection header can name other headers, which tells the next server
+# on the way to drop them: after the broker has judged the request with them.
+turned_away "a Connection header that names other headers to drop" odd-connection-header "Connection header" \
+  -H "Connection: keep-alive, Content-Type, Authorization" "$api/repos/$listed"
+turned_away "the same in the form a request to switch protocols has" odd-connection-header "Connection header" \
+  -H "Connection: Upgrade" "$api/repos/$listed"
+[ "$(through --http1.1 "${login[@]}" -H "Connection: close" "$api/repos/$listed" | field authorization)" = "$with_token" ] &&
+  [ "$(through --http1.1 "${login[@]}" -H "Connection: Keep-Alive" "$api/repos/$listed" | field authorization)" = "$with_token" ] &&
+  pass "the two usual Connection headers are passed on" || fail "the two usual Connection headers are passed on"
 
 # A closed connection is a poor way to tell the VM that an answer is whole,
 # so an answer that ends that way is given an end it can see. The stand-in
@@ -837,16 +963,31 @@ fi
 
 echo "How a refusal is worded for the program that gets it:"
 
+# The status of the answer in "$work/headers". The first status line there
+# is the broker's answer to the request for a tunnel; the last is the one
+# meant.
+answer_status() { grep "^HTTP/" "$work/headers" | tail -n 1 | cut -d' ' -f2; }
+
 # gh shows the `message` of a JSON error, and only the status line of a
 # plain-text one. git shows a plain-text body line by line.
 through --http1.1 -D "$work/headers" "${login[@]}" "$api/repos/$unlisted" >"$work/answer"
-grep -qi "^content-type: application/json" "$work/headers" &&
+[ "$(answer_status)" = 403 ] && grep -qi "^content-type: application/json" "$work/headers" &&
   [ "$(field message <"$work/answer" | cut -c1-32)" = '"Refused by the sandbox broker: ' ] &&
-  pass "on the API a refusal is JSON with a message, as GitHub's own errors are" ||
-  fail "on the API a refusal is JSON with a message, as GitHub's own errors are"
+  pass "on the REST API a refusal is a 403 with a JSON message, as GitHub's own errors are" ||
+  fail "on the REST API a refusal is a 403 with a JSON message, as GitHub's own errors are"
+
+# The gh commands that change something print the body of a 403 as one line
+# with every quote and line break escaped. They show cleanly what GraphQL
+# itself sends for a refusal: the status 200 and `errors` in place of data.
+through --http1.1 -D "$work/headers" "${login[@]}" "${json[@]}" $(graphql close-by-id) "$api/graphql" >"$work/answer"
+[ "$(answer_status)" = 200 ] && grep -qi "^content-type: application/json" "$work/headers" &&
+  [ "$(graphql_error <"$work/answer" | cut -c1-32)" = '"Refused by the sandbox broker: ' ] &&
+  [ "$(field data <"$work/answer")" = null ] &&
+  pass "a refused GraphQL request is answered the way GraphQL reports an error" ||
+  fail "a refused GraphQL request is answered the way GraphQL reports an error"
 
 through --http1.1 -D "$work/headers" "${login[@]}" "$git/$unlisted/info/refs?service=git-upload-pack" >"$work/answer"
-grep -qi "^content-type: text/plain" "$work/headers" && head -n 1 "$work/answer" | grep -q "^Refused by the sandbox broker: " &&
+[ "$(answer_status)" = 403 ] && grep -qi "^content-type: text/plain" "$work/headers" && head -n 1 "$work/answer" | grep -q "^Refused by the sandbox broker: " &&
   pass "for git a refusal is plain text" || fail "for git a refusal is plain text"
 
 echo "What may be sent to GitHub: git"
@@ -944,6 +1085,82 @@ turned_away "a query that walks from the listed repo to the repo it was forked f
   "${json[@]}" $(graphql walk-to-the-parent) "$api/graphql"
 turned_away "a query for all the repos the token can see" graphql-not-on-list "" \
   "${json[@]}" $(graphql my-repos) "$api/graphql"
+
+# `gh pr edit` reads who can be assigned before it changes anything, and is
+# refused at that read. The refusal has to name the way to make the change.
+turned_away "what gh pr edit reads first is refused, and the refusal names the gh api line for the change" \
+  graphql-not-on-list "gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title=" \
+  "${json[@]}" $(graphql read-before-an-edit) "$api/graphql"
+
+echo "The request as it was sent, not a tidied view of it (none of the refused may reach the stand-in):"
+
+# sent <host> <expected answers, one per line> <first lines of the requests...>:
+# sends the requests as written, on one connection, with the placeholder.
+sent() {
+  local what=$1 host=$2 expected=$3 outcome
+  shift 3
+  outcome=$(python3 "$work/client.py" requests "$broker_port" "$host" 443 "$ca" 0 "$placeholder" "$@" 2>&1)
+  if [ "$outcome" = "$expected" ]; then pass "$what"; else fail "$what ($(printf '%s' "$outcome" | tr '\n' ';'))"; fi
+}
+yes="200 arrived with the token"
+no="403 refused"
+
+# A decision is about one request. A connection that has carried an allowed
+# request must not carry a refused one after it.
+git_read="/info/refs?service=git-upload-pack"
+before=$(count)
+sent "git: a listed repo, then an unlisted one, on one connection" github.com "$yes
+$no" "GET /$listed$git_read" "GET /$unlisted$git_read"
+sent "git: an unlisted repo, then a listed one" github.com "$no
+$yes" "GET /$unlisted$git_read" "GET /$listed$git_read"
+sent "git: a fetch from the listed repo, then a push to an unlisted one" github.com "$yes
+$no" "GET /$listed$git_read" "GET /$unlisted/info/refs?service=git-receive-pack"
+sent "the API: a listed repo, then an unlisted one, then the listed one again" api.github.com "$yes
+$no
+$yes" "GET /repos/$listed" "GET /repos/$unlisted" "GET /repos/$listed"
+sent "the API: an unlisted repo, then a listed one" api.github.com "$no
+$yes" "GET /repos/$unlisted" "GET /repos/$listed"
+sent "the API: a read of the listed repo, then its secrets" api.github.com "$yes
+$no" "GET /repos/$listed" "GET /repos/$listed/actions/secrets"
+[ "$(count)" = "$((before + 7))" ] &&
+  pass "of those fourteen requests, the seven allowed ones reached the stand-in and no other" ||
+  fail "of those fourteen requests, the seven allowed ones reached the stand-in and no other (it got $(($(count) - before)))"
+
+# A "#" has no place in a request. The broker must not cut it off for the
+# policy and then send it on: a server that reads on after the "#" would
+# act on an address the policy never saw.
+before=$(count)
+sent "a # in the path, followed by a way out of the listed repo" api.github.com "$no" \
+  "GET /repos/$listed#/../../$unlisted"
+sent "a # in the path of a git request" github.com "$no" "GET /$listed#/../$unlisted$git_read"
+sent "a # in the query string" api.github.com "$no" "GET /repos/$listed/pulls?state=open#/../../../$unlisted"
+sent "a # at the end of a git request" github.com "$no" "GET /$listed$git_read#"
+sent "a # alone" api.github.com "$no" "GET /repos/$listed#"
+[ "$(count)" = "$before" ] && pass "none of them reached the stand-in" || fail "none of them reached the stand-in"
+logged " refused api.github.com 443 https GET /repos/$listed path-odd\$" &&
+  logged " refused api.github.com 443 https GET /repos/$listed/pulls query-odd\$" &&
+  pass "they are logged as an odd path and an odd query" || fail "they are logged as an odd path and an odd query"
+
+# A method in small or mixed letters. mitmproxy shows it to a script in
+# capitals and sends it on as it came, so the broker has to look at what
+# was sent.
+before=$(count)
+sent "a method in small letters: get" api.github.com "$no" "get /repos/$listed"
+sent "delete, on a comment" api.github.com "$no" "delete /repos/$listed/issues/comments/5"
+sent "Post, with a capital" api.github.com "$no" "Post /repos/$listed/issues/7/comments"
+sent "PoSt, mixed, as a push" github.com "$no" "PoSt /$listed/git-receive-pack"
+sent "get, as a fetch" github.com "$no" "get /$listed$git_read"
+sent "a refused spelling, then the usual one on the same connection" api.github.com "$no
+$yes" "get /repos/$listed" "GET /repos/$listed"
+[ "$(count)" = "$((before + 1))" ] && pass "only the one in capitals reached the stand-in" ||
+  fail "only the one in capitals reached the stand-in"
+logged " refused api.github.com 443 https delete /repos/$listed/issues/comments/5 odd-method\$" &&
+  pass "the log has the method as it was sent" || fail "the log has the method as it was sent"
+if grep -Eq " allowed [^ ]+ 443 https (get|delete|Post|PoSt) " "$work/broker.log"; then
+  fail "no request with such a method was let through"
+else
+  pass "no request with such a method was let through"
+fi
 
 echo "A body the policy needs but cannot read (none may reach the stand-in):"
 

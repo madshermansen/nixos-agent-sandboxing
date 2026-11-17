@@ -123,16 +123,32 @@ request to GitHub the broker first decides whether it may go out at all:
   address in a way GitHub might not.
 
 The decision is made by [`broker/github_policy.py`](../broker/github_policy.py),
-on the request exactly as it arrived and as it will be sent on. For git it
-is made from the first lines of a request, and the upload or download
-streams through. For the API it is made after the body has been read,
-because the body says what a request changes; a request to the API whose
-body the broker cannot read in full (over 1 MiB, compressed, or sent in
-pieces) is refused. A refusal is a 403 with a text for the agent, which
-for several refusals names the command to use instead. On the API's host
-the text is wrapped as JSON, the way GitHub's own errors are, because `gh`
-shows the message of such an error and only the status line of anything
-else.
+on the request as it arrived and as it will be sent on. The broker hands
+over the bytes themselves: the method, the address with its query string,
+and every header, each byte read as one character. It does not hand over
+the tidied form that mitmproxy offers for convenience, in which a method
+sent as `delete` reads `DELETE`. A method that is not in capital letters is
+refused, and so is a `#` in the address; neither is put right and passed on.
+
+One thing is rewritten on purpose. A body in JSON is sent on as the policy
+wrote it out again from what it read, not as the bytes that arrived. Two
+programs can read a sloppy JSON text in two ways; after this, GitHub reads
+exactly what the policy judged. The cost is that a number may be spelled
+differently on the way out: `1e2` leaves as `100.0`.
+
+For git the decision is made from the first lines of a request, and the
+upload or download streams through. For the API it is made after the body
+has been read, because the body says what a request changes; a request to
+the API whose body the broker cannot read in full (over 1 MiB, compressed,
+or sent in pieces) is refused. Each request is decided by itself, also when
+several come over one connection.
+
+A refusal carries a text for the agent, which for several refusals names
+the command to use instead. The text is worded for the program that gets
+it, because each shows only what it expects: plain text for git, which
+prints it line by line; the JSON of a GitHub error for the REST API, which
+`gh api` prints; and for GraphQL the answer GraphQL itself gives when it
+refuses, which is what the other `gh` commands print cleanly.
 [github-rules.md](github-rules.md) has the whole list, the reasons, and what
 the broker cannot check.
 
@@ -204,7 +220,18 @@ says: `X-HTTP-Method-Override` and its relatives, and `X-Forwarded-Host`,
 `Forwarded` and the like. Nothing in the VM needs them, and a later rule
 about a request's method or host should not be undone by a header. Requests
 that ask to switch to another protocol (`Upgrade`, as WebSocket does) or
-that carry lines after their body (trailers) are refused.
+that carry lines after their body (trailers) are refused. So is a
+`Connection` header that says more than `close` or `keep-alive`: it can
+name other headers for the next server to drop, after the broker has judged
+the request with them.
+
+**The broker's own settings.** mitmproxy, the program the broker is a script
+for, has about a hundred settings, and some of them change a request after
+the broker has judged it: one sends it to another address, others rewrite
+its headers or body, or write the traffic to a file. mitmproxy also reads
+settings from a file in its folder without being asked. The broker refuses
+to start when that file is there, or when any setting differs from what the
+start command sets. The list is in [`broker/settings.py`](../broker/settings.py).
 
 ### Watching the traffic
 
@@ -345,6 +372,7 @@ GitHub is the first service. Others can be added later as new rules.
 | [`broker/github_request.py`](../broker/github_request.py) | Joins the two: asks the policy, then puts the token in |
 | [`broker/fetch_tokens.py`](../broker/fetch_tokens.py) | Fetches the tokens before the broker starts |
 | [`broker/limits.py`](../broker/limits.py) | Limits on what a connection may send before it makes sense, added to mitmproxy from the outside |
+| [`broker/settings.py`](../broker/settings.py) | Which of mitmproxy's settings the broker agrees to run with |
 | [`broker/tokens.example.yaml`](../broker/tokens.example.yaml) | Example of the file on your Mac that says where each token is kept |
 | [`darwin/commands.nix`](../darwin/commands.nix) | The commands behind `nix run .#vm`, `.#stop`, `.#ssh` and the others |
 | [`darwin/default.nix`](../darwin/default.nix) | What the Mac itself needs, as a nix-darwin module |
