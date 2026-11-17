@@ -55,28 +55,26 @@ jobs:
       - name: nix flake check
         run: nix flake check -L
 
-      # The broker test reaches its stand-in server by names that end in
-      # ".localhost". A recent macOS reads every such name as the machine
-      # itself. The one on this runner does not, and the broker then cannot
-      # find the stand-in. So a name that does not resolve here is added to
-      # the runner's own list of hosts. The runner is thrown away after the
-      # job, which is why `sudo` is fine here and nowhere else in this repo.
-      - name: Point the stand-in's names at this machine
+      # The broker test reaches its stand-in server as "standin.localhost".
+      # A recent macOS reads every name that ends in ".localhost" as the
+      # machine itself. The one on this runner does not, and the broker then
+      # cannot find the stand-in. So if the name does not resolve here, it is
+      # added to the runner's own list of hosts. The runner is thrown away
+      # after the job, which is why `sudo` is fine here and nowhere else in
+      # this repo. The step can go once the test no longer uses such a name.
+      - name: Point the stand-in's name at this machine
         run: |
           sw_vers
-          for name in standin.localhost unopened.localhost; do
-            if python3 -c 'import socket, sys; socket.getaddrinfo(sys.argv[1], 443)' "$name" 2>/dev/null; then
-              echo "$name resolves by itself"
-            else
-              echo "127.0.0.1 $name" | sudo tee -a /etc/hosts
-            fi
-          done
-          # Make macOS read the list again.
-          sudo dscacheutil -flushcache
-          sudo killall -HUP mDNSResponder || true
-          for name in standin.localhost unopened.localhost; do
-            python3 -c 'import socket, sys; print(sys.argv[1], "is", socket.getaddrinfo(sys.argv[1], 443)[0][4][0])' "$name"
-          done
+          resolves() { python3 -c 'import socket, sys; print(socket.getaddrinfo(sys.argv[1], 443)[0][4][0])' "$1" 2>/dev/null; }
+          if resolves standin.localhost; then
+            echo "standin.localhost resolves by itself"
+          else
+            echo "127.0.0.1 standin.localhost" | sudo tee -a /etc/hosts
+            # Make macOS read the list again.
+            sudo dscacheutil -flushcache
+            sudo killall -HUP mDNSResponder || true
+            resolves standin.localhost
+          fi
 
       # The tests that are programs of their own, because they start real
       # programs on this machine, which Nix's checks cannot do. One on each
