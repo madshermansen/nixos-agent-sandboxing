@@ -367,9 +367,6 @@ destinations:
     ports: [$server_port]
     inspect: true
     token: github
-  - host: unopened.localhost
-    note: The stand-in under a second name, passed on without being opened.
-    ports: [$server_port]
 EOF
 cat >"$work/tokens.yaml" <<EOF
 tokens:
@@ -431,58 +428,6 @@ cp "$work/tokens.yaml" "$work/writable.yaml"
 chmod 666 "$work/writable.yaml"
 start_broker "$work/writable.log" AGENT_BROKER_TOKENS="$work/writable.yaml"
 if wait "$broker_pid"; then fail "tokens file others can write: the broker does not start"; else pass "tokens file others can write: the broker does not start"; fi
-
-# The rules file. A broker that started without rules, or with half of them,
-# would let through what nobody chose. fetch_tokens.py reads the file first
-# and stops at one that is missing or is not YAML. Every other mistake is
-# left to the broker itself, which must then end instead of starting.
-
-# stops_by_itself: whether the broker that was just started ends with an
-# error within 20 seconds. One that keeps running is stopped, so that a
-# broker which wrongly started cannot make this script wait for ever.
-stops_by_itself() {
-  for _ in $(seq 200); do
-    if ! kill -0 "$broker_pid" 2>/dev/null; then
-      ! wait "$broker_pid"
-      return
-    fi
-    sleep 0.1
-  done
-  kill "$broker_pid" 2>/dev/null
-  return 1
-}
-# bad_rules <description> <text of a rules file>: the broker must not start
-# with these rules, and must say that the rules are why.
-bad_rules() {
-  local what=$1
-  printf '%s\n' "$2" >"$work/bad-rules.yaml"
-  start_broker "$work/bad-rules.log" AGENT_BROKER_RULES="$work/bad-rules.yaml"
-  stops_by_itself && pass "$what: the broker does not start" || fail "$what: the broker does not start"
-  check "$what: the message says the rules are why" \
-    grep -q "the rules file cannot be used" "$work/bad-rules.log"
-}
-
-start_broker "$work/no-rules.log" AGENT_BROKER_RULES="$work/missing-rules.yaml"
-stops_by_itself && pass "no rules file: the broker does not start" || fail "no rules file: the broker does not start"
-
-printf 'destinations: [\n' >"$work/not-yaml.yaml"
-start_broker "$work/not-yaml.log" AGENT_BROKER_RULES="$work/not-yaml.yaml"
-stops_by_itself && pass "a rules file that is not YAML: the broker does not start" ||
-  fail "a rules file that is not YAML: the broker does not start"
-
-bad_rules "an empty rules file" ""
-bad_rules "a misspelt key in a rule" "destinations:
-  - host: standin.localhost
-    note: The key below should be 'inspect'.
-    inspct: true"
-bad_rules "a rule for every host" "destinations:
-  - host: '*'
-    note: There are no wildcards."
-bad_rules "a rule for an address instead of a name" "destinations:
-  - host: 127.0.0.1
-    note: Only names can be listed."
-bad_rules "a rule without a note" "destinations:
-  - host: standin.localhost"
 
 if port_open "$broker_port"; then fail "nothing listens after a failed start"; else pass "nothing listens after a failed start"; fi
 
@@ -639,71 +584,6 @@ if curl -sk --max-time 15 --proxy "http://127.0.0.1:$broker_port" \
   fail "a tunnel cannot be used under another name"
 else
   pass "a tunnel cannot be used under another name"
-fi
-
-logged " refused standin.localhost $server_port tls tls-name-differs other.example\$" &&
-  pass "the other name is logged as refused" || fail "the other name is logged as refused"
-
-echo "What the rules do not list (each is refused before anything is sent):"
-
-# Names that end in ".example" are set aside for examples: no such host
-# exists, and the broker refuses them without looking them up.
-[ "$(through -o /dev/null -w '%{http_connect}' "https://unlisted.example/a")" = 403 ] &&
-  pass "a tunnel to a host that is not listed is refused" ||
-  fail "a tunnel to a host that is not listed is refused"
-
-# The first line of the broker's answer is all most programs show of it.
-through -v "https://unlisted.example/a" 2>&1 | grep -q "^< HTTP/1.1 403 Refused by the sandbox broker" &&
-  pass "the refusal says who refused it" || fail "the refusal says who refused it"
-
-# Plain HTTP reaches the broker as a request it can answer in full.
-answer=$(through -w '%{http_code}' "http://unlisted.example/a")
-case "$answer" in
-  *"unlisted.example is not an allowed destination"*"broker/rules.yaml"*403)
-    pass "plain HTTP to a host that is not listed is refused, and the answer says what to change"
-    ;;
-  *) fail "plain HTTP to a host that is not listed is refused, and the answer says what to change" ;;
-esac
-
-other_port=$(free_port)
-before=$(count)
-[ "$(through -o /dev/null -w '%{http_connect}' "https://standin.localhost:$other_port/a")" = 403 ] &&
-  pass "a tunnel to a listed host on another port is refused" ||
-  fail "a tunnel to a listed host on another port is refused"
-
-through "http://standin.localhost:$other_port/a" |
-  grep -q "is an allowed destination, but not on port $other_port. Allowed on this host: port $server_port." &&
-  pass "the answer names the port that is allowed" || fail "the answer names the port that is allowed"
-
-[ "$(count)" = "$before" ] && pass "none of it reached the stand-in" || fail "none of it reached the stand-in"
-
-logged " refused unlisted.example 443 connect host-not-listed\$" &&
-  logged " refused unlisted.example 80 http host-not-listed\$" &&
-  logged " refused standin.localhost $other_port connect port-not-listed\$" &&
-  pass "each is logged as refused, with the reason" || fail "each is logged as refused, with the reason"
-
-echo "A destination that is listed but not opened (passed on unread):"
-
-# The stand-in under its second name, which the rules do not mark with
-# `inspect`. Its certificate is for the first name, so curl is told not to
-# check it (-k); what matters here is whose certificate it is.
-unopened="https://unopened.localhost:$server_port"
-unchecked() { curl -sk --max-time 15 --proxy "http://127.0.0.1:$broker_port" "$@"; }
-
-[ "$(unchecked -H "Authorization: token $placeholder" "$unopened/a" | field authorization)" = "[\"token $placeholder\"]" ] &&
-  pass "a request arrives as it was sent: the placeholder is not swapped" ||
-  fail "a request arrives as it was sent: the placeholder is not swapped"
-
-unchecked -v "$unopened/a" 2>&1 | grep -q "issuer: CN=stand-in authority" &&
-  pass "the program sees the server's own certificate, not the broker's" ||
-  fail "the program sees the server's own certificate, not the broker's"
-
-logged " allowed unopened.localhost $server_port connect\$" &&
-  pass "the tunnel is logged as allowed" || fail "the tunnel is logged as allowed"
-if grep -q " unopened.localhost $server_port https " "$work/broker.log"; then
-  fail "nothing from inside the tunnel is logged"
-else
-  pass "nothing from inside the tunnel is logged"
 fi
 
 memory() { echo $(($(ps -o rss= -p "$mitm_pid") / 1024)); }
@@ -915,6 +795,215 @@ if grep -q "mitmproxy has crashed\|Traceback" "$work/broker.log"; then
   grep -n "mitmproxy has crashed\|Traceback" -A 12 "$work/broker.log" | head -40
 else
   pass "the broker reported no errors of its own"
+fi
+
+# --- The rules themselves ------------------------------------------------------
+#
+# Everything above is about a destination that the broker opens. This part
+# is about the plainer half of the rules, which is all that stands between
+# the VM and the rest of the internet: what is not listed is refused, what
+# is listed and not opened is passed on unread, and a rules file with a
+# mistake in it stops the broker. The check inside the VM
+# (tests/network-lock.sh) shows the same from the VM's side.
+#
+# It is kept apart from the rest on purpose. It uses a broker of its own,
+# started after the one above has done its work, with rules written here
+# and with nothing of the checks above loaded into it. It needs only the
+# stand-in server and the helpers `pass`, `fail`, `check`, `count`, `field`
+# and `port_open`.
+
+kill "$broker_pid" 2>/dev/null
+wait "$broker_pid" 2>/dev/null
+
+# A mitmproxy script, loaded after the broker's, that sends the one
+# connection the rules below allow to the stand-in, the way a name server
+# would if it gave this machine's address for the name. It refuses every
+# other connection, so nothing here leaves this machine and no name is ever
+# looked up.
+cat >"$work/to-stand-in.py" <<'EOF'
+import os
+
+STAND_IN = ("127.0.0.1", int(os.environ["RULES_TEST_STAND_IN"]))
+
+
+class ToStandIn:
+    def server_connect(self, data):
+        if data.server.error:
+            return  # The broker has refused it already.
+        if data.server.address == ("unopened.example", 443):
+            data.server.address = STAND_IN
+        else:
+            data.server.error = "the test lets nothing leave this machine"
+
+
+addons = [ToStandIn()]
+EOF
+
+# Names that end in ".example" are set aside for examples: no such host
+# exists. One of them is listed, without `inspect`.
+cat >"$work/plain-rules.yaml" <<EOF
+destinations:
+  - host: unopened.example
+    note: The stand-in, as a destination that is passed on without being opened.
+EOF
+
+# start_plain <log file> <rules file>: starts a broker with these rules in
+# the background, with a state folder of its own.
+start_plain() {
+  env AGENT_VM_STATE="$work/plain-state" AGENT_BROKER_RULES="$2" \
+    AGENT_BROKER_TOKENS="$work/tokens.yaml" RULES_TEST_STAND_IN="$server_port" \
+    "$broker" --listen-port "$broker_port" --scripts "$work/to-stand-in.py" >"$1" 2>&1 &
+  broker_pid=$!
+}
+# stops_by_itself: whether the broker that was just started ends with an
+# error within 20 seconds. One that keeps running is stopped, so that a
+# broker which wrongly started cannot make this script wait for ever.
+stops_by_itself() {
+  for _ in $(seq 200); do
+    if ! kill -0 "$broker_pid" 2>/dev/null; then
+      ! wait "$broker_pid"
+      return
+    fi
+    sleep 0.1
+  done
+  kill "$broker_pid" 2>/dev/null
+  return 1
+}
+# bad_rules <description> <text of a rules file>: the broker must not start
+# with these rules, and must say that the rules are why.
+bad_rules() {
+  local what=$1
+  printf '%s\n' "$2" >"$work/bad-rules.yaml"
+  start_plain "$work/bad-rules.log" "$work/bad-rules.yaml"
+  stops_by_itself && pass "$what: the broker does not start" || fail "$what: the broker does not start"
+  check "$what: the message says the rules are why" \
+    grep -q "the rules file cannot be used" "$work/bad-rules.log"
+}
+
+echo "Rules that cannot be used (each must stop the broker):"
+
+# A broker that started without rules, or with half of them, would let
+# through what nobody chose. fetch_tokens.py reads the file first and stops
+# at one that is missing or is not YAML. Every other mistake is left to the
+# broker itself, which must then end instead of starting.
+start_plain "$work/no-rules.log" "$work/missing-rules.yaml"
+stops_by_itself && pass "no rules file: the broker does not start" || fail "no rules file: the broker does not start"
+
+printf 'destinations: [\n' >"$work/not-yaml.yaml"
+start_plain "$work/not-yaml.log" "$work/not-yaml.yaml"
+stops_by_itself && pass "a rules file that is not YAML: the broker does not start" ||
+  fail "a rules file that is not YAML: the broker does not start"
+
+bad_rules "an empty rules file" ""
+bad_rules "a misspelt key in a rule" "destinations:
+  - host: unopened.example
+    note: The key below should be 'inspect'.
+    inspct: true"
+bad_rules "a rule for every host" "destinations:
+  - host: '*'
+    note: There are no wildcards."
+bad_rules "a rule for an address instead of a name" "destinations:
+  - host: 127.0.0.1
+    note: Only names can be listed."
+bad_rules "a rule without a note" "destinations:
+  - host: unopened.example"
+
+if port_open "$broker_port"; then fail "nothing listens after these failed starts"; else pass "nothing listens after these failed starts"; fi
+
+start_plain "$work/plain.log" "$work/plain-rules.yaml"
+plain_started=no
+for _ in $(seq 300); do
+  kill -0 "$broker_pid" 2>/dev/null || break
+  if port_open "$broker_port"; then
+    plain_started=yes
+    break
+  fi
+  sleep 0.1
+done
+if [ "$plain_started" = no ]; then
+  fail "a broker with the plain rules starts"
+  cat "$work/plain.log"
+fi
+
+# plainly <curl arguments...>: a request through this broker. The stand-in's
+# certificate is for another name than the one used here, so curl is told
+# not to check it (-k); the checks below look at whose certificate it is.
+plainly() { curl -sk --max-time 30 --proxy "http://127.0.0.1:$broker_port" "$@"; }
+# plain_logged <pattern>: whether this broker's log has a matching line,
+# waiting briefly for it.
+plain_logged() {
+  for _ in $(seq 30); do
+    grep -Eq "$1" "$work/plain.log" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+echo "What the rules do not list (each is refused before anything is sent):"
+
+before=$(count)
+[ "$(plainly -o /dev/null -w '%{http_connect}' "https://unlisted.example/a")" = 403 ] &&
+  pass "a tunnel to a host that is not listed is refused" ||
+  fail "a tunnel to a host that is not listed is refused"
+
+# The first line of the broker's answer is all most programs show of it.
+plainly -v "https://unlisted.example/a" 2>&1 | grep -q "^< HTTP/1.1 403 Refused by the sandbox broker" &&
+  pass "the refusal says who refused it" || fail "the refusal says who refused it"
+
+# Plain HTTP reaches the broker as a request it can answer in full.
+answer=$(plainly -w '%{http_code}' "http://unlisted.example/a")
+case "$answer" in
+  *"unlisted.example is not an allowed destination"*"broker/rules.yaml"*403)
+    pass "plain HTTP to a host that is not listed is refused, and the answer says what to change"
+    ;;
+  *) fail "plain HTTP to a host that is not listed is refused, and the answer says what to change" ;;
+esac
+
+[ "$(plainly -o /dev/null -w '%{http_connect}' "https://unopened.example:8443/a")" = 403 ] &&
+  pass "a tunnel to a listed host on another port is refused" ||
+  fail "a tunnel to a listed host on another port is refused"
+
+plainly "http://unopened.example:8443/a" |
+  grep -q "is an allowed destination, but not on port 8443. Allowed on this host: port 443." &&
+  pass "the answer names the port that is allowed" || fail "the answer names the port that is allowed"
+
+# The encrypted connection names another site than the tunnel was opened for.
+if plainly --connect-to "other.example:443:unopened.example:443" "https://other.example/a" >/dev/null 2>&1; then
+  fail "a tunnel cannot be used under another name"
+else
+  pass "a tunnel cannot be used under another name"
+fi
+
+[ "$(count)" = "$before" ] && pass "none of it reached the stand-in" || fail "none of it reached the stand-in"
+
+plain_logged " refused unlisted.example 443 connect host-not-listed\$" &&
+  plain_logged " refused unlisted.example 80 http host-not-listed\$" &&
+  plain_logged " refused unopened.example 8443 connect port-not-listed\$" &&
+  plain_logged " refused unopened.example 443 tls tls-name-differs other.example\$" &&
+  pass "each is logged as refused, with the reason" || fail "each is logged as refused, with the reason"
+
+echo "A destination that is listed but not opened (passed on unread):"
+
+[ "$(plainly -H "Authorization: token $placeholder" "https://unopened.example/a" | field authorization)" = "[\"token $placeholder\"]" ] &&
+  pass "a request arrives as it was sent: the placeholder is not swapped" ||
+  fail "a request arrives as it was sent: the placeholder is not swapped"
+
+plainly -v "https://unopened.example/a" 2>&1 | grep -q "issuer: CN=stand-in authority" &&
+  pass "the program sees the server's own certificate, not the broker's" ||
+  fail "the program sees the server's own certificate, not the broker's"
+
+plain_logged " allowed unopened.example 443 connect\$" &&
+  pass "the tunnel is logged as allowed" || fail "the tunnel is logged as allowed"
+if grep -q " unopened.example 443 https " "$work/plain.log"; then
+  fail "nothing from inside the tunnel is logged"
+else
+  pass "nothing from inside the tunnel is logged"
+fi
+if grep -q "mitmproxy has crashed\|Traceback" "$work/plain.log"; then
+  fail "this broker reported no errors of its own"
+  grep -n "mitmproxy has crashed\|Traceback" -A 12 "$work/plain.log" | head -40
+else
+  pass "this broker reported no errors of its own"
 fi
 
 echo
