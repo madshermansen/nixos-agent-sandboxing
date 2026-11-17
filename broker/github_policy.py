@@ -1,0 +1,2069 @@
+"""Which GitHub requests the broker lets through.
+
+The agent VM holds no GitHub token. The broker on the Mac adds the token to
+requests on their way out, so every request that reaches GitHub with the
+token is something the broker chose to let through. This module makes that
+choice. It is given one request and answers "allowed" or "refused, and here
+is why".
+
+The worry is an agent that has been tricked by something it read. It may try
+to use the token to do damage (delete a repo, change who has access, read a
+secret) or to move data out (push to someone else's repo, post it in a gist
+or a comment elsewhere). GitHub limits the token too, but the broker is the
+first check and does not count on the second.
+
+How it decides:
+
+- **Default deny.** A request is allowed only when this module recognises it
+  as one of the kinds listed in docs/github-rules.md. Everything else is
+  refused, including requests that are harmless but unknown.
+- **Repos are listed.** The rules name the repos the agent may use, each as
+  `read` or `write`. A request to any other repo is refused, unless the rules
+  allow reading other repos, and then it goes out without the token, so only
+  public repos can be read that way.
+- **Some things are refused on every repo,** listed or not: settings,
+  deletion, secrets, deploy keys, webhooks, collaborators, branch protection,
+  releases, forks, and so on.
+- **Odd spellings are refused, not tidied up.** A path with `..`, a doubled
+  slash or an encoded keyword is never rewritten into its plain form and
+  passed on. If the broker and GitHub could read a request differently, the
+  broker refuses it.
+
+This module is pure: it imports nothing from mitmproxy, opens no files and
+makes no connections. That keeps it small enough to test fully; the tests
+are in tests/unit/test_github_policy.py. proxy.py calls three things here:
+`load_policy` once at start, and `wants_body` and `decide` for each request.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+import re
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, replace
+from urllib.parse import unquote_to_bytes
+
+__all__ = [
+    "Decision",
+    "MAX_BODY",
+    "Policy",
+    "PolicyError",
+    "Repo",
+    "decide",
+    "load_policy",
+    "wants_body",
+]
+
+# The two hosts this module knows. Git uses the first, the API the second.
+# Any other host is refused: see `_refuse_host` for the ones people ask about.
+GIT_HOST = "github.com"
+API_HOST = "api.github.com"
+
+# The largest API request body that is read. Real ones are a few kilobytes;
+# the largest is a pull request text, which GitHub caps at 65536 characters.
+MAX_BODY = 1024 * 1024
+
+# Limits that keep a hostile request from keeping the broker busy.
+MAX_PATH = 4096
+MAX_QUERY = 8192
+MAX_GRAPHQL = 256 * 1024
+MAX_DEPTH = 50
+MAX_TOKENS = 100_000
+MAX_ROOT_FIELDS = 100
+
+METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"})
+READ_METHODS = frozenset({"GET", "HEAD"})
+
+
+# ---------------------------------------------------------------------------
+# The rules
+# ---------------------------------------------------------------------------
+
+
+class PolicyError(Exception):
+    """The `github` part of rules.yaml cannot be used. The message says what
+    to fix."""
+
+
+@dataclass(frozen=True)
+class Repo:
+    """One listed repo."""
+
+    owner: str
+    name: str
+    write: bool
+    # May pull requests be merged from the sandbox? Only with `write`.
+    merge: bool = False
+    # GitHub's number for the repo, taken from the `id` in the rules. GraphQL
+    # names things by id instead of by owner and name, and this number is how
+    # an id is tied back to a listed repo. None when the rules give no `id`.
+    number: int | None = None
+
+    @property
+    def full_name(self) -> str:
+        return f"{self.owner}/{self.name}"
+
+
+@dataclass(frozen=True)
+class Policy:
+    """The loaded rules. Make one with `load_policy`."""
+
+    # Keyed by "owner/name" in lower case, because GitHub ignores case there.
+    repos: Mapping[str, Repo]
+    # True when repos that are not listed may be read without the token.
+    read_public: bool = False
+
+    def find(self, owner: str, name: str) -> Repo | None:
+        return self.repos.get(f"{owner}/{name}".lower())
+
+    def find_number(self, number: int) -> Repo | None:
+        for repo in self.repos.values():
+            if repo.number == number:
+                return repo
+        return None
+
+
+REPO_KEYS = {"repo", "note", "access", "id", "merge"}
+POLICY_KEYS = {"repos", "other_repos"}
+OTHER_REPOS = {"refuse": False, "read-public": True}
+
+# GitHub's own limits on names: an owner is letters, digits and single
+# hyphens, at most 39 long; a repo name is letters, digits, dot, hyphen and
+# underscore, at most 100 long.
+OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
+REPO_NAME = re.compile(r"[A-Za-z0-9._-]{1,100}")
+
+
+def load_policy(data: object) -> Policy:
+    """Check the `github` part of rules.yaml and return it as a Policy.
+
+    `data` is that part as the YAML reader returned it. Nothing is read from
+    disk here. Any mistake raises PolicyError; as with the rest of
+    rules.yaml, an unknown key is a mistake, so that a typing error cannot
+    quietly change what a rule means.
+
+    The format, with every key shown:
+
+        github:
+          repos:
+            - repo: some-owner/some-repo
+              note: Why the agent needs this repo.
+              access: write          # or: read
+              id: R_kgDOExample      # optional; see docs/github-rules.md
+              merge: false           # optional; only with access: write
+          other_repos: refuse        # optional; or: read-public
+    """
+    if not isinstance(data, dict):
+        raise PolicyError("`github` must have a `repos:` list")
+    unknown = set(data) - POLICY_KEYS
+    if unknown:
+        raise PolicyError(
+            f"`github` has an unknown key `{sorted(map(str, unknown))[0]}`. "
+            f"Known keys: {', '.join(sorted(POLICY_KEYS))}"
+        )
+
+    entries = data.get("repos")
+    if not isinstance(entries, list):
+        raise PolicyError("`github: repos` must be a list")
+
+    other = data.get("other_repos", "refuse")
+    if not isinstance(other, str) or other not in OTHER_REPOS:
+        raise PolicyError(
+            "`github: other_repos` must be `refuse` or `read-public`. It says "
+            "what happens to repos that are not listed"
+        )
+
+    repos: dict[str, Repo] = {}
+    numbers: dict[int, str] = {}
+    for position, entry in enumerate(entries, start=1):
+        where = f"github repo {position}"
+        if not isinstance(entry, dict):
+            raise PolicyError(f"{where} must have a `repo`, a `note` and an `access`")
+
+        full_name = entry.get("repo")
+        if not isinstance(full_name, str) or not full_name:
+            raise PolicyError(f"{where} has no `repo`. Write it as owner/name")
+        where = f"{where} ({full_name})"
+
+        unknown = set(entry) - REPO_KEYS
+        if unknown:
+            raise PolicyError(
+                f"{where} has an unknown key `{sorted(map(str, unknown))[0]}`. "
+                f"Known keys: {', '.join(sorted(REPO_KEYS))}"
+            )
+
+        owner, slash, name = full_name.partition("/")
+        if (
+            not slash
+            or not OWNER.fullmatch(owner)
+            or not REPO_NAME.fullmatch(name)
+            or name in (".", "..")
+        ):
+            raise PolicyError(
+                f"{where}: `repo` must be one exact repo written as owner/name, "
+                "such as octocat/hello-world, without https://, a path or a "
+                "wildcard"
+            )
+        if name.lower().endswith(".git"):
+            raise PolicyError(f"{where}: write `repo` without the `.git` ending")
+        key = full_name.lower()
+        if key in repos:
+            raise PolicyError(f"{where} is listed twice")
+
+        note = entry.get("note")
+        if not isinstance(note, str) or not note.strip():
+            raise PolicyError(
+                f"{where} has no `note`. Say in a few words why the agent needs it"
+            )
+
+        access = entry.get("access")
+        if not isinstance(access, str) or access not in ("read", "write"):
+            raise PolicyError(
+                f"{where}: `access` must be `read` or `write`. `read` allows "
+                "clone and fetch and reading pull requests; `write` also "
+                "allows push and working on pull requests"
+            )
+        write = access == "write"
+
+        merge = entry.get("merge", False)
+        # `1` and "yes" are not accepted: a switch this important is spelled
+        # true or false.
+        if type(merge) is not bool:
+            raise PolicyError(f"{where}: `merge` must be true or false")
+        if merge and not write:
+            raise PolicyError(f"{where}: `merge: true` needs `access: write`")
+
+        number = None
+        if "id" in entry:
+            node_id = entry["id"]
+            number = _repo_number(node_id) if isinstance(node_id, str) else None
+            if number is None:
+                raise PolicyError(
+                    f"{where}: `id` is not a repo id from GitHub. Get it with "
+                    f"`gh repo view {full_name} --json id --jq .id`"
+                )
+            if number in numbers:
+                raise PolicyError(
+                    f"{where} has the same `id` as {numbers[number]}. Each repo "
+                    "has its own"
+                )
+            numbers[number] = full_name
+
+        repos[key] = Repo(owner, name, write, merge, number)
+    return Policy(repos, OTHER_REPOS[other])
+
+
+# ---------------------------------------------------------------------------
+# The answer
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Decision:
+    """What to do with one request.
+
+    allowed     True: send it on. False: answer with a 403 and `message`.
+    kind        What the request is, for the log: `git-read`, `git-write`,
+                `api-read`, `api-write`, `graphql-read` or `graphql-write`.
+                Empty for a refusal.
+    reason      For a refusal, a short fixed word for the log, such as
+                `repo-not-listed`. It never holds anything from the request.
+    message     For a refusal, the text for the agent in the VM: what was
+                refused and what to ask the user for.
+    with_token  True: add the GitHub token. False: send the request without
+                any credentials, because it reads a repo that is not listed.
+    body        When not None, send these bytes as the body instead of the
+                ones received. See `_fresh` for why.
+    repo        The listed repo the request is about, as written in the
+                rules, or None.
+    """
+
+    allowed: bool
+    kind: str = ""
+    reason: str = ""
+    message: str = ""
+    with_token: bool = False
+    body: bytes | None = None
+    repo: str | None = None
+
+
+class _Refusal(Exception):
+    """Raised anywhere below to refuse the request being looked at."""
+
+    def __init__(self, reason: str, what: str, ask: str) -> None:
+        super().__init__(reason)
+        self.decision = Decision(
+            allowed=False,
+            reason=reason,
+            message=(
+                f"Refused by the sandbox broker: {what}\n"
+                "\n"
+                "This machine is a sandbox. Its requests to GitHub go through a\n"
+                "broker on the host. The broker adds the GitHub token, and lets\n"
+                "through only what the `github` rules in broker/rules.yaml of the\n"
+                "nixt3 repo on the host allow. Trying again, or sending the same\n"
+                "request in another way or with another tool, will not help.\n"
+                "\n"
+                f"{ask}\n"
+            ),
+        )
+
+
+# What the agent is told to do about a refusal. Which one is used depends on
+# whether the user could change the rules to allow the request.
+ASK_LIST = (
+    "If the task needs this repo, tell the user. They can list it under\n"
+    "`github: repos:` in that file and restart the broker."
+)
+ASK_WRITE = (
+    "If the task needs to change this repo, tell the user. They can give it\n"
+    "`access: write` in that file and restart the broker."
+)
+ASK_MERGE = (
+    "Leave the merging to the user, or tell them the task needs it. They can\n"
+    "set `merge: true` on the repo in that file and restart the broker."
+)
+ASK_ID = (
+    "GraphQL names things by an id, and the broker can only tie an id to a\n"
+    "listed repo when the rules hold that repo's own `id`. If this is a listed\n"
+    "repo, tell the user that its entry needs an `id`; the command for it is\n"
+    "in docs/github-rules.md of the nixt3 repo. If it is another repo, tell\n"
+    "the user the task needs that repo listed."
+)
+ASK_NEVER = (
+    "No rule allows this from the sandbox, on purpose. If the task needs it,\n"
+    "tell the user what is needed and why, and let them do it themselves."
+)
+ASK_UNKNOWN = (
+    "The broker lets through the kinds of request it knows: clone, fetch and\n"
+    "push with git, and reading and working on pull requests with gh. The\n"
+    "full list is in docs/github-rules.md of the nixt3 repo. If the task\n"
+    "needs this request, tell the user what you were trying to do."
+)
+ASK_FIX = (
+    "The request is written in a way the broker does not accept, whatever it\n"
+    "is for. Send it the plain way git and gh do. The accepted forms are in\n"
+    "docs/github-rules.md of the nixt3 repo."
+)
+
+# Things that are refused on every repo. The key is the reason in the log.
+NEVER = {
+    "repo-settings": (
+        "changing a repo's settings is not allowed from the sandbox. That "
+        "covers its name, visibility, default branch, topics, pages and the "
+        "like."
+    ),
+    "repo-deletion": "deleting a repo is not allowed from the sandbox.",
+    "repo-transfer": "moving a repo to another owner is not allowed from the sandbox.",
+    "repo-creation": "creating a repo is not allowed from the sandbox.",
+    "repo-by-id": (
+        "repos must be named as /repos/OWNER/NAME. Naming one by its number "
+        "would get around the list of allowed repos."
+    ),
+    "forks": "forking a repo is not allowed from the sandbox.",
+    "secrets": (
+        "secrets and variables are out of reach of the sandbox: those of "
+        "Actions, Dependabot, Codespaces and environments, and secret "
+        "scanning results. That goes for reading them too."
+    ),
+    "deploy-keys": "deploy keys are out of reach of the sandbox.",
+    "webhooks": "webhooks are out of reach of the sandbox.",
+    "collaborators": (
+        "who has access to a repo (collaborators, invitations, teams) is out "
+        "of reach of the sandbox."
+    ),
+    "branch-protection": (
+        "changing branches' protection, rules or names is not allowed from "
+        "the sandbox."
+    ),
+    "releases": "creating or changing releases is not allowed from the sandbox.",
+    "actions": (
+        "starting, stopping or changing Actions runs and workflows is not "
+        "allowed from the sandbox. Reading runs, jobs and logs is."
+    ),
+    "checks": (
+        "setting commit statuses or checks is not allowed from the sandbox. "
+        "They are how tests report on a commit; the agent may read them."
+    ),
+    "git-data": (
+        "changing files, commits or branches through the API is not allowed "
+        "from the sandbox. Use git instead: commit and push."
+    ),
+    "merge-api": (
+        "merging branches through the API is not allowed from the sandbox. "
+        "Use git instead: merge and push."
+    ),
+    "assignees": (
+        "assigning issues and pull requests is not allowed from the sandbox. "
+        "Assigning one to a coding agent starts a second agent, outside the "
+        "sandbox, with a token of its own."
+    ),
+    "issues": (
+        "creating, editing and closing issues is not allowed from the "
+        "sandbox. Reading issues and commenting on them is."
+    ),
+    "gists": (
+        "gists are not allowed from the sandbox. A gist is a place to put "
+        "data outside the allowed repos."
+    ),
+    "account": (
+        "the account behind the token is out of reach of the sandbox, apart "
+        "from `GET /user`, which says who it is."
+    ),
+    "organizations": "organizations are out of reach of the sandbox.",
+    "search": (
+        "the search API is not tied to one repo, so the broker cannot keep "
+        "it to the allowed ones. `gh pr list --search` and `gh issue list "
+        "--search` work, because they name the repo."
+    ),
+    "git-lfs": (
+        "Git LFS is not supported in the sandbox. It stores files on other "
+        "hosts than github.com, which the broker does not pass on."
+    ),
+}
+
+
+def _never(reason: str) -> _Refusal:
+    return _Refusal(reason, NEVER[reason], ASK_NEVER)
+
+
+def _unknown(what: str) -> _Refusal:
+    return _Refusal("not-recognised", what, ASK_UNKNOWN)
+
+
+def _fix(reason: str, what: str) -> _Refusal:
+    return _Refusal(reason, what, ASK_FIX)
+
+
+def _show(text: object, limit: int = 80) -> str:
+    """Make part of a request safe to repeat in a message to the VM."""
+    shown = re.sub(r"[^\x21-\x7e]", "?", str(text))
+    return shown if len(shown) <= limit else shown[:limit] + "..."
+
+
+# ---------------------------------------------------------------------------
+# The entry points
+# ---------------------------------------------------------------------------
+
+
+def wants_body(host: str) -> bool:
+    """Must the whole body be read before `decide` is called?
+
+    True for the API, where the decision depends on the body. Read at most
+    MAX_BODY bytes and refuse a longer one. False for github.com: git's
+    uploads can be very large, the decision does not look at them, and they
+    should be passed on as they arrive. False for every other host as well,
+    because `decide` refuses those whatever they send.
+    """
+    return isinstance(host, str) and host.lower() == API_HOST
+
+
+def decide(
+    method: str,
+    host: str,
+    path: str,
+    query: str,
+    body: bytes | None,
+    policy: Policy,
+    *,
+    headers: Mapping[str, str] | Iterable[tuple[str, str]],
+    authority: str | None,
+) -> Decision:
+    """Decide about one request to GitHub.
+
+    method     As sent, for example "GET". Upper and lower case differ.
+    host       The host the broker will connect to: the one the tunnel was
+               opened for, not anything the request says about itself.
+    path       The path as sent, undecoded, without the query: "/repos/a/b".
+    query      What followed the "?" as sent, undecoded, or "" for none.
+    body       The body as sent, undecoded. May be None or empty for
+               github.com (see `wants_body`); for the API it must be the
+               whole body.
+    policy     From `load_policy`.
+    headers    The request's headers: a mapping, or pairs when a name occurs
+               more than once.
+    authority  The host the request itself names: the `Host` header, or
+               `:authority` in HTTP/2. GitHub goes by this name, so it has to
+               be the same as `host`.
+
+    It never raises. Anything unexpected is a refusal, because a check that
+    stops with an error must not let the request through.
+    """
+    try:
+        return _decide(method, host, path, query, body, policy, headers, authority)
+    except _Refusal as refusal:
+        return refusal.decision
+    except Exception:  # noqa: BLE001 - see the docstring
+        return _Refusal(
+            "policy-error",
+            "the broker could not make sense of this request.",
+            ASK_FIX,
+        ).decision
+
+
+def _decide(
+    method: object,
+    host: object,
+    path: object,
+    query: object,
+    body: object,
+    policy: Policy,
+    headers: object,
+    authority: object,
+) -> Decision:
+    if not isinstance(policy, Policy):
+        raise TypeError("policy must come from load_policy")
+    if not isinstance(host, str):
+        raise TypeError("host must be text")
+    host = host.lower()
+    if host not in (GIT_HOST, API_HOST):
+        raise _refuse_host(host)
+
+    # GitHub answers for many names on the same servers, and picks by the
+    # name inside the request. A request that connects to one host and names
+    # another would be judged here as the first and served there as the
+    # second.
+    if not isinstance(authority, str) or authority.lower() not in (host, f"{host}:443"):
+        raise _fix(
+            "host-differs",
+            f"the request was sent to {host} but names another host in its "
+            "Host header.",
+        )
+
+    if method == "OPTIONS":
+        raise _unknown(
+            "OPTIONS requests are not passed on. Programs do not need them; "
+            "browsers do."
+        )
+    if not isinstance(method, str) or method not in METHODS:
+        raise _unknown(f"the method {_show(method, 20)} is not one the broker passes on.")
+
+    header_values = _headers(headers)
+    # GitHub does not document these, but web frameworks often honour them,
+    # and they would turn an allowed POST into a DELETE after the check.
+    for name in ("x-http-method-override", "x-http-method", "x-method-override"):
+        if name in header_values:
+            raise _fix(
+                "method-override",
+                f"the header {name} asks for another method than the one sent.",
+            )
+    for name in ("host", "content-type", "content-encoding"):
+        if len(header_values.get(name, ())) > 1:
+            raise _fix("header-repeated", f"the header {name} is sent more than once.")
+    for named in header_values.get("host", ()):
+        if named.lower() not in (host, f"{host}:443"):
+            raise _fix(
+                "host-differs",
+                f"the request was sent to {host} but names another host in "
+                "its Host header.",
+            )
+
+    segments = _segments(path)
+    pairs = _query(query)
+    if any(key.lower() == "_method" for key, _ in pairs):
+        raise _fix(
+            "method-override",
+            "the query asks for another method than the one sent (`_method`).",
+        )
+
+    if host == GIT_HOST:
+        return _git(method, segments, query, policy)
+    return _api(method, segments, pairs, header_values, body, policy)
+
+
+def _refuse_host(host: str) -> _Refusal:
+    if host == "gist.github.com":
+        return _never("gists")
+    if host == "uploads.github.com":
+        return _Refusal(
+            "releases",
+            "uploads.github.com takes files for releases, and " + NEVER["releases"],
+            ASK_NEVER,
+        )
+    return _Refusal(
+        "github-host-not-covered",
+        f"{_show(host)} is not a GitHub host the broker has rules for. It "
+        "knows github.com, for git, and api.github.com, for the API.",
+        ASK_UNKNOWN,
+    )
+
+
+def _headers(headers: object) -> dict[str, list[str]]:
+    """Group header values by name in lower case."""
+    if isinstance(headers, Mapping):
+        items = list(headers.items())
+    elif headers is None:
+        raise TypeError("headers are needed")
+    else:
+        items = list(headers)  # type: ignore[call-overload]
+    values: dict[str, list[str]] = {}
+    for name, value in items:
+        if isinstance(name, bytes):
+            name = name.decode("latin-1")
+        if isinstance(value, bytes):
+            value = value.decode("latin-1")
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise TypeError("header names and values must be text")
+        values.setdefault(name.strip().lower(), []).append(value.strip())
+    return values
+
+
+# ---------------------------------------------------------------------------
+# Paths and queries
+# ---------------------------------------------------------------------------
+
+# Printable ASCII without "#", "?" and "\". A path holds nothing else.
+PATH_CHARS = re.compile(r"[\x21\x22\x24-\x3e\x40-\x5b\x5d-\x7e]+")
+QUERY_CHARS = re.compile(r"[\x21\x22\x24-\x7e]*")
+BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+
+
+def _decode(text: str) -> str | None:
+    """Undo percent-encoding once. None when it is not valid."""
+    if BAD_ESCAPE.search(text):
+        return None
+    try:
+        return unquote_to_bytes(text).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _segments(path: object) -> list[str]:
+    """Split a path into its parts, refusing every spelling that is not plain.
+
+    The parts are returned as they were sent, still encoded. Every later
+    check compares these raw parts with plain words, so an encoded keyword
+    such as "%70ulls" matches nothing and is refused. The decoded form is
+    used only here, to catch what the encoding may hide.
+
+    The path is never repaired and passed on in a better form. The broker
+    sends on exactly the path it was given, so the only safe paths are the
+    ones GitHub cannot read differently from how they were read here.
+    """
+    bad = _fix
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise bad("path-odd", "the path does not start with a slash.")
+    if len(path) > MAX_PATH:
+        raise bad("path-odd", "the path is too long.")
+    if not PATH_CHARS.fullmatch(path):
+        raise bad(
+            "path-odd",
+            "the path holds a character that does not belong in one, such as "
+            "a space, `?`, `#`, a backslash or a letter outside plain ASCII.",
+        )
+    if path == "/":
+        return []
+    parts = path[1:].split("/")
+    for part in parts:
+        if not part:
+            raise bad("path-odd", "the path has a doubled slash or ends with a slash.")
+        decoded = _decode(part)
+        if decoded is None:
+            raise bad("path-odd", "the path has a `%` that is not a valid encoding.")
+        if decoded in (".", ".."):
+            raise bad("path-odd", "the path has a `.` or `..` part.")
+        if any(char in "/\\%" or ord(char) < 0x20 or ord(char) == 0x7F for char in decoded):
+            raise bad(
+                "path-odd",
+                "the path has an encoded slash, backslash, `%` or control "
+                "character. Write a slash as a slash.",
+            )
+    return parts
+
+
+def _query(query: object) -> list[tuple[str, str]]:
+    """Split a query into decoded names and values."""
+    if not isinstance(query, str):
+        raise TypeError("query must be text")
+    if len(query) > MAX_QUERY or not QUERY_CHARS.fullmatch(query):
+        raise _fix("query-odd", "the query is too long or holds an odd character.")
+    pairs = []
+    for part in query.split("&") if query else []:
+        name, _, value = part.partition("=")
+        decoded = (_decode(name.replace("+", " ")), _decode(value.replace("+", " ")))
+        if decoded[0] is None or decoded[1] is None:
+            raise _fix("query-odd", "the query has a `%` that is not a valid encoding.")
+        pairs.append((decoded[0], decoded[1]))
+    return pairs
+
+
+def _owner_and_name(owner: str, name: str) -> None:
+    """Refuse an owner or repo name that GitHub could not have issued."""
+    if not OWNER.fullmatch(owner) or not REPO_NAME.fullmatch(name):
+        raise _fix(
+            "path-odd",
+            "the owner or repo name in the path is not written the plain way: "
+            "letters, digits, `-`, `_` and `.` only.",
+        )
+
+
+def _access(
+    policy: Policy, owner: str, name: str, want: str, kind: str
+) -> Decision:
+    """Allow or refuse `want` ("read", "write" or "merge") on one repo."""
+    repo = policy.find(owner, name)
+    shown = f"{owner}/{name}"
+    if repo is None:
+        if want == "read" and policy.read_public:
+            # No token: GitHub then answers only for public repos. With the
+            # token this would read everything its owner can read.
+            return Decision(allowed=True, kind=kind, with_token=False)
+        if want == "read":
+            raise _Refusal(
+                "repo-not-listed",
+                f"{shown} is not a repo the sandbox may use.",
+                ASK_LIST,
+            )
+        raise _Refusal(
+            "repo-not-listed",
+            f"{shown} is not a repo the sandbox may use, so nothing can be "
+            "sent to it.",
+            ASK_LIST,
+        )
+    if want != "read" and not repo.write:
+        raise _Refusal(
+            "repo-read-only",
+            f"{repo.full_name} is listed for reading only.",
+            ASK_WRITE,
+        )
+    if want == "merge" and not repo.merge:
+        raise _Refusal(
+            "merge",
+            f"merging pull requests in {repo.full_name} is not allowed from "
+            "the sandbox.",
+            ASK_MERGE,
+        )
+    return Decision(allowed=True, kind=kind, with_token=True, repo=repo.full_name)
+
+
+# ---------------------------------------------------------------------------
+# github.com: git over HTTPS
+# ---------------------------------------------------------------------------
+
+
+def _git(method: str, segments: list[str], query: str, policy: Policy) -> Decision:
+    """Git talks to three addresses per repo, and nothing else is allowed.
+
+        GET  /OWNER/NAME/info/refs?service=git-upload-pack    what is there?
+        POST /OWNER/NAME/git-upload-pack                      fetch, clone
+        GET  /OWNER/NAME/info/refs?service=git-receive-pack   may I push?
+        POST /OWNER/NAME/git-receive-pack                     push
+
+    "upload-pack" is the server uploading to you, so it is the reading one.
+    NAME may end in ".git". The rest of github.com is the website, which the
+    agent has no use for with a token.
+
+    A push is allowed or refused as a whole. Which branch it changes is
+    inside the upload and is not looked at; protect branches on GitHub.
+    """
+    if len(segments) < 3:
+        raise _unknown("on github.com the broker passes on git only: clone, fetch and push.")
+    owner, name, rest = segments[0], segments[1], segments[2:]
+
+    if rest[:2] == ["info", "lfs"]:
+        raise _never("git-lfs")
+
+    if rest == ["info", "refs"] and method == "GET":
+        if query == "service=git-upload-pack":
+            want = "read"
+        elif query == "service=git-receive-pack":
+            want = "write"
+        else:
+            raise _unknown(
+                "this git request does not say whether it is a fetch or a "
+                "push in the usual way."
+            )
+    elif rest == ["git-upload-pack"] and method == "POST":
+        want = "read"
+    elif rest == ["git-receive-pack"] and method == "POST":
+        want = "write"
+    else:
+        raise _unknown("on github.com the broker passes on git only: clone, fetch and push.")
+    if rest != ["info", "refs"] and query:
+        raise _unknown("a git fetch or push does not have a query.")
+
+    _owner_and_name(owner, name)
+    # GitHub takes the name with or without ".git". One ending is removed and
+    # no more: "name.git.git" is then a repo called "name.git", which cannot
+    # be listed, and "name.wiki.git" is the repo's wiki, a separate place to
+    # push to, which is not listed either.
+    if name.endswith(".git"):
+        name = name[: -len(".git")]
+    if not name or name in (".", ".."):
+        raise _fix("path-odd", "the repo name in the path is empty.")
+    return _access(policy, owner, name, want, f"git-{want}")
+
+
+# ---------------------------------------------------------------------------
+# api.github.com: the REST API
+# ---------------------------------------------------------------------------
+
+# Parts of a repo that may be read: the first word after /repos/OWNER/NAME.
+# `actions` is handled apart, because only some of it is readable.
+READABLE = frozenset(
+    {
+        "assignees",
+        "branches",
+        "check-runs",
+        "check-suites",
+        "comments",
+        "commits",
+        "compare",
+        "contents",
+        "contributors",
+        "deployments",
+        "events",
+        "forks",
+        "git",
+        "issues",
+        "labels",
+        "languages",
+        "license",
+        "milestones",
+        "pulls",
+        "readme",
+        "releases",
+        "statuses",
+        "tags",
+        "tarball",
+        "topics",
+        "zipball",
+    }
+)
+READABLE_ACTIONS = frozenset({"artifacts", "jobs", "runs", "workflows"})
+
+# The changes that are allowed in a `write` repo. "#" stands for a number and
+# "*" for any one part. Everything not here is refused.
+#
+# The `issues` lines are here for pull requests. In this API a pull request
+# is also an issue with the same number, and its comments, labels and
+# reactions are reached under /issues. The broker cannot tell from a number
+# whether it is a pull request, so these work on issues as well. Creating,
+# editing and closing an issue have requests of their own, and are refused.
+WRITABLE = {
+    "POST": (
+        ("pulls",),
+        ("pulls", "#", "comments"),
+        ("pulls", "#", "comments", "#", "replies"),
+        ("pulls", "#", "reviews"),
+        ("pulls", "#", "reviews", "#", "events"),
+        ("pulls", "#", "requested_reviewers"),
+        ("pulls", "comments", "#", "reactions"),
+        ("issues", "#", "comments"),
+        ("issues", "#", "labels"),
+        ("issues", "#", "reactions"),
+        ("issues", "comments", "#", "reactions"),
+    ),
+    "PATCH": (
+        ("pulls", "#"),
+        ("pulls", "comments", "#"),
+        ("issues", "comments", "#"),
+    ),
+    "PUT": (
+        ("pulls", "#", "update-branch"),
+        ("pulls", "#", "reviews", "#"),
+        ("issues", "#", "labels"),
+    ),
+    "DELETE": (
+        ("pulls", "comments", "#"),
+        ("pulls", "comments", "#", "reactions", "#"),
+        ("pulls", "#", "reviews", "#"),
+        ("pulls", "#", "requested_reviewers"),
+        ("issues", "comments", "#"),
+        ("issues", "comments", "#", "reactions", "#"),
+        ("issues", "#", "labels"),
+        ("issues", "#", "labels", "*"),
+        ("issues", "#", "reactions", "#"),
+    ),
+}
+
+# Parts of a repo where a change is refused with a reason of its own, so the
+# agent is told what the matter is instead of "not recognised".
+CLOSED_FOR_CHANGES = {
+    "actions": "actions",
+    "automated-security-fixes": "repo-settings",
+    "autolinks": "repo-settings",
+    "branches": "branch-protection",
+    "check-runs": "checks",
+    "check-suites": "checks",
+    "code-scanning": "repo-settings",
+    "codespaces": "repo-settings",
+    "contents": "git-data",
+    "dependabot": "repo-settings",
+    "dispatches": "actions",
+    "environments": "repo-settings",
+    "forks": "forks",
+    "generate": "repo-creation",
+    "git": "git-data",
+    "immutable-releases": "releases",
+    "import": "repo-settings",
+    "interaction-limits": "repo-settings",
+    "merge-upstream": "merge-api",
+    "merges": "merge-api",
+    "pages": "repo-settings",
+    "private-vulnerability-reporting": "repo-settings",
+    "properties": "repo-settings",
+    "releases": "releases",
+    "rulesets": "branch-protection",
+    "statuses": "checks",
+    "topics": "repo-settings",
+    "transfer": "repo-transfer",
+    "vulnerability-alerts": "repo-settings",
+}
+
+NUMBER = re.compile(r"[1-9][0-9]{0,18}")
+
+
+def _matches(rest: list[str], patterns: Iterable[tuple[str, ...]]) -> bool:
+    for pattern in patterns:
+        if len(pattern) == len(rest) and all(
+            (want == "#" and NUMBER.fullmatch(got))
+            or want == "*"
+            or (want == got and want != "#")
+            for want, got in zip(pattern, rest)
+        ):
+            return True
+    return False
+
+
+def _closed_area(rest: list[str]) -> str | None:
+    """The parts of a repo that are refused for reading as well."""
+    first = rest[0] if rest else ""
+    second = rest[1] if len(rest) > 1 else ""
+    if first == "actions" and second in (
+        "secrets",
+        "variables",
+        "organization-secrets",
+        "organization-variables",
+    ):
+        return "secrets"
+    if first in ("dependabot", "codespaces") and second == "secrets":
+        return "secrets"
+    if first == "environments" and ("secrets" in rest or "variables" in rest):
+        return "secrets"
+    if first == "secret-scanning":
+        return "secrets"
+    if first == "keys":
+        return "deploy-keys"
+    if first == "hooks":
+        return "webhooks"
+    if first in ("collaborators", "invitations", "teams"):
+        return "collaborators"
+    return None
+
+
+def _repo_request(method: str, rest: list[str]) -> str:
+    """Sort a request under /repos/OWNER/NAME into read, write or merge."""
+    closed = _closed_area(rest)
+    if closed:
+        raise _never(closed)
+
+    if method in READ_METHODS:
+        first = rest[0] if rest else ""
+        if not rest or first in READABLE:
+            return "read"
+        if first == "actions" and len(rest) > 1 and rest[1] in READABLE_ACTIONS:
+            return "read"
+        raise _unknown("this part of a repo is not one the broker lets the sandbox read.")
+
+    if _matches(rest, WRITABLE[method]):
+        return "write"
+    # Deleting a branch, which `gh pr close --delete-branch` does. A push can
+    # delete a branch as well, so this gives nothing new.
+    if method == "DELETE" and len(rest) > 3 and rest[:3] == ["git", "refs", "heads"]:
+        return "write"
+    if method == "PUT" and _matches(rest, [("pulls", "#", "merge")]):
+        return "merge"
+
+    if not rest:
+        if method == "DELETE":
+            raise _never("repo-deletion")
+        raise _never("repo-settings")
+    if _matches(rest, [("pulls", "#", "merge-async")]):
+        raise _never("merge-api")
+    if _matches(rest, [("issues", "#", "assignees")]):
+        raise _never("assignees")
+    if _matches(rest, [("issues",), ("issues", "#")]):
+        raise _never("issues")
+    reason = CLOSED_FOR_CHANGES.get(rest[0])
+    if reason:
+        raise _never(reason)
+    raise _unknown("this change to a repo is not one the broker lets through.")
+
+
+def _api(
+    method: str,
+    segments: list[str],
+    pairs: list[tuple[str, str]],
+    headers: dict[str, list[str]],
+    body: object,
+    policy: Policy,
+) -> Decision:
+    # A packed body would have to be unpacked to be read, and the unpacked
+    # size is not known beforehand. No client of the API packs its requests.
+    encoding = headers.get("content-encoding", [""])[0].lower()
+    if encoding not in ("", "identity"):
+        raise _fix("body-odd", "the body is compressed, so the broker cannot read it.")
+
+    if body is None:
+        body = b""
+        if method not in READ_METHODS:
+            # proxy.py must hand over the body for these. Without it nothing
+            # can be said about the request.
+            raise _fix("body-odd", "the broker was not given the body of this request.")
+    if not isinstance(body, bytes | bytearray):
+        raise TypeError("body must be bytes")
+    body = bytes(body)
+    if len(body) > MAX_BODY:
+        raise _fix("body-odd", "the body is larger than the broker reads.")
+    if method in READ_METHODS and body:
+        raise _fix("body-odd", f"a {method} request must not have a body.")
+
+    first = segments[0] if segments else ""
+
+    if first == "graphql" and len(segments) == 1:
+        if method != "POST":
+            raise _unknown("GraphQL requests are sent with POST.")
+        if pairs:
+            # Many servers fill in what the body leaves out from the query
+            # string. `variables` given there would be used by GitHub and
+            # never seen by the checks below, which read the body.
+            raise _fix(
+                "query-odd",
+                "a GraphQL request must not have a query string. Everything "
+                "goes in the body.",
+            )
+        return _graphql(headers, body, policy)
+
+    if first == "repos":
+        if len(segments) < 3:
+            raise _unknown("a repo is named as /repos/OWNER/NAME.")
+        owner, name, rest = segments[1], segments[2], segments[3:]
+        _owner_and_name(owner, name)
+        want = _repo_request(method, rest)
+        decision = _access(
+            policy, owner, name, want, "api-read" if want == "read" else "api-write"
+        )
+        if want != "read" and body:
+            # The allowed changes take a JSON object or nothing. Most of
+            # what is in it is GitHub's business: a title, a comment's text.
+            # Assigning is the one thing that is looked for, in case a
+            # request that creates or edits something takes assignees on
+            # the side.
+            data = _json_object(headers, body)
+            if any(data.get(key) for key in ("assignees", "assignee", "agent_assignment")):
+                raise _never("assignees")
+            decision = replace(decision, body=_fresh(data))
+        return decision
+
+    # What is left is not tied to a repo. Only these few are allowed; they
+    # say who the token belongs to and how the API is doing.
+    if method in READ_METHODS and segments in (
+        [],
+        ["user"],
+        ["rate_limit"],
+        ["meta"],
+        ["versions"],
+    ):
+        return Decision(allowed=True, kind="api-read", with_token=True)
+
+    if first == "user":
+        if segments == ["user", "repos"] and method == "POST":
+            raise _never("repo-creation")
+        raise _never("account")
+    if first in ("orgs", "organizations"):
+        if len(segments) == 3 and segments[2] == "repos" and method == "POST":
+            raise _never("repo-creation")
+        raise _never("organizations")
+    if first == "gists":
+        raise _never("gists")
+    if first == "search":
+        raise _never("search")
+    if first == "repositories":
+        raise _never("repo-by-id")
+    raise _unknown("this part of the GitHub API is not one the broker lets through.")
+
+
+# ---------------------------------------------------------------------------
+# JSON bodies
+# ---------------------------------------------------------------------------
+
+
+def _reject_constant(name: str) -> object:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _reject_repeats(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("a name is used twice")
+        result[name] = value
+    return result
+
+
+def _fresh(data: dict[str, object]) -> bytes:
+    """Write a JSON object out again, to be sent on instead of the original.
+
+    GitHub then reads exactly what was judged here, and not a second meaning
+    that the original bytes might have had for a reader that differs from
+    this one. The result is plain ASCII, which leaves nothing to differ on.
+    """
+    try:
+        text = json.dumps(data, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+    except ValueError:
+        # A number too large to be one, such as 1e999.
+        raise _fix("body-odd", "the body holds a number that is not valid JSON.") from None
+    return text.encode("ascii")
+
+
+def _json_object(headers: dict[str, list[str]], body: bytes) -> dict[str, object]:
+    """Read a body as one JSON object, strictly.
+
+    Strictly, because two programs can read a sloppy document in two ways.
+    The cases refused here are the ones where readers are known to differ: a
+    name used twice (the first or the last value?), a byte order mark, text
+    that is not UTF-8, and NaN and Infinity, which are not JSON.
+
+    The body must also say that it is JSON. A server that picked the reader
+    from the Content-Type could otherwise be handed a body that is harmless
+    as JSON and something else as a web form.
+    """
+    media_type, *extras = (
+        part.strip().lower() for part in headers.get("content-type", [""])[0].split(";")
+    )
+    # The body is read here as UTF-8. If it claimed another character set, a
+    # server that believed the claim would read other text than was judged.
+    if media_type != "application/json" or any(
+        extra.replace('"', "") != "charset=utf-8" for extra in extras
+    ):
+        raise _fix(
+            "body-odd",
+            "a request with a body must say `Content-Type: application/json`, "
+            "with no character set other than UTF-8.",
+        )
+    try:
+        data = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=_reject_repeats,
+            parse_constant=_reject_constant,
+        )
+    except (ValueError, RecursionError):
+        raise _fix(
+            "body-odd",
+            "the body is not plain JSON: one object, in UTF-8, with no name "
+            "used twice.",
+        ) from None
+    if not isinstance(data, dict):
+        raise _fix(
+            "body-odd",
+            "the body must be one JSON object. Several requests in one body "
+            "are not accepted.",
+        )
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Ids
+# ---------------------------------------------------------------------------
+
+# GraphQL names a thing by an id such as "PR_kwDOAbCdEf8AAAABPlDjjg" instead
+# of by repo and number. GitHub calls these ids opaque and does not promise
+# their make-up, but since 2021 it has been this: a few letters for the kind
+# of thing, an underscore, and a short list of numbers packed with
+# MessagePack and base64. For a thing that lives in a repo the list is
+# [0, the repo's number, the thing's own number], and for a repo itself it is
+# [0, the repo's number].
+#
+# That is the only way to tell which repo an id belongs to without asking
+# GitHub, so it is used. If GitHub changes the make-up, ids stop being
+# understood and requests that need them are refused, which is the safe way
+# to fail. Older things have ids of another make-up that does not hold the
+# repo's number; those are refused for the same reason, except a repo's own
+# old id, which holds its number in plain text.
+NEW_ID = re.compile(r"([A-Z]{1,8})_([A-Za-z0-9_-]{4,64})")
+OLD_REPO_ID = re.compile(rb"010:Repository([1-9][0-9]{0,18})")
+OLD_ID_TEXT = re.compile(r"[A-Za-z0-9+/]{8,128}={0,2}")
+
+# The kinds of thing, by the letters their ids start with.
+PULL = "PR"
+ISSUE = "I"
+ISSUE_COMMENT = "IC"
+REVIEW = "PRR"
+REVIEW_COMMENT = "PRRC"
+REVIEW_THREAD = "PRRT"
+REPO = "R"
+
+
+def _unpack(packed: bytes) -> tuple[int, ...] | None:
+    """Read a MessagePack list of two or three whole numbers, and only that."""
+    if not packed or packed[0] not in (0x92, 0x93):
+        return None
+    count = packed[0] - 0x90
+    numbers = []
+    at = 1
+    for _ in range(count):
+        if at >= len(packed):
+            return None
+        first = packed[at]
+        at += 1
+        if first < 0x80:
+            numbers.append(first)
+            continue
+        size = {0xCC: 1, 0xCD: 2, 0xCE: 4, 0xCF: 8}.get(first)
+        if size is None or at + size > len(packed):
+            return None
+        numbers.append(int.from_bytes(packed[at : at + size], "big"))
+        at += size
+    if at != len(packed):
+        return None
+    return tuple(numbers)
+
+
+def _id_parts(node_id: object) -> tuple[str, tuple[int, ...]] | None:
+    """Split an id of the newer make-up into its kind and its numbers."""
+    if not isinstance(node_id, str):
+        return None
+    match = NEW_ID.fullmatch(node_id)
+    if not match:
+        return None
+    text = match.group(2)
+    try:
+        packed = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    except (binascii.Error, ValueError):
+        return None
+    numbers = _unpack(packed)
+    if numbers is None or numbers[0] != 0:
+        return None
+    return match.group(1), numbers
+
+
+def _repo_number(node_id: object) -> int | None:
+    """The repo's number from a repo's id, of either make-up."""
+    parts = _id_parts(node_id)
+    if parts:
+        kind, numbers = parts
+        return numbers[1] if kind == REPO and len(numbers) == 2 else None
+    if isinstance(node_id, str) and OLD_ID_TEXT.fullmatch(node_id):
+        try:
+            match = OLD_REPO_ID.fullmatch(base64.b64decode(node_id, validate=True))
+        except (binascii.Error, ValueError):
+            return None
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _repo_of_id(node_id: object, kinds: tuple[str, ...], policy: Policy) -> Repo:
+    """The listed repo that the thing with this id lives in, or a refusal."""
+    number = None
+    if REPO in kinds:
+        number = _repo_number(node_id)
+    if number is None:
+        parts = _id_parts(node_id)
+        if parts and parts[0] in kinds and parts[0] != REPO and len(parts[1]) == 3:
+            number = parts[1][1]
+    repo = policy.find_number(number) if number is not None else None
+    if repo is None:
+        raise _Refusal(
+            "graphql-id-not-listed",
+            "the request names something by an id that the broker cannot tie "
+            "to a listed repo.",
+            ASK_ID,
+        )
+    return repo
+
+
+# ---------------------------------------------------------------------------
+# GraphQL: reading the document
+# ---------------------------------------------------------------------------
+#
+# A GraphQL request is a small program in the body of a POST to /graphql. To
+# know what it does, the broker has to read it the way GitHub will, so below
+# is a reader for the part of the language a request can use. It follows the
+# GraphQL specification and accepts nothing beyond it. Where it could not be
+# sure to agree with GitHub, it refuses.
+
+
+class _Syntax(Exception):
+    """The GraphQL document cannot be read."""
+
+
+class _Field:
+    __slots__ = ("name", "arguments", "selections")
+
+    def __init__(self, name: str, arguments: dict[str, object], selections: list) -> None:
+        self.name = name
+        self.arguments = arguments
+        self.selections = selections
+
+
+class _Spread:
+    """`...name`: the fields of a named fragment, used here."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _Inline:
+    """`... on Type { fields }`: fields that apply to one type of thing."""
+
+    __slots__ = ("selections",)
+
+    def __init__(self, selections: list) -> None:
+        self.selections = selections
+
+
+class _Operation:
+    __slots__ = ("kind", "name", "variables", "selections")
+
+    def __init__(
+        self, kind: str, name: str | None, variables: dict[str, object], selections: list
+    ) -> None:
+        self.kind = kind
+        self.name = name
+        # Each variable's default value, or _NO_DEFAULT.
+        self.variables = variables
+        self.selections = selections
+
+
+class _Variable:
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _Enum(str):
+    """A bare word used as a value, such as ISSUE. Not the same as "ISSUE"."""
+
+
+class _Unknown:
+    """A value this reader does not work out. It equals nothing, so a check
+    that needs the value fails."""
+
+
+_NO_DEFAULT = _Unknown()
+_UNKNOWN = _Unknown()
+
+TOKEN = re.compile(
+    r"""
+      (?P<skip>   [\ufeff\t\n\r ,]+ | \#[^\n\r]* )
+    | (?P<punct>  \.\.\. | [!$&()\[\]{}:=@|] )
+    | (?P<name>   [_A-Za-z][_0-9A-Za-z]* )
+    | (?P<number> -?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?(?![_A-Za-z0-9.]) )
+    | (?P<block>  \"\"\"(?:\\\"\"\"|[^"]|"(?!""))*\"\"\" )
+    | (?P<string> "(?:[^"\\\n\r]|\\.)*" )
+    """,
+    re.VERBOSE,
+)
+
+ESCAPE = re.compile(r'\\(?:u\{([0-9A-Fa-f]{1,6})\}|u([0-9A-Fa-f]{4})|(["\\/bfnrt])|(.))', re.S)
+SIMPLE_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+
+def _unescape(match: re.Match[str]) -> str:
+    braced, four, simple, other = match.groups()
+    if other is not None:
+        raise _Syntax("unknown escape in a string")
+    if simple is not None:
+        return SIMPLE_ESCAPES[simple]
+    code = int(braced or four, 16)
+    if code > 0x10FFFF:
+        raise _Syntax("escape out of range")
+    return chr(code)
+
+
+def _string(text: str) -> str:
+    inner = text[1:-1]
+    if any(ord(char) < 0x20 and char != "\t" for char in inner):
+        raise _Syntax("control character in a string")
+    return ESCAPE.sub(_unescape, inner)
+
+
+def _tokens(text: str) -> list[tuple[str, str]]:
+    tokens = []
+    at = 0
+    while at < len(text):
+        match = TOKEN.match(text, at)
+        if not match:
+            raise _Syntax("unreadable text")
+        at = match.end()
+        kind = match.lastgroup
+        if kind != "skip":
+            tokens.append((kind, match.group()))
+            if len(tokens) > MAX_TOKENS:
+                raise _Syntax("too long")
+    return tokens
+
+
+class _Reader:
+    """Turns the text of a GraphQL document into operations and fragments."""
+
+    def __init__(self, text: str) -> None:
+        self.tokens = _tokens(text)
+        self.at = 0
+
+    def peek(self) -> tuple[str, str]:
+        return self.tokens[self.at] if self.at < len(self.tokens) else ("end", "")
+
+    def take(self) -> tuple[str, str]:
+        token = self.peek()
+        self.at += 1
+        return token
+
+    def has(self, punct: str) -> bool:
+        if self.peek() == ("punct", punct):
+            self.at += 1
+            return True
+        return False
+
+    def need(self, punct: str) -> None:
+        if not self.has(punct):
+            raise _Syntax(f"expected {punct}")
+
+    def name(self) -> str:
+        kind, text = self.take()
+        if kind != "name":
+            raise _Syntax("expected a name")
+        return text
+
+    def document(self) -> tuple[list[_Operation], dict[str, list]]:
+        operations: list[_Operation] = []
+        fragments: dict[str, list] = {}
+        while self.peek()[0] != "end":
+            kind, text = self.peek()
+            if (kind, text) == ("punct", "{"):
+                operations.append(_Operation("query", None, {}, self.selection_set(1)))
+            elif kind == "name" and text in ("query", "mutation", "subscription"):
+                self.take()
+                name = self.name() if self.peek()[0] == "name" else None
+                variables = self.variable_definitions() if self.peek() == ("punct", "(") else {}
+                self.directives()
+                operations.append(_Operation(text, name, variables, self.selection_set(1)))
+            elif kind == "name" and text == "fragment":
+                self.take()
+                name = self.name()
+                if name == "on" or self.name() != "on":
+                    raise _Syntax("badly formed fragment")
+                self.name()
+                self.directives()
+                if name in fragments:
+                    raise _Syntax("two fragments with one name")
+                fragments[name] = self.selection_set(1)
+            else:
+                # Anything else that can start a definition describes a
+                # schema. A request has no business sending that.
+                raise _Syntax("not an operation or a fragment")
+        names = [operation.name for operation in operations]
+        if not operations or len(set(names)) != len(names):
+            raise _Syntax("no operation, or two with one name")
+        if len(operations) > 1 and None in names:
+            raise _Syntax("an unnamed operation next to others")
+        return operations, fragments
+
+    def variable_definitions(self) -> dict[str, object]:
+        variables: dict[str, object] = {}
+        self.need("(")
+        while not self.has(")"):
+            self.need("$")
+            name = self.name()
+            self.need(":")
+            self.type()
+            default = self.value(1, constant=True) if self.has("=") else _NO_DEFAULT
+            self.directives()
+            if name in variables:
+                raise _Syntax("a variable is declared twice")
+            variables[name] = default
+        if not variables:
+            raise _Syntax("empty variable list")
+        return variables
+
+    def type(self) -> None:
+        if self.has("["):
+            self.type()
+            self.need("]")
+        else:
+            self.name()
+        self.has("!")
+
+    def directives(self) -> None:
+        """`@name(arguments)`, as in `@include(if: $x)`. Read and dropped:
+        every field is checked whether or not a directive would leave it
+        out."""
+        while self.has("@"):
+            self.name()
+            if self.peek() == ("punct", "("):
+                self.arguments()
+
+    def selection_set(self, depth: int) -> list:
+        if depth > MAX_DEPTH:
+            raise _Syntax("nested too deep")
+        self.need("{")
+        selections: list = []
+        while not self.has("}"):
+            if self.has("..."):
+                kind, text = self.peek()
+                if kind == "name" and text != "on":
+                    selections.append(_Spread(self.name()))
+                    self.directives()
+                    continue
+                if self.peek() == ("name", "on"):
+                    self.take()
+                    self.name()
+                self.directives()
+                selections.append(_Inline(self.selection_set(depth + 1)))
+                continue
+            name = self.name()
+            if self.has(":"):
+                # What came first was an alias, a name for the result. The
+                # field asked for is the name after the colon.
+                name = self.name()
+            arguments = self.arguments() if self.peek() == ("punct", "(") else {}
+            self.directives()
+            inner = self.selection_set(depth + 1) if self.peek() == ("punct", "{") else []
+            selections.append(_Field(name, arguments, inner))
+        if not selections:
+            raise _Syntax("empty selection")
+        return selections
+
+    def arguments(self) -> dict[str, object]:
+        arguments: dict[str, object] = {}
+        self.need("(")
+        while not self.has(")"):
+            name = self.name()
+            self.need(":")
+            if name in arguments:
+                raise _Syntax("an argument is given twice")
+            arguments[name] = self.value(1)
+        if not arguments:
+            raise _Syntax("empty argument list")
+        return arguments
+
+    def value(self, depth: int, constant: bool = False) -> object:
+        if depth > MAX_DEPTH:
+            raise _Syntax("nested too deep")
+        kind, text = self.take()
+        if (kind, text) == ("punct", "$"):
+            if constant:
+                raise _Syntax("a variable where a fixed value is needed")
+            return _Variable(self.name())
+        if kind == "number":
+            # No check depends on a number, so its value is not worked out.
+            return _UNKNOWN
+        if kind == "string":
+            return _string(text)
+        if kind == "block":
+            # A """block""" string has rules about indentation that decide
+            # its value. No tool writes a repo name or an id that way, so it
+            # is treated as a value that matches nothing.
+            return _UNKNOWN
+        if kind == "name":
+            if text == "true":
+                return True
+            if text == "false":
+                return False
+            if text == "null":
+                return None
+            return _Enum(text)
+        if (kind, text) == ("punct", "["):
+            items = []
+            while not self.has("]"):
+                items.append(self.value(depth + 1, constant))
+            return items
+        if (kind, text) == ("punct", "{"):
+            fields: dict[str, object] = {}
+            while not self.has("}"):
+                name = self.name()
+                self.need(":")
+                if name in fields:
+                    raise _Syntax("a name is used twice in one value")
+                fields[name] = self.value(depth + 1, constant)
+            return fields
+        raise _Syntax("expected a value")
+
+
+class _Document:
+    def __init__(self, text: str) -> None:
+        self.operations, self.fragments = _Reader(text).document()
+        self._flat: dict[str, list[_Field]] = {}
+
+    def fields(self, selections: list) -> list[_Field]:
+        """The fields a selection asks for, with every fragment opened up.
+
+        `{ a ...F ... on T { b } }` asks for `a`, the fields of F, and `b`.
+        A check that looked only at fields written out in place would be
+        walked around by putting the field in a fragment.
+        """
+        found: dict[_Field, None] = {}
+        self._collect(selections, found, set())
+        return list(found)
+
+    def _collect(self, selections: list, found: dict[_Field, None], open_now: set[str]) -> None:
+        for selection in selections:
+            if isinstance(selection, _Field):
+                found[selection] = None
+            elif isinstance(selection, _Inline):
+                self._collect(selection.selections, found, open_now)
+            else:
+                for field in self._fragment(selection.name, open_now):
+                    found[field] = None
+
+    def _fragment(self, name: str, open_now: set[str]) -> list[_Field]:
+        if name in self._flat:
+            return self._flat[name]
+        if name not in self.fragments:
+            raise _Syntax("a fragment is used but not defined")
+        if name in open_now:
+            raise _Syntax("a fragment uses itself")
+        open_now.add(name)
+        found: dict[_Field, None] = {}
+        self._collect(self.fragments[name], found, open_now)
+        open_now.discard(name)
+        self._flat[name] = list(found)
+        return self._flat[name]
+
+    def check_fragments(self) -> None:
+        """Open every fragment once, so that one that is missing or uses
+        itself is found before any check relies on it."""
+        for name in self.fragments:
+            self._fragment(name, set())
+
+    def every_field(self) -> Iterable[_Field]:
+        """Every field anywhere in the document, at any depth."""
+        stack = [operation.selections for operation in self.operations]
+        stack.extend(self.fragments.values())
+        while stack:
+            for selection in stack.pop():
+                if isinstance(selection, _Field):
+                    yield selection
+                    if selection.selections:
+                        stack.append(selection.selections)
+                elif isinstance(selection, _Inline):
+                    stack.append(selection.selections)
+
+
+def _resolve(value: object, operation: _Operation, variables: dict[str, object]) -> object:
+    """Work out what an argument's value will be when GitHub runs the request.
+
+    A variable takes its value from the request's `variables`; when it is
+    not given there, from the default in its declaration.
+    """
+    if isinstance(value, _Variable):
+        if value.name not in operation.variables:
+            return _UNKNOWN
+        if value.name in variables:
+            return variables[value.name]
+        default = operation.variables[value.name]
+        return None if default is _NO_DEFAULT else default
+    if isinstance(value, list):
+        return [_resolve(item, operation, variables) for item in value]
+    if isinstance(value, dict):
+        return {name: _resolve(item, operation, variables) for name, item in value.items()}
+    return value
+
+
+# ---------------------------------------------------------------------------
+# GraphQL: deciding
+# ---------------------------------------------------------------------------
+
+# Where a query may start. Each is checked below.
+#
+#   repository  one repo, by owner and name, which must be listed
+#   node        one thing by id, which must be in a listed repo
+#   search      issues and pull requests, kept to listed repos
+#   viewer      the account behind the token: its name and id only
+#   user        another account: its name and id only (to request a review)
+#   rateLimit, __type, __schema, __typename   about the API itself
+QUERY_STARTS = frozenset(
+    {"repository", "node", "search", "viewer", "user", "rateLimit", "__type", "__schema", "__typename"}
+)
+
+# What may be asked about an account.
+ACCOUNT_FIELDS = frozenset({"login", "id", "databaseId", "name", "url", "__typename"})
+
+# Fields that lead from one thing to a list of other repos or gists. A query
+# that starts at a listed repo could otherwise walk on from there:
+# `repository { owner { repositories { ... } } }`. See docs/github-rules.md,
+# "What the broker cannot see or enforce": this closes the plain routes, not
+# every route.
+WALKS_AWAY = frozenset(
+    {
+        "gist",
+        "gists",
+        "organizations",
+        "pinnableItems",
+        "pinnedItems",
+        "repositories",
+        "repositoriesContributedTo",
+        "starredRepositories",
+        "topRepositories",
+        "watching",
+    }
+)
+
+# Parts of a repo that are closed in the REST API, under the names GraphQL
+# has for them. GraphQL has no way to read secrets or webhooks at all.
+CLOSED_FIELDS = {"collaborators": "collaborators", "deployKeys": "deploy-keys"}
+
+SEARCH_TYPES = frozenset({"ISSUE", "ISSUE_ADVANCED"})
+
+# The changes ("mutations") that are allowed, and for each one the names in
+# its input that hold an id, with the kinds of thing the id may be. Every id
+# that is present must belong to a listed `write` repo, and at least one must
+# be present. A mutation that is not here is refused.
+ON_PULL = {"pullRequestId": (PULL,)}
+ON_PULL_OR_ISSUE = (PULL, ISSUE)
+MUTATIONS: dict[str, dict[str, tuple[str, ...]]] = {
+    # Pull requests.
+    "createPullRequest": {"repositoryId": (REPO,), "headRepositoryId": (REPO,)},
+    "updatePullRequest": ON_PULL,
+    "closePullRequest": ON_PULL,
+    "reopenPullRequest": ON_PULL,
+    "markPullRequestReadyForReview": ON_PULL,
+    "convertPullRequestToDraft": ON_PULL,
+    "updatePullRequestBranch": ON_PULL,
+    "requestReviews": ON_PULL,
+    "requestReviewsByLogin": ON_PULL,
+    # Reviews.
+    "addPullRequestReview": ON_PULL,
+    "submitPullRequestReview": {"pullRequestId": (PULL,), "pullRequestReviewId": (REVIEW,)},
+    "updatePullRequestReview": {"pullRequestReviewId": (REVIEW,)},
+    "deletePullRequestReview": {"pullRequestReviewId": (REVIEW,)},
+    "addPullRequestReviewThread": {"pullRequestId": (PULL,), "pullRequestReviewId": (REVIEW,)},
+    "addPullRequestReviewThreadReply": {
+        "pullRequestReviewThreadId": (REVIEW_THREAD,),
+        "pullRequestReviewId": (REVIEW,),
+    },
+    "updatePullRequestReviewComment": {"pullRequestReviewCommentId": (REVIEW_COMMENT,)},
+    "deletePullRequestReviewComment": {"id": (REVIEW_COMMENT,)},
+    "resolveReviewThread": {"threadId": (REVIEW_THREAD,)},
+    "unresolveReviewThread": {"threadId": (REVIEW_THREAD,)},
+    # Comments, on pull requests and issues alike.
+    "addComment": {"subjectId": ON_PULL_OR_ISSUE},
+    "updateIssueComment": {"id": (ISSUE_COMMENT,)},
+    "deleteIssueComment": {"id": (ISSUE_COMMENT,)},
+    "addReaction": {"subjectId": (PULL, ISSUE, ISSUE_COMMENT, REVIEW, REVIEW_COMMENT)},
+    "removeReaction": {"subjectId": (PULL, ISSUE, ISSUE_COMMENT, REVIEW, REVIEW_COMMENT)},
+    # Labels.
+    "addLabelsToLabelable": {"labelableId": ON_PULL_OR_ISSUE},
+    "removeLabelsFromLabelable": {"labelableId": ON_PULL_OR_ISSUE},
+}
+
+# Mutations that only assign, and the names under which other mutations can
+# assign on the side. `agentAssignment` also holds the id of a repo for the
+# agent to work in, which nothing here would check.
+ASSIGNING = frozenset(
+    {"addAssigneesToAssignable", "removeAssigneesFromAssignable", "replaceActorsForAssignable"}
+)
+ASSIGNING_INPUTS = ("assigneeIds", "assignees", "agentAssignment")
+
+# Issues may be read and commented on, not created, edited or closed.
+ISSUE_MUTATIONS = frozenset({"createIssue", "updateIssue", "closeIssue", "reopenIssue"})
+
+# Allowed only in a repo with `merge: true`.
+MERGE_MUTATIONS: dict[str, dict[str, tuple[str, ...]]] = {
+    "mergePullRequest": ON_PULL,
+    "enablePullRequestAutoMerge": ON_PULL,
+    "disablePullRequestAutoMerge": ON_PULL,
+    "enqueuePullRequest": ON_PULL,
+}
+
+
+def _malformed(what: str) -> _Refusal:
+    return _fix("graphql-malformed", what)
+
+
+def _graphql(headers: dict[str, list[str]], body: bytes, policy: Policy) -> Decision:
+    """Decide about a GraphQL request.
+
+    The body is `{"query": "...", "variables": {...}, "operationName": "..."}`.
+    The `query` text may define several operations, of which GitHub runs the
+    one named by `operationName`. Here every operation in the text has to
+    pass, whichever one is picked, so there is nothing to gain from hiding a
+    refused operation next to an allowed one.
+
+    An allowed request is sent on with its body written out afresh from what
+    was read here (`Decision.body`); see `_fresh` for why.
+    """
+    data = _json_object(headers, body)
+    extra = set(data) - {"query", "variables", "operationName"}
+    if extra:
+        raise _malformed(
+            f"the body has a part the broker does not know: `{_show(sorted(extra)[0], 40)}`. "
+            "It takes `query`, `variables` and `operationName`."
+        )
+    text = data.get("query")
+    if not isinstance(text, str) or not text.strip():
+        raise _malformed("the body has no `query` text.")
+    if len(text) > MAX_GRAPHQL:
+        raise _malformed("the `query` text is longer than the broker reads.")
+    variables = data.get("variables")
+    if variables is None:
+        variables = {}
+    if not isinstance(variables, dict):
+        raise _malformed("`variables` must be an object.")
+    picked_name = data.get("operationName")
+    if picked_name is not None and not isinstance(picked_name, str):
+        raise _malformed("`operationName` must be text.")
+
+    try:
+        document = _Document(text)
+        picked = _pick(document, picked_name)
+        document.check_fragments()
+        roots = {
+            operation: document.fields(operation.selections)
+            for operation in document.operations
+        }
+    except _Syntax:
+        raise _malformed(
+            "the `query` text is not a GraphQL request the broker can read."
+        ) from None
+
+    repo_names: set[str] = set()
+    at_start: set[_Field] = set()
+    for operation, fields in roots.items():
+        if len(fields) > MAX_ROOT_FIELDS:
+            raise _malformed("the request asks for too many things at once.")
+        at_start.update(fields)
+        if operation.kind == "subscription":
+            raise _unknown("GraphQL subscriptions are not passed on.")
+        for field in fields:
+            if operation.kind == "mutation":
+                repo = _mutation(field, operation, variables, policy)
+            else:
+                repo = _query_start(field, document, operation, variables, policy)
+            if repo is not None:
+                repo_names.add(repo.full_name)
+
+    for field in document.every_field():
+        if field in at_start:
+            continue
+        if field.name in CLOSED_FIELDS:
+            raise _never(CLOSED_FIELDS[field.name])
+        if field.name in WALKS_AWAY or (field.name == "repository" and field.arguments):
+            raise _Refusal(
+                "graphql-walks-away",
+                f"the request asks for `{_show(field.name, 40)}` inside "
+                "something else, which leads to repos or gists outside the "
+                "allowed ones.",
+                ASK_UNKNOWN,
+            )
+
+    clean: dict[str, object] = {"query": text}
+    if data.get("variables") is not None:
+        clean["variables"] = variables
+    if picked_name is not None:
+        clean["operationName"] = picked_name
+    return Decision(
+        allowed=True,
+        kind="graphql-write" if picked.kind == "mutation" else "graphql-read",
+        with_token=True,
+        body=_fresh(clean),
+        repo=next(iter(repo_names)) if len(repo_names) == 1 else None,
+    )
+
+
+def _pick(document: _Document, name: str | None) -> _Operation:
+    """The operation GitHub will run."""
+    if name is None:
+        if len(document.operations) != 1:
+            raise _Syntax("several operations and no operationName")
+        return document.operations[0]
+    for operation in document.operations:
+        if operation.name == name:
+            return operation
+    raise _Syntax("operationName names no operation")
+
+
+def _text_argument(
+    field: _Field, name: str, operation: _Operation, variables: dict[str, object]
+) -> str | None:
+    """An argument's value when it is plain text, else None."""
+    value = _resolve(field.arguments.get(name, _UNKNOWN), operation, variables)
+    # `type(...) is str` leaves out bare words, which are not text.
+    return value if type(value) is str else None
+
+
+def _query_start(
+    field: _Field,
+    document: _Document,
+    operation: _Operation,
+    variables: dict[str, object],
+    policy: Policy,
+) -> Repo | None:
+    name = field.name
+    if name not in QUERY_STARTS:
+        raise _Refusal(
+            "graphql-query-not-allowed",
+            f"a GraphQL query may not start at `{_show(name, 40)}`. It may "
+            "start at `repository` with a listed repo, at `node`, `search`, "
+            "`viewer` or `user`.",
+            ASK_UNKNOWN,
+        )
+
+    if name == "repository":
+        owner = _text_argument(field, "owner", operation, variables)
+        repo_name = _text_argument(field, "name", operation, variables)
+        if owner is None or repo_name is None:
+            raise _malformed(
+                "`repository` must be given its `owner` and `name` as plain "
+                "text, written out or in `variables`."
+            )
+        repo = policy.find(owner, repo_name)
+        if repo is None:
+            # Other repos cannot be read here even with `read-public`:
+            # GraphQL does not answer without a token, and with the token
+            # this would read everything its owner can read.
+            raise _Refusal(
+                "repo-not-listed",
+                f"{_show(owner, 40)}/{_show(repo_name, 100)} is not a repo "
+                "the sandbox may use through GraphQL, which is what most gh "
+                "commands use.",
+                ASK_LIST,
+            )
+        return repo
+
+    if name == "node":
+        node_id = _resolve(field.arguments.get("id", _UNKNOWN), operation, variables)
+        return _repo_of_id(
+            node_id,
+            (REPO, PULL, ISSUE, ISSUE_COMMENT, REVIEW, REVIEW_COMMENT, REVIEW_THREAD),
+            policy,
+        )
+
+    if name == "search":
+        kind = _resolve(field.arguments.get("type", _UNKNOWN), operation, variables)
+        if not isinstance(kind, str) or str(kind) not in SEARCH_TYPES:
+            raise _Refusal(
+                "graphql-search",
+                "a GraphQL search may look for issues and pull requests only "
+                "(type ISSUE).",
+                ASK_UNKNOWN,
+            )
+        _search(_text_argument(field, "query", operation, variables), policy)
+        return None
+
+    if name in ("viewer", "user"):
+        for inner in document.fields(field.selections):
+            if inner.name not in ACCOUNT_FIELDS or inner.selections:
+                raise _Refusal(
+                    "graphql-account",
+                    f"under `{name}` only an account's name and id may be "
+                    f"asked for, not `{_show(inner.name, 40)}`.",
+                    ASK_UNKNOWN,
+                )
+    return None
+
+
+def _search(text: str | None, policy: Policy) -> None:
+    """Keep a search for issues and pull requests to listed repos.
+
+    A search names its repos in the search text: `repo:owner/name is:open`.
+    The text must name at least one listed repo and no other, and must not
+    use the parts of the search language that could widen it again: `OR`,
+    `NOT`, a leading `-`, quotes (which turn `repo:` into words to look
+    for), and `user:`, `org:` or `owner:`, which add all repos of an
+    account.
+
+    This follows GitHub's search language as it is documented. It is the
+    weakest check in this module, and it is about reading only.
+    """
+
+    def refuse(what: str) -> _Refusal:
+        return _Refusal("graphql-search", what, ASK_UNKNOWN)
+
+    if text is None or len(text) > 1024:
+        raise refuse("a search must be given its text as plain text of normal length.")
+    if '"' in text or "'" in text or "|" in text or "-(" in text:
+        raise refuse(
+            "a search from the sandbox may not use quotes, `|` or a `-` "
+            "before a bracket."
+        )
+    words = text.replace("(", " ( ").replace(")", " ) ").split()
+    listed = 0
+    for word in words:
+        lower = word.lower()
+        if lower in ("or", "and", "not", "-"):
+            raise refuse(
+                "a search from the sandbox may not use the words OR, AND or "
+                "NOT, in capitals or not."
+            )
+        # "Holds", not "starts with": a word such as `+user:x` might still
+        # be read as `user:x` by GitHub.
+        if any(scope in lower for scope in ("user:", "org:", "owner:", "enterprise:")):
+            raise refuse(
+                "a search from the sandbox may not use `user:`, `org:` or "
+                "`owner:`. Name the repo with `repo:owner/name`."
+            )
+        if "repo:" in lower:
+            owner, _, name = lower[len("repo:") :].partition("/")
+            if not lower.startswith("repo:") or policy.find(owner, name) is None:
+                raise _Refusal(
+                    "repo-not-listed",
+                    "the search names a repo that the sandbox may not use, or "
+                    "leaves one out with `-repo:`.",
+                    ASK_LIST,
+                )
+            listed += 1
+    if not listed:
+        raise refuse(
+            "a search must name a listed repo with `repo:owner/name`. "
+            "`gh pr list --search` and `gh issue list --search` do that."
+        )
+
+
+def _mutation(
+    field: _Field, operation: _Operation, variables: dict[str, object], policy: Policy
+) -> Repo:
+    name = field.name
+    merging = name in MERGE_MUTATIONS
+    ids = MERGE_MUTATIONS.get(name) or MUTATIONS.get(name)
+    if name in ASSIGNING:
+        raise _never("assignees")
+    if name in ISSUE_MUTATIONS:
+        raise _never("issues")
+    if ids is None:
+        raise _Refusal(
+            "graphql-mutation-not-allowed",
+            f"the GraphQL mutation `{_show(name, 60)}` is not one the broker "
+            "lets through. It lets through the ones gh uses to open, edit, "
+            "comment on, review and close pull requests.",
+            ASK_UNKNOWN,
+        )
+    given = _resolve(field.arguments.get("input", _UNKNOWN), operation, variables)
+    if set(field.arguments) != {"input"} or not isinstance(given, dict):
+        raise _malformed(f"`{name}` must be given one `input` object.")
+
+    if any(given.get(key) for key in ASSIGNING_INPUTS):
+        raise _never("assignees")
+
+    repo = None
+    for key, kinds in ids.items():
+        if given.get(key) is None:
+            continue
+        found = _repo_of_id(given[key], kinds, policy)
+        if not found.write:
+            raise _Refusal(
+                "repo-read-only",
+                f"{found.full_name} is listed for reading only.",
+                ASK_WRITE,
+            )
+        if merging and not found.merge:
+            raise _Refusal(
+                "merge",
+                f"merging pull requests in {found.full_name} is not allowed "
+                "from the sandbox.",
+                ASK_MERGE,
+            )
+        repo = repo or found
+    if repo is None:
+        raise _malformed(
+            f"`{name}` does not say what it is about: its input has no "
+            f"`{next(iter(ids))}`."
+        )
+    return repo
