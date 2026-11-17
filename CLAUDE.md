@@ -249,11 +249,6 @@ The reply should name Linux and the host `agent-vm`.
   pinned by commit; keep it that way.
 - **Keep the broker test off the internet.** It uses a stand-in server on
   the same machine. GitHub allows 60 requests an hour without a login.
-- **One check in `tests/github-broker.sh` fails about one run in three:**
-  "a first TLS message that never ends: logged", sometimes together with
-  "the broker reported no errors of its own". The fault is in the test; see
-  "Known to fail now and then" in docs/testing.md. CI lets exactly these
-  through, with a warning, until the test is fixed.
 
 ## How work is done
 

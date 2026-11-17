@@ -23,7 +23,7 @@
       };
 
       # The tests that need no VM, see tests/default.nix and docs/testing.md.
-      tests = hostPkgs.callPackage ./tests { inherit self ports; };
+      tests = hostPkgs.callPackage ./tests { inherit self hostScripts; };
     in
     {
       nixosConfigurations.agent-vm = nixpkgs.lib.nixosSystem {

@@ -78,30 +78,10 @@ jobs:
             python3 -c 'import socket, sys; print(sys.argv[1], "is", socket.getaddrinfo(sys.argv[1], 443)[0][4][0])' "$name"
           done
 
-      # A real broker against a stand-in server on this machine. Nothing in
-      # it leaves the runner.
-      #
-      # Two checks in tests/github-broker.sh fail now and then for a reason
-      # that lies in the test and not in the broker; on this runner, more
-      # often than not (docs/testing.md, "Known to fail now and then"). The
-      # first is "a first TLS message that never ends: logged". The second,
-      # "the broker reported no errors of its own", fails only along with
-      # the first, from the same cause.
-      #
-      # A run in which nothing else failed is let through, with a warning on
-      # the run's page. Any other failure fails the job, and so does the
-      # second check without the first. Remove all of this, down to the
-      # plain `nix run .#test-broker`, when the test is fixed.
-      - name: Check the broker against a stand-in server
+      # The tests that are programs of their own, because they start real
+      # programs on this machine, which Nix's checks cannot do. One on each
+      # line; the step stops at the first that fails. Nothing in them leaves
+      # the runner. To add one, add a line.
+      - name: Tests that start real programs
         run: |
-          known_hello='  FAIL  a first TLS message that never ends: logged'
-          known_errors='  FAIL  the broker reported no errors of its own'
-          output=$(mktemp)
-          if nix run .#test-broker | tee "$output"; then
-            exit 0
-          fi
-          others=$(grep '^  FAIL' "$output" | grep -vxF -e "$known_hello" -e "$known_errors" || true)
-          if [ -n "$others" ] || ! grep -qxF "$known_hello" "$output"; then
-            exit 1
-          fi
-          echo "::warning title=Known fault in the broker test::Only the checks named in docs/testing.md under 'Known to fail now and then' failed. They are let through until the test is fixed."
+          nix run .#test-broker

@@ -112,29 +112,6 @@ cannot find the stand-in, and every check that needs it fails with
 line `127.0.0.1 standin.localhost unopened.localhost` to `/etc/hosts`. CI
 does this by itself.
 
-### Known to fail now and then
-
-One check, "a first TLS message that never ends: logged", fails in about one
-run in three. The fault is in the test, not in the broker. The test sends a
-first TLS message that claims to be 16 MiB long, and expects the broker's
-size limit (`limits.py`) to stop it and write a log line. But the bytes that
-follow are not shaped like TLS, so mitmproxy's own reader also gives up on
-them, once it has more than 16 KiB. Which of the two comes first depends on
-how the bytes happen to arrive. Either way the connection is closed within a
-megabyte or two, which the check before it confirms; only the log line
-differs.
-
-A second check sometimes fails along with it, from the same cause: "the
-broker reported no errors of its own". When mitmproxy's reader has given up
-and more bytes arrive before the connection is closed, mitmproxy 12.3.1
-stumbles over them and writes "mitmproxy has crashed!" with a long error to
-the log. It then drops that connection and carries on; nothing is passed on.
-On a slower machine, such as the one CI runs on, the two fail together more
-often than not.
-
-Until the test sends bytes that only the limit can stop, run it again when
-these are the only failures.
-
 ## Layer 3: inside the VM
 
 ```sh
@@ -191,14 +168,14 @@ The workflow uses no secrets and may only read the repo. It runs on
 `pull_request`, so a pull request from a fork gets the same read-only
 treatment. Each action it uses is named by its exact commit.
 
-Because of the two checks described under "Known to fail now and then", CI
-lets a run through when they are the only failures, with a warning on the
-run's page. Any other failure fails the run. That exception is to be removed
-together with the fault.
-
 The runner's macOS does not read `.localhost` names as the machine itself,
 so the workflow adds the two names of the stand-in to the runner's hosts
 file first.
+
+A test that is a script of its own, as `tests/github-broker.sh` is, gets
+into CI with one line: the step "Tests that start real programs" in the
+workflow runs one command on each line. A script that only needs `nix` is
+added there by its path, such as `tests/commands.sh`.
 
 ## Working on the tests
 

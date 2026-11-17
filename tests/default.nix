@@ -14,7 +14,6 @@
   mkShellNoCC,
   writeShellApplication,
   writeShellScriptBin,
-  callPackage,
   python3,
   bash,
   shellcheck,
@@ -24,7 +23,8 @@
   # The flake itself: its files are the source under test, and its outputs
   # give the VM and the formatter.
   self,
-  ports,
+  # The Mac-side commands as flake.nix builds them, with the real VM.
+  hostScripts,
 }:
 let
   formatter = self.formatter.${stdenv.hostPlatform.system};
@@ -43,9 +43,9 @@ let
   # a shell script that Nix runs shellcheck over when it builds it, so
   # building them is the check. The real `vm` command holds the path of the
   # VM, and asking for it would build the VM; here that path is a script
-  # that does nothing.
-  commands = callPackage ../darwin/commands.nix {
-    inherit ports;
+  # that does nothing. Everything else is as flake.nix hands it to
+  # darwin/commands.nix, whatever that grows to be.
+  commands = hostScripts.override {
     vm = writeShellScriptBin "run-agent-vm-vm" ''
       echo "This is the stand-in used by the checks, not a VM." >&2
       exit 1
