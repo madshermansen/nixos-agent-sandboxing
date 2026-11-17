@@ -47,6 +47,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `tests/github-broker.sh` | The token swap, checked on the Mac against a stand-in for GitHub |
 | `tests/github-live.sh` | The round trip with a real token, run inside the VM |
 | `tests/unit/` | pytest files for the broker's decisions; no network needed |
+| `tests/default.nix` | What `nix flake check`, `nix develop` and `nix run .#test-broker` are made of |
 | `docs/` | Setup, architecture, diagrams |
 
 ## Commands
@@ -63,6 +64,9 @@ nix run .#pair               # add the VM to the T3 app on the Mac
 nix build .#vm --no-link     # build only
 tests/github-broker.sh       # check the token swap on the Mac, without the VM or a token
 nix fmt                      # format the Nix files; run before committing
+nix flake check              # every test that needs no VM; run before pushing
+nix run .#test-broker        # tests/github-broker.sh with the programs it needs
+nix develop                  # a shell with pytest, mitmproxy, shellcheck, ruff and treefmt
 ```
 
 ## Checking that T3 and Claude work in the VM
@@ -212,6 +216,31 @@ The reply should name Linux and the host `agent-vm`.
   the user can start threads in it. `t3 environment link` lets agents on the
   Mac hand work to the VM, and needs Linked environments turned on under
   Settings → Labs in the app.
+
+## Tests
+
+[docs/testing.md](docs/testing.md) describes the layers and what each proves.
+
+- **Run `nix flake check` and `nix run .#test-broker` before pushing.**
+  Neither needs the VM, the Linux builder or a token. The checks inside the
+  VM (`nix run .#check`) are still what proves the sandbox.
+- **Nothing in `checks` may build a part of the VM.** They must pass on a
+  Mac with no Linux builder. The `vm` command is built there with a stand-in
+  for the VM, and the VM's configuration is only evaluated.
+- **New tests are picked up by themselves,** once `git add`ed: every
+  `tests/unit/test_*.py` is run, and every `tests/*.sh` goes through
+  shellcheck.
+- **A skipped unit test fails the check.** `NIXT3_NO_SKIPS=1` is set there,
+  so that a missing library cannot quietly shrink the set. Plain `pytest`
+  without `ruamel.yaml` skips a whole file and still ends green.
+- **`proxy.py` cannot be imported in a test:** its last line starts the
+  broker. Use the `proxy` fixture in `tests/unit/conftest.py`, which loads
+  the file without that line.
+- **Keep the broker test off the internet.** It uses a stand-in server on
+  the same machine. GitHub allows 60 requests an hour without a login.
+- **One check in `tests/github-broker.sh` fails about one run in three:**
+  "a first TLS message that never ends: logged". The fault is in the test;
+  see "Known to fail now and then" in docs/testing.md.
 
 ## How work is done
 
