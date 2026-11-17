@@ -12,8 +12,8 @@ the way out. So the VM can use the token without ever holding it.
 """
 
 import base64
-import binascii
 import json
+import os
 import re
 from dataclasses import dataclass
 
@@ -119,7 +119,9 @@ def swap_authorization(values: list[str], token: Secret | None) -> Credential:
     if scheme_lower == "basic":
         try:
             decoded = base64.b64decode(rest, validate=True).decode("utf-8")
-        except (binascii.Error, UnicodeDecodeError):
+        except ValueError:
+            # Not base64, not text, or not ASCII to begin with: each of
+            # those is a kind of ValueError.
             return Credential("refuse", reason="other-login")
         name, colon, password = decoded.partition(":")
         placeholder_is_password = colon == ":" and password == PLACEHOLDER
@@ -155,6 +157,32 @@ def names_the_host(
     if authority:
         names.append(authority.strip().lower())
     return bool(names) and all(name in allowed for name in names)
+
+
+# Headers by which a request tells a server that it is "really" something
+# else: for another host, from another address, or with another method than
+# its first line says. They are meant for proxies to set, and the broker is
+# the proxy here, so what the VM sends in them is left out. Otherwise a rule
+# about a request's method or host could be met by the first line and undone
+# by a header.
+DROPPED_HEADERS = frozenset(
+    {
+        "forwarded",
+        "x-host",
+        "x-http-method",
+        "x-http-method-override",
+        "x-method-override",
+        "x-original-url",
+        "x-real-ip",
+        "x-rewrite-url",
+    }
+)
+
+
+def drops_header(name: str) -> bool:
+    """Whether a request header is left out before the request is passed on."""
+    name = name.strip().lower()
+    return name in DROPPED_HEADERS or name.startswith("x-forwarded-")
 
 
 def reads_body(
@@ -228,6 +256,46 @@ def parse_handover(text: str, needed: set[str]) -> dict[str, Secret]:
             )
         result[name] = Secret(value)
     return result
+
+
+def copy_scrubbed(source: int, target: int, secrets: list[Secret]) -> None:
+    """Copy what arrives on one open file to another, with every token replaced.
+
+    `source` and `target` are file numbers. The broker puts this between
+    itself and its log: everything the process writes, by this code, by
+    mitmproxy or by Python itself, goes into a pipe, and this function reads
+    the other end. So no line reaches the log without passing through here.
+
+    A token may arrive in two parts. So the last few bytes, as many as could
+    be the start of a token, are held back until more arrives or the source
+    is closed. Returns when the source is closed.
+    """
+    tokens = [secret.reveal().encode() for secret in secrets]
+    hold = max((len(token) for token in tokens), default=1) - 1
+    pending = b""
+
+    def write(data: bytes) -> None:
+        while data:
+            try:
+                data = data[os.write(target, data) :]
+            except OSError:
+                return  # Nobody reads the log any more. Keep taking input.
+
+    while True:
+        try:
+            piece = os.read(source, 65536)
+        except OSError:
+            piece = b""
+        pending += piece
+        for token in tokens:
+            pending = pending.replace(token, b"<secret>")
+        if not piece:
+            write(pending)
+            return
+        # Whole lines go out at once; a token has no line break in it.
+        cut = max(pending.rfind(b"\n") + 1, len(pending) - hold)
+        write(pending[:cut])
+        pending = pending[cut:]
 
 
 def scrub(text: str, secrets: list[Secret]) -> str:

@@ -33,9 +33,20 @@ What the broker does:
   Two more kinds of line exist: "started" when the broker starts, and
   "failed" when an allowed destination could not be reached.
 
-It fails closed. If rules.yaml is missing or has a mistake, or a token that
-a rule asks for was not handed over, the broker prints the reason and exits.
-mitmproxy itself exits when this file cannot be loaded.
+It fails closed, in three ways:
+
+- If rules.yaml is missing or has a mistake, or a token that a rule asks for
+  was not handed over, the broker prints the reason and exits. mitmproxy
+  itself exits when this file cannot be loaded.
+- If the code below fails while it decides about a request or a connection,
+  that request or connection is refused. mitmproxy by itself would log the
+  error and carry on as if the code had agreed. See `fail_closed`.
+- If mitmproxy is not the version that limits.py was written for, the broker
+  does not start.
+
+What the VM can make the broker hold in memory is bounded: limits.py bounds
+what a connection may send before it makes sense, bodies are passed on in
+pieces (swap.reads_body), and MAX_CLIENTS bounds the connections.
 
 Started by `nix run .#broker`, which runs mitmdump with this file as its
 script and the path of the rules file in AGENT_BROKER_RULES. The tokens are
@@ -44,22 +55,27 @@ whose number is in AGENT_BROKER_TOKENS_FD. This file runs no other program
 and reads no token from a file or an environment variable.
 """
 
+import atexit
+import functools
 import ipaddress
 import os
 import re
 import stat
 import sys
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 
-from mitmproxy import connection, ctx, http, tls
+from mitmproxy import connection, ctx, hooks, http, tls
+from mitmproxy import flow as mitmproxy_flow
 from mitmproxy.proxy import server_hooks
 from OpenSSL import SSL
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
 
-# swap.py lies next to this file. mitmproxy puts this file's folder on the
+# These lie next to this file. mitmproxy puts this file's folder on the
 # search path before loading it.
+import limits
 import swap
 
 RULES_ENV = "AGENT_BROKER_RULES"
@@ -78,6 +94,13 @@ ENCRYPTED_CLIENT_HELLO = 0xFE0D
 
 # The error mitmproxy is given for a connection stopped at the last gate.
 REFUSED_OUTGOING = "refused by the sandbox broker"
+
+# How many connections from the VM the broker holds at once. Each one can
+# make the broker keep a bounded amount in memory (see limits.py and
+# swap.MAX_READ_BODY), so this bounds the total, at roughly 1.5 MiB each in
+# the worst case. Ordinary use is a few dozen: git, gh and each agent's
+# connection to its model.
+MAX_CLIENTS = 256
 
 # Every key a destination may have. An unknown key is an error rather than
 # ignored, so a typing mistake cannot quietly change what a rule means. Later
@@ -309,6 +332,14 @@ REFUSALS = {
         "mistake in how it was started on the host."
     ),
     "method-not-passed-on": "this kind of request is not passed on to {host}.",
+    "trailers": (
+        "the request announces lines after its body (a Trailer header), which "
+        "the broker does not pass on."
+    ),
+    "upgrade": (
+        "the request asks to switch to another protocol (an Upgrade header), "
+        "such as WebSocket, which the broker does not pass on."
+    ),
     "names-another-host": (
         "the request names another site than {host}, the one its connection "
         "was opened for."
@@ -345,10 +376,143 @@ def is_http1(request: http.Request) -> bool:
     return request.is_http10 or request.is_http11
 
 
+def limit_passed(reason: str, context: object, from_vm: bool) -> None:
+    """limits.py closed a connection that sent more than the broker takes in."""
+    address = getattr(getattr(context, "server", None), "address", None)
+    host, port = (address[0], address[1]) if address else ("-", 0)
+    log("refused" if from_vm else "failed", host, port, "limit", reason)
+
+
+# --- Failing closed -----------------------------------------------------------
+#
+# mitmproxy calls the methods of Broker below ("hooks") at fixed points: when
+# a connection comes in, when a request's first lines have arrived, and so
+# on. If such a method stops with an error, mitmproxy logs the error and
+# carries on as if the method had done nothing. For a method whose job is to
+# refuse things, doing nothing means letting them through.
+#
+# So every hook is wrapped. When one fails for a reason nobody foresaw, the
+# wrapper writes a `refused ... broker-error` line and stops the thing the
+# hook was deciding about. ON_FAILURE says how, per hook. `fail_closed`
+# applies the wrapper to the whole class, and refuses to load a class that
+# has a hook without an entry, so that a hook added later cannot be left out.
+
+
+def _stop_flow(broker: "Broker", flow: http.HTTPFlow) -> None:
+    """End a request without passing it, or its answer, on."""
+    flow.metadata[STATE] = "refused"
+    try:
+        if flow.killable:
+            flow.kill()
+    except Exception:
+        flow.error = mitmproxy_flow.Error(mitmproxy_flow.Error.KILLED_MESSAGE)
+
+
+def _stop_client(broker: "Broker", client: connection.Client) -> None:
+    client.error = REFUSED_OUTGOING
+
+
+def _stop_hello(broker: "Broker", data: tls.ClientHelloData) -> None:
+    """Neither pass the TLS connection on nor open it: tls_start_client ends it."""
+    data.ignore_connection = False
+    broker.opening.discard(data.context.client.id)
+
+
+def _stop_tls(broker: "Broker", data: tls.TlsData) -> None:
+    """Make the handshake fail, as for a refused connection."""
+    broker.opening.discard(data.context.client.id)
+    data.ssl_conn = SSL.Connection(SSL.Context(SSL.TLS_SERVER_METHOD))
+    data.ssl_conn.set_accept_state()
+
+
+def _stop_server(broker: "Broker", data: server_hooks.ServerConnectionHookData) -> None:
+    data.server.error = REFUSED_OUTGOING
+
+
+def _stop_nothing(broker: "Broker", data: object) -> None:
+    """For hooks that decide nothing: they only note or log."""
+
+
+ON_FAILURE = {
+    "client_connected": _stop_client,
+    "client_disconnected": _stop_nothing,
+    "http_connect": _stop_flow,
+    "requestheaders": _stop_flow,
+    "request": _stop_flow,
+    "responseheaders": _stop_flow,
+    "error": _stop_nothing,
+    "tls_clienthello": _stop_hello,
+    "tls_start_client": _stop_tls,
+    "server_connect": _stop_server,
+    "server_connect_error": _stop_nothing,
+}
+
+
+def _place(data: object) -> tuple[object, object]:
+    """The host and port that a hook's argument is about, for the log."""
+    request = getattr(data, "request", None)
+    if request is not None:
+        return request.host, request.port
+    for holder in (getattr(data, "server", None), getattr(getattr(data, "context", None), "server", None)):
+        address = getattr(holder, "address", None)
+        if address:
+            return address[0], address[1]
+    return "-", 0
+
+
+def _guarded(name: str, hook, stop):
+    @functools.wraps(hook)
+    def guarded(self, data):
+        try:
+            return hook(self, data)
+        except Exception as error:
+            # First stop it, then say so: writing the log line may be the
+            # very thing that fails.
+            try:
+                stop(self, data)
+            except Exception:
+                pass
+            try:
+                # The kind of error and where it arose, never its message:
+                # a message can hold parts of the request, or a token.
+                trace, where = error.__traceback__, "-"
+                while trace is not None:
+                    code = trace.tb_frame.f_code
+                    where = f"{os.path.basename(code.co_filename)}:{trace.tb_lineno}"
+                    trace = trace.tb_next
+                host, port = _place(data)
+                log("refused", host, port, name, "broker-error", type(error).__name__, where)
+            except Exception:
+                pass
+
+    return guarded
+
+
+def fail_closed(cls):
+    """Wrap every hook of a class so that an error in it refuses, see above."""
+    for name in ON_FAILURE:
+        if name not in hooks.all_hooks:
+            raise TypeError(f"mitmproxy has no hook called `{name}` (ON_FAILURE in proxy.py)")
+    for name in hooks.all_hooks:
+        hook = cls.__dict__.get(name)
+        if hook is None:
+            continue
+        if name not in ON_FAILURE:
+            raise TypeError(
+                f"the hook `{name}` has no entry in ON_FAILURE in proxy.py. "
+                "Say there what must happen when it fails"
+            )
+        setattr(cls, name, _guarded(name, hook, ON_FAILURE[name]))
+    return cls
+
+
+@fail_closed
 class Broker:
     def __init__(self, rules: dict[str, Rule], tokens: dict[str, swap.Secret]) -> None:
         self.rules = rules
         self.tokens = tokens
+        # The connections from the VM that are open now.
+        self.clients: set[str] = set()
         # For each connection from the VM that holds a tunnel: the host and
         # port the tunnel was opened for. Everything that arrives on such a
         # connection afterwards is inside the tunnel.
@@ -373,9 +537,11 @@ class Broker:
         opened request, its method and path.
 
         A request whose body is large, or of unknown size, gets no answer.
-        Its connection is closed instead. To answer it, the broker would
-        first have to take in the whole body, and a program in the VM could
-        use that to fill the Mac's memory with a request that never ends.
+        Its connection is closed instead, which the program in the VM sees
+        as a failed request within about a second. To answer it, the broker
+        would first have to take in the whole body, and a program in the VM
+        could use that to fill the Mac's memory with a request that never
+        ends.
 
         Which of the two a request is can be told from its first lines,
         because the broker speaks only HTTP/1 with the VM (`http2=false` in
@@ -443,10 +609,35 @@ class Broker:
                 flow.request.port,
             )
 
+    def client_connected(self, client: connection.Client) -> None:
+        """A program in the VM connects. Refuse it when there are too many."""
+        if len(self.clients) >= MAX_CLIENTS:
+            log("refused", "-", 0, "connection", "too-many-connections")
+            client.error = REFUSED_OUTGOING
+            return
+        self.clients.add(client.id)
+
     def client_disconnected(self, client: connection.Client) -> None:
         """A connection from the VM ended. Forget what was noted about it."""
+        self.clients.discard(client.id)
         self.tunnels.pop(client.id, None)
         self.opening.discard(client.id)
+
+    @staticmethod
+    def unwanted(request: http.Request) -> str | None:
+        """Why a readable request is refused for what it asks of the broker.
+
+        Two things mitmproxy would do with a request are not safe here.
+        Lines after a chunked body ("trailers") it cannot pass on at all.
+        And a request to switch the connection to another protocol, such
+        as WebSocket, would have mitmproxy collect each message of that
+        protocol in memory, however long.
+        """
+        if "trailer" in request.headers:
+            return "trailers"
+        if "upgrade" in request.headers:
+            return "upgrade"
+        return None
 
     def requestheaders(self, flow: http.HTTPFlow) -> None:
         """A request the broker can read. There are three kinds.
@@ -468,17 +659,23 @@ class Broker:
         is read in full only when it is known to be small; otherwise it is
         passed on piece by piece or, for a refused request, not read at
         all. That keeps a program in the VM from filling the Mac's memory
-        with a request that never ends.
+        with a body that never ends. The first lines themselves are bounded
+        before this method is called, by limits.py.
         """
         tunnel = self.tunnels.get(flow.client_conn.id)
         if tunnel is None:
             host, port = flow.request.host, flow.request.port
             rule = self.rules.get(host.lower())
-            if rule is not None and rule.inspect and port in rule.ports:
+            reason = self.refusal(host, port)
+            if reason is None and rule.inspect:
                 # An opened destination is never contacted without
                 # encryption, on whatever port.
-                self.refuse(flow, "http", "clear-text")
-            elif self.decide(flow, "http"):
+                reason = "clear-text"
+            reason = reason or self.unwanted(flow.request)
+            if reason is not None:
+                self.refuse(flow, "http", reason)
+            else:
+                log("allowed", host, port, "http")
                 flow.metadata[STATE] = "plain"
                 flow.request.stream = True
         elif not flow.client_conn.tls_established:
@@ -526,6 +723,8 @@ class Broker:
             # A TRACE request asks the server to send the request back,
             # and that would include the real token.
             reason = "method-not-passed-on"
+        elif self.unwanted(request) is not None:
+            reason = self.unwanted(request)
         elif not swap.names_the_host(
             request.authority, request.headers.get_all("host"), host, port
         ):
@@ -617,6 +816,10 @@ class Broker:
         # keeps the harmless cookies of an earlier answer still works.
         request.headers.pop("cookie", None)
         request.headers.pop("proxy-authorization", None)
+        # Headers that claim the request is really for another host or has
+        # another method than it says, see swap.DROPPED_HEADERS.
+        for name in {name for name in request.headers if swap.drops_header(name)}:
+            request.headers.pop(name, None)
         # Send "GET /path", never "GET https://host/path", so that the server
         # has one place to read the host from, the Host header.
         request.authority = ""
@@ -638,11 +841,12 @@ class Broker:
 
         # Some answers do not say how long they are: they end when the
         # server closes the connection. GitHub's "Bad credentials" is one.
-        # The VM would wait for that end forever, because the closing of a
-        # connection does not get through to it: the helper that QEMU runs
-        # for each connection of the VM does not pass it on. So such an
-        # answer is sent to the VM in pieces that each state their size
-        # ("chunked"), with a last piece that marks the end.
+        # A closed connection is a poor way to tell the VM that an answer
+        # is complete: it reaches the VM a second late (see the forward in
+        # vm/default.nix), and looks the same as an answer that was cut
+        # off. So such an answer is sent to the VM in pieces that each
+        # state their size ("chunked"), with a last piece that marks the
+        # end.
         if (
             flow.request.is_http11
             and flow.request.method.upper() != "HEAD"
@@ -664,6 +868,10 @@ class Broker:
     def error(self, flow: http.HTTPFlow) -> None:
         """A request that was passed on got no answer. Say so in the log."""
         if flow.metadata.get(STATE) != "passed-on":
+            return
+        if flow.error and flow.error.msg.startswith(limits.MARK):
+            # Cut off by limits.py, which has written its own line.
+            flow.metadata[STATE] = "refused"
             return
         request = flow.request
         path, _ = swap.split_path(request.path)
@@ -770,7 +978,58 @@ class Broker:
         log("failed", host, port, "outgoing", data.server.error)
 
 
+def scrub_output(secrets: list[swap.Secret]) -> None:
+    """From here on, replace tokens in everything this process writes.
+
+    log() above already does so for the broker's own lines. But mitmproxy
+    and Python write to the same log, for example when something fails, and
+    nothing in the broker's code is passed by those lines. So the two output
+    channels of the process are each pointed at a pipe, and a small helper
+    copies what comes out of the pipe to where the output went before, with
+    tokens replaced (swap.copy_scrubbed). Nothing reaches the log unread.
+    """
+    if not secrets:
+        return
+    sys.stdout.flush()
+    sys.stderr.flush()
+    restore, helpers = [], []
+    for number in (1, 2):  # standard output and standard error
+        original = os.dup(number)
+        read_end, write_end = os.pipe()
+        os.dup2(write_end, number)
+        os.close(write_end)
+        helper = threading.Thread(
+            target=swap.copy_scrubbed, args=(read_end, original, secrets), daemon=True
+        )
+        helper.start()
+        restore.append((original, number))
+        helpers.append(helper)
+
+    def finish() -> None:
+        """At exit, let the helpers write out what they still hold."""
+        sys.stdout.flush()
+        sys.stderr.flush()
+        for original, number in restore:
+            os.dup2(original, number)  # Closes the pipe, which ends the helper.
+        for helper in helpers:
+            helper.join(2)
+
+    atexit.register(finish)
+
+
 def start() -> Broker:
+    try:
+        limits.install(limit_passed)
+    except limits.LimitsError as error:
+        print(
+            f"broker: not starting, because its limits do not fit this mitmproxy.\n"
+            f"broker: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Carrying on would mean a broker whose memory the VM can fill.
+        sys.exit(1)
+
     path = os.environ.get(RULES_ENV)
     try:
         if not path:
@@ -799,6 +1058,7 @@ def start() -> Broker:
         # then cannot log in, which fails in ways that are hard to read.
         sys.exit(1)
     _secrets.extend(tokens.values())
+    scrub_output(_secrets)
 
     log(
         "started",

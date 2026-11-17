@@ -45,6 +45,8 @@ The GitHub token is on the Mac; the VM holds a placeholder for it.
 2. **One forward leads out.** Connections to `10.0.2.100:3128`, an address
    that exists only inside the VM, are handed to the broker on the Mac's
    `localhost:8474`.
+   QEMU runs a small helper (`socat`) on the Mac for each connection, which
+   ends when either side closes, so the VM notices when the broker hangs up.
 3. **Programs are pointed at it.** The VM sets the usual proxy variables, so
    `curl`, `git`, `gh` and Claude Code send their requests to that address. A
    program that ignores the variables and connects directly gets no answer.
@@ -131,6 +133,42 @@ memory. A refused request with a large body gets its connection closed
 instead of an answer. Where the broker opens the traffic it speaks HTTP/1.1,
 because there a request says up front whether a body follows.
 
+**What the VM can make the broker hold in memory.** A hostile program in the
+VM might try to fill the Mac's memory through the broker. Three limits bound
+what it can achieve:
+
+- *Bodies* are never collected beyond 1 MiB, as described above.
+- *What comes before a request can be judged* is capped. The broker has to
+  take in a request's first lines, or the first message of an encrypted
+  connection, before it can decide anything. mitmproxy sets no limit there,
+  so [`broker/limits.py`](../broker/limits.py) adds one from the outside:
+  128 KiB of data that does not yet make up a request or an answer, and
+  64 KiB for the first encrypted message. Beyond that the connection is
+  closed. Because this changes mitmproxy's own code, the broker checks at
+  start that mitmproxy is the exact version the change was written for, and
+  refuses to start otherwise.
+- *Connections* are capped at 256 at once.
+
+Together that bounds the broker's memory at a few hundred megabytes in the
+worst case, on top of what it uses when idle (about 100 MB). It does not
+bound how much the VM can send *through* the broker to an allowed
+destination; that is traffic, not memory.
+
+**When the broker's own code fails.** mitmproxy calls the broker's code at
+fixed points and, if that code stops with an error, carries on as if it had
+agreed. For code whose job is to refuse, that would let things through. So
+every such point is wrapped: an error nobody foresaw ends with the request
+or connection refused and a `broker-error` line in the log, which names the
+kind of error and where it arose, but not its message.
+
+**Left out of requests to GitHub.** Besides cookies, the broker removes
+headers by which a request claims to be something else than its first line
+says: `X-HTTP-Method-Override` and its relatives, and `X-Forwarded-Host`,
+`Forwarded` and the like. Nothing in the VM needs them, and a later rule
+about a request's method or host should not be undone by a header. Requests
+that ask to switch to another protocol (`Upgrade`, as WebSocket does) or
+that carry lines after their body (trailers) are refused.
+
 ### Watching the traffic
 
 The broker writes one line per decision to `broker.log` in the state folder:
@@ -150,7 +188,10 @@ string, and the status of the answer:
 2026-11-16T17:01:14+01:00 refused api.github.com 443 https GET /user other-login
 ```
 
-Headers, bodies and tokens are never logged.
+Headers, bodies and tokens are never logged. As a last safeguard,
+everything the broker process writes, including what mitmproxy and Python
+write by themselves when something fails, passes through a filter that
+replaces the token before it reaches the log.
 
 ### The clock
 
@@ -202,10 +243,11 @@ and T3's data.
 - **The broker's certificate authority.** Its private key is in the state
   folder on the Mac. Whoever reads it can pose as any site towards the VM.
   Only the VM trusts it, not the Mac.
-- **A connection that ends without an answer.** The VM does not notice when
-  the broker closes a connection, because QEMU's forward does not pass that
-  on. A program whose request was cut off, such as a refused upload, may
-  wait until its own time limit.
+- **A connection that ends without an answer.** Some refusals cannot carry
+  an explanation: a request with a large body, or an encrypted connection
+  that names the wrong site, is simply closed. The program in the VM sees a
+  failed connection within about a second, and the reason is only in the
+  broker's log on the Mac.
 - **Wearing out the Mac.** QEMU starts a small helper program on the Mac for
   each connection the VM opens. A program in the VM that opens thousands at
   once can use up the processes your account may run, and slow the Mac down
@@ -243,6 +285,7 @@ GitHub is the first service. Others can be added later as new rules.
 | [`broker/proxy.py`](../broker/proxy.py) | The broker: a mitmproxy script that applies the rules |
 | [`broker/swap.py`](../broker/swap.py) | The decisions about one opened request, among them the token swap |
 | [`broker/fetch_tokens.py`](../broker/fetch_tokens.py) | Fetches the tokens before the broker starts |
+| [`broker/limits.py`](../broker/limits.py) | Limits on what a connection may send before it makes sense, added to mitmproxy from the outside |
 | [`broker/tokens.example.yaml`](../broker/tokens.example.yaml) | Example of the file on your Mac that says where each token is kept |
 | [`darwin/commands.nix`](../darwin/commands.nix) | The commands behind `nix run .#vm`, `.#stop`, `.#ssh` and the others |
 | [`darwin/default.nix`](../darwin/default.nix) | What the Mac itself needs, as a nix-darwin module |

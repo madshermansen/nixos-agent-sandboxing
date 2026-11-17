@@ -85,31 +85,45 @@ in
     sharedDirectories = lib.mkForce { };
 
     # The network is locked. The VM cannot reach the internet, the Mac, or
-    # even a name server. Only the forwards below work, and QEMU enforces
-    # this from outside the VM, so nothing inside it can lift the lock.
-    restrictNetwork = true;
-
-    forwardPorts = [
-      {
-        # The one way out: the broker on the Mac, which decides per request.
-        from = "guest";
-        guest.address = brokerAddress;
-        guest.port = brokerPort;
-        host.address = "127.0.0.1";
-        host.port = ports.broker;
-      }
-      {
-        from = "host";
-        host.address = "127.0.0.1";
-        host.port = ports.ssh;
-        guest.port = 22;
-      }
-      {
-        from = "host";
-        host.address = "127.0.0.1";
-        host.port = ports.t3;
-        guest.port = t3Port;
-      }
+    # even a name server. Only the three forwards below work, and QEMU
+    # enforces this from outside the VM, so nothing inside it can lift the
+    # lock.
+    #
+    # This is the whole of the VM's network, written out as the one option
+    # QEMU gets for it, instead of NixOS's `forwardPorts`. The reason is the
+    # way out: NixOS would run `nc` for each connection to the broker, and
+    # `nc` does not tell the VM when the broker closes a connection. A
+    # program in the VM whose request was refused then waited until its own
+    # time limit, or forever. `socat` ends when either side closes, and the
+    # VM sees that.
+    #
+    #   restrict=on  drops everything the VM sends, except to the forwards
+    #   guestfwd     the one way out: connections to the broker's address in
+    #                the VM are handed to a helper on the Mac, which passes
+    #                them to the broker on the Mac's localhost. The broker
+    #                decides per request.
+    #                  -b65536  pass data on in pieces of 64 KiB
+    #                  -t1      after one side has closed, wait a second for
+    #                           what the other side still sends, then end
+    #   hostfwd      two ports on the Mac's localhost that lead into the VM:
+    #                SSH and the T3 server
+    #
+    # No other option is read from the environment of the start command, so
+    # a variable left over in a shell cannot add a forward.
+    qemu.networkingOptions = lib.mkForce [
+      "-net nic,netdev=user.0,model=virtio"
+      (
+        "-netdev '"
+        + lib.concatStringsSep "," [
+          "user"
+          "id=user.0"
+          "restrict=on"
+          "guestfwd=tcp:${brokerAddress}:${toString brokerPort}-cmd:${hostPkgs.socat}/bin/socat -b65536 -t1 STDIO TCP:127.0.0.1:${toString ports.broker}"
+          "hostfwd=tcp:127.0.0.1:${toString ports.ssh}-:22"
+          "hostfwd=tcp:127.0.0.1:${toString ports.t3}-:${toString t3Port}"
+        ]
+        + "'"
+      )
     ];
   };
 

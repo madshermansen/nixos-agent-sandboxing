@@ -75,6 +75,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 port, cert, key, count_file = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 requests = 0
+completed = 0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -113,6 +114,12 @@ class Handler(BaseHTTPRequestHandler):
         with open(count_file, "w") as file:
             file.write(str(requests))
         size, digest = self.read_body()
+        # Counted apart: a request that was cut off half way got this far
+        # only with its first lines.
+        global completed
+        completed += 1
+        with open(count_file + ".completed", "w") as file:
+            file.write(str(completed))
         if self.path.startswith("/unframed"):
             # An answer that does not say how long it is, and ends when the
             # connection is closed. GitHub answers a wrong token this way.
@@ -138,6 +145,11 @@ class Handler(BaseHTTPRequestHandler):
                 "authorization": self.headers.get_all("Authorization", []),
                 "host": self.headers.get_all("Host", []),
                 "cookie": self.headers.get_all("Cookie", []),
+                "x_headers": sorted(
+                    name.lower()
+                    for name in self.headers.keys()
+                    if name.lower().startswith(("x-", "forwarded"))
+                ),
                 "body_size": size,
                 "body_sha256": digest,
             }
@@ -160,8 +172,163 @@ EOF
 python3 "$work/server.py" "$server_port" "$work/server.pem" "$work/server.key" "$work/count" &
 server_pid=$!
 
-# How many requests the stand-in has received so far.
+# How many requests the stand-in has received so far, and how many of them
+# it received whole.
 count() { cat "$work/count" 2>/dev/null || echo 0; }
+completed() { cat "$work/count.completed" 2>/dev/null || echo 0; }
+
+# A second mitmproxy script, loaded after the broker's, that can make the
+# broker's own code fail on demand. It breaks nothing until the file named in
+# BROKER_TEST_FAIL holds the name of a hook; then every helper that hook
+# calls raises an error. This stands in for a mistake nobody has found yet.
+cat >"$work/inject.py" <<'EOF'
+import gc, logging, os, sys
+
+CONTROL = os.environ["BROKER_TEST_FAIL"]
+
+
+def maybe_fail():
+    try:
+        hook = open(CONTROL).read().strip()
+    except OSError:
+        return
+    if hook == "scrub-probe":
+        # Write the token to the log the way mitmproxy or Python would,
+        # without the broker's code seeing the line.
+        logging.error("a line that mitmproxy wrote: made-up-token-for-the-broker-test")
+        os.write(2, b"a line written past Python: made-up-token-for-the-broker-test\n")
+        return
+    frame = sys._getframe(1)
+    while hook and frame:
+        if frame.f_code.co_name == hook and frame.f_code.co_filename.endswith("proxy.py"):
+            # The message holds what an error message must never leak.
+            raise RuntimeError("INJECTED request text, made-up-token-for-the-broker-test")
+        frame = frame.f_back
+
+
+def breakable(function):
+    def wrapper(*arguments, **named):
+        maybe_fail()
+        return function(*arguments, **named)
+
+    return wrapper
+
+
+class BreakableSet(set):
+    def __len__(self):
+        maybe_fail()
+        return super().__len__()
+
+    def __contains__(self, item):
+        maybe_fail()
+        return super().__contains__(item)
+
+
+broker = next(thing for thing in gc.get_objects() if type(thing).__name__ == "Broker")
+swap = sys.modules["swap"]
+type(broker).refusal = breakable(type(broker).refusal)
+type(broker).policy = breakable(type(broker).policy)
+swap.names_the_host = breakable(swap.names_the_host)
+swap.split_path = breakable(swap.split_path)
+broker.opening = BreakableSet()
+broker.clients = BreakableSet()
+
+# The broker has put its limits into mitmproxy by now. Doing it again must
+# be refused: the functions are no longer the ones limits.py was written
+# for, as they would not be after an update of mitmproxy.
+limits = sys.modules["limits"]
+try:
+    limits.install(lambda *arguments: None)
+    verdict = "installed over functions it does not know"
+except limits.LimitsError:
+    verdict = "refused"
+with open(CONTROL + ".limits", "w") as file:
+    file.write(verdict)
+EOF
+: >"$work/fail"
+
+# A program that speaks to the broker byte by byte, for requests that curl
+# will not send: ones that never end, or that break the rules of HTTP.
+cat >"$work/client.py" <<'EOF'
+"""client.py KIND BROKER_PORT HOST PORT CA_FILE MEGABYTES
+
+Sends one hostile request and prints what became of it: "closed after N MB"
+when the broker hung up, "answered <first line>" when it answered, "took it
+all" when it accepted everything without either.
+"""
+import socket, ssl, sys
+
+kind, broker_port, host, port, ca, megabytes = sys.argv[1:7]
+piece = b"a" * 65536
+total = int(megabytes) << 20
+
+
+def connect():
+    return socket.create_connection(("127.0.0.1", int(broker_port)), timeout=30)
+
+
+def tunnel(encrypted=True):
+    plain = connect()
+    plain.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n".encode())
+    if b" 200 " not in plain.recv(4096):
+        print("no tunnel")
+        sys.exit(2)
+    if not encrypted:
+        return plain
+    context = ssl.create_default_context(cafile=ca)
+    context.set_alpn_protocols(["http/1.1"])
+    return context.wrap_socket(plain, server_hostname=host)
+
+
+def flood(connection, start):
+    """Send `start`, then filler up to the total, and report what happened."""
+    sent = 0
+    try:
+        connection.sendall(start)
+        while sent < total:
+            connection.sendall(piece)
+            sent += len(piece)
+        connection.settimeout(5)
+        answer = connection.recv(200)
+    except (OSError, ssl.SSLError):
+        print(f"closed after {sent >> 20} MB")
+        return
+    if answer:
+        print("answered", answer.split(b"\r\n")[0].decode("latin-1"))
+    elif sent >= total:
+        print("took it all")
+    else:
+        print(f"closed after {sent >> 20} MB")
+
+
+if kind == "head":  # a header that never ends, inside an opened tunnel
+    flood(tunnel(), f"GET /a HTTP/1.1\r\nHost: {host}:{port}\r\nX-Filler: ".encode())
+elif kind == "first-line":  # a request line that never ends, inside an opened tunnel
+    flood(tunnel(), b"GET /")
+elif kind == "connect":  # a CONNECT that never ends, before any tunnel
+    flood(connect(), f"CONNECT {host}:{port} HTTP/1.1\r\nX-Filler: ".encode())
+elif kind == "plain-first-line":  # a request line that never ends, before any tunnel
+    flood(connect(), b"GET http://example.org/")
+elif kind == "chunk-size":  # a chunked body whose first size line never ends
+    flood(
+        tunnel(),
+        f"POST /a HTTP/1.1\r\nHost: {host}:{port}\r\nTransfer-Encoding: chunked\r\n\r\n".encode(),
+    )
+elif kind == "tls-hello":  # a first TLS message that claims to be 16 MiB long
+    flood(tunnel(encrypted=False), b"\x16\x03\x01\x40\x00\x01\xff\xff\xff")
+elif kind == "trailers":  # lines after a chunked body, not announced
+    connection = tunnel()
+    connection.sendall(
+        f"POST /a HTTP/1.1\r\nHost: {host}:{port}\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "5\r\nhello\r\n0\r\nX-After: the body\r\n\r\n".encode()
+    )
+    connection.settimeout(10)
+    try:
+        answer = connection.recv(200)
+    except (OSError, ssl.SSLError):
+        answer = b""
+    print("answered " + answer.split(b"\r\n")[0].decode("latin-1") if answer else "closed")
+EOF
 
 # --- The broker --------------------------------------------------------------
 
@@ -193,8 +360,8 @@ start_broker() {
   local log=$1
   shift
   env AGENT_VM_STATE="$work/state" AGENT_BROKER_RULES="$work/rules.yaml" \
-    AGENT_BROKER_TOKENS="$work/tokens.yaml" "$@" \
-    "$broker" --listen-port "$broker_port" \
+    AGENT_BROKER_TOKENS="$work/tokens.yaml" BROKER_TEST_FAIL="$work/fail" "$@" \
+    "$broker" --listen-port "$broker_port" --scripts "$work/inject.py" \
     --set ssl_verify_upstream_trusted_ca="$work/ca.pem" >"$log" 2>&1 &
   broker_pid=$!
 }
@@ -250,6 +417,16 @@ url="https://standin.localhost:$server_port"
 through() { curl -s --max-time 60 --proxy "http://127.0.0.1:$broker_port" --cacert "$ca" "$@"; }
 # field <name>: reads one field of the stand-in's report from standard input.
 field() { python3 -c 'import json, sys; print(json.dumps(json.load(sys.stdin)[sys.argv[1]]))' "$1" 2>/dev/null; }
+
+# logged <pattern>: whether the broker's log has a matching line. The log is
+# written a moment after the event, so this waits for it briefly.
+logged() {
+  for _ in $(seq 30); do
+    grep -Eq "$1" "$work/broker.log" && return 0
+    sleep 0.1
+  done
+  return 1
+}
 
 basic() { printf '%s' "$1" | base64 | tr -d '\n'; }
 real_basic="[\"Basic $(basic "x-access-token:$standin_token")\"]"
@@ -311,6 +488,50 @@ for version in --http1.1 --http2; do
     fail "$version: a small body arrives unchanged"
 done
 
+echo "Logins that are not what they should be (none may reach the stand-in):"
+
+# never_arrives <description> <curl arguments...>: the request must not arrive.
+never_arrives() {
+  local what=$1 before answer
+  shift
+  before=$(count)
+  answer=$(through --http1.1 "$@" "$url/malformed" 2>&1)
+  case "$answer" in
+    *body_sha256*)
+      fail "$what"
+      return
+      ;;
+  esac
+  [ "$(count)" = "$before" ] && pass "$what" || fail "$what"
+}
+long=$(head -c 100000 /dev/zero | tr '\0' a)
+never_arrives "a login with bytes that are not ASCII, and a cookie" \
+  -H $'Authorization: Basic \xc3\xa9' -H "Cookie: user_session=must-not-arrive"
+never_arrives "a login with other bytes that are not text" -H $'Authorization: Basic \xff\xfe\x80'
+never_arrives "a login that is not base64" -H "Authorization: Basic !!!not-base64!!!"
+never_arrives "base64 of bytes that are not text" -H "Authorization: Basic //79/A=="
+never_arrives "an empty login" -H "Authorization;"
+never_arrives "a login 100000 characters long" -H "Authorization: token $long"
+never_arrives "the placeholder followed by 100000 characters" -H "Authorization: token $placeholder$long"
+never_arrives "a login with a control character" -H $'Authorization: token a\x01b'
+never_arrives "the placeholder with a tab in it" -H $'Authorization: token nixt3-placeholder\t-not-a-real-token'
+never_arrives "the placeholder under an unknown scheme" -H "Authorization: Digest $placeholder"
+logged " refused standin.localhost $server_port https GET /malformed other-login\$" &&
+  pass "such a login is logged as refused" || fail "such a login is logged as refused"
+
+report=$(through --http1.1 -H "Authorization: token $placeholder" -H "X-HTTP-Method-Override: DELETE" \
+  -H "X-Forwarded-Host: other.example" -H "Forwarded: host=other.example" -H "X-Harmless: stays" "$url/headers")
+case "$report" in
+  *'"x_headers": ["x-harmless"]'*) pass "headers that claim another method or host are left out" ;;
+  *) fail "headers that claim another method or host are left out" ;;
+esac
+
+before=$(count)
+through --http1.1 -H "Authorization: token $placeholder" -H "Connection: Upgrade" -H "Upgrade: websocket" "$url/a" |
+  grep -q "another protocol" && [ "$(count)" = "$before" ] &&
+  pass "a request to switch to another protocol is refused" ||
+  fail "a request to switch to another protocol is refused"
+
 # The VM does not notice when a connection is closed, so an answer that ends
 # that way has to be given an end it can see.
 through --http1.1 -D - -H "Authorization: token $placeholder" "$url/unframed" >"$work/unframed" 2>&1
@@ -337,11 +558,113 @@ else
   pass "a tunnel cannot be used under another name"
 fi
 
-echo "Large bodies (the broker's memory use is measured in megabytes):"
-
 memory() { echo $(($(ps -o rss= -p "$mitm_pid") / 1024)); }
 # The broker command ends by turning into mitmdump, so the process is the same.
 mitm_pid=$broker_pid
+
+echo "When the broker's own code fails (it must refuse, not let through):"
+
+# fails_closed <hook> <yes|no: may the request reach the stand-in>: makes the
+# named hook fail, sends an ordinary request with a small body, and checks
+# that the VM got no answer from the stand-in and that the log says why.
+fails_closed() {
+  local hook=$1 may_arrive=$2 before answer
+  before=$(count)
+  echo "$hook" >"$work/fail"
+  answer=$(through --http1.1 --max-time 10 -H "Authorization: token $placeholder" --data-binary hello "$url/when-$hook-fails" 2>&1)
+  : >"$work/fail"
+  case "$answer" in
+    *body_sha256*) fail "$hook fails: the VM gets no answer" ;;
+    *) pass "$hook fails: the VM gets no answer" ;;
+  esac
+  if [ "$may_arrive" = no ]; then
+    [ "$(count)" = "$before" ] && pass "$hook fails: nothing reaches the server" ||
+      fail "$hook fails: nothing reaches the server"
+  fi
+  logged " refused [^ ]+ [0-9]+ $hook broker-error RuntimeError [a-z_.]+:[0-9]+\$" &&
+    pass "$hook fails: the log says so" || fail "$hook fails: the log says so"
+}
+fails_closed client_connected no
+fails_closed http_connect no
+fails_closed tls_clienthello no
+fails_closed tls_start_client no
+fails_closed requestheaders no
+fails_closed request no
+fails_closed server_connect no
+# By the time the answer's first lines arrive, the request has been sent.
+fails_closed responseheaders yes
+
+answer=$(through --http1.1 -H "Authorization: token $placeholder" "$url/a" | field authorization)
+[ "$answer" = "[\"token $standin_token\"]" ] &&
+  pass "afterwards the broker works as before" || fail "afterwards the broker works as before"
+if grep -q "INJECTED" "$work/broker.log"; then
+  fail "the error's message, which may hold request text, is not logged"
+else
+  pass "the error's message, which may hold request text, is not logged"
+fi
+
+echo "More than the broker takes in (each sends up to 200 MB; the broker must hang up early):"
+
+start_memory=$(memory)
+# hostile <kind> <description> <log pattern>
+hostile() {
+  local kind=$1 what=$2 pattern=$3 before outcome
+  before=$(count)
+  outcome=$(python3 "$work/client.py" "$kind" "$broker_port" standin.localhost "$server_port" "$ca" 200 2>&1)
+  case "$outcome" in
+    "closed after "[0-9]" MB" | "answered HTTP/1.1 4"*) [ "$(count)" = "$before" ] &&
+      pass "$what ($outcome)" || fail "$what (it reached the server)" ;;
+    *) fail "$what ($outcome)" ;;
+  esac
+  logged "$pattern" && pass "$what: logged" || fail "$what: logged"
+}
+hostile head "a header that never ends" " refused standin.localhost $server_port limit too-much-unread\$"
+hostile first-line "a request line that never ends" " refused standin.localhost $server_port limit too-much-unread\$"
+hostile connect "a CONNECT that never ends, before any tunnel" " refused - 0 limit too-much-unread\$"
+hostile plain-first-line "a request line that never ends, before any tunnel" " refused - 0 limit too-much-unread\$"
+hostile tls-hello "a first TLS message that never ends" " refused standin.localhost $server_port limit tls-hello-too-long\$"
+
+before=$(completed)
+outcome=$(python3 "$work/client.py" chunk-size "$broker_port" standin.localhost "$server_port" "$ca" 200 2>&1)
+case "$outcome" in
+  "closed after "[0-9]" MB") [ "$(completed)" = "$before" ] &&
+    pass "a chunk size line that never ends ($outcome)" ||
+    fail "a chunk size line that never ends (the request was completed)" ;;
+  *) fail "a chunk size line that never ends ($outcome)" ;;
+esac
+
+[ "$(cat "$work/fail.limits" 2>/dev/null)" = refused ] &&
+  pass "the limits refuse to go into a mitmproxy they were not written for" ||
+  fail "the limits refuse to go into a mitmproxy they were not written for"
+
+grown=$(($(memory) - start_memory))
+[ "$grown" -lt 30 ] &&
+  pass "the broker held none of it in memory (grew ${grown} MB, from ${start_memory} MB)" ||
+  fail "the broker held none of it in memory (grew ${grown} MB, from ${start_memory} MB)"
+
+echo "Lines after a body (trailers), which mitmproxy cannot pass on:"
+
+before=$(count)
+through --http1.1 -H "Authorization: token $placeholder" -H "Trailer: X-After" --data-binary hello "$url/a" |
+  grep -q "lines after its body" && [ "$(count)" = "$before" ] &&
+  pass "a request that announces trailers is refused before anything is sent" ||
+  fail "a request that announces trailers is refused before anything is sent"
+
+# Not announced, they show only after the body, when the request's first
+# lines and body have gone out. The request must then not be completed.
+before=$(completed)
+outcome=$(python3 "$work/client.py" trailers "$broker_port" standin.localhost "$server_port" "$ca" 1 2>&1)
+sleep 0.5
+case "$outcome" in
+  closed | "answered HTTP/1.1 4"* | "answered HTTP/1.1 5"*) [ "$(completed)" = "$before" ] &&
+    pass "a request that sends trailers unannounced is cut off, not completed ($outcome)" ||
+    fail "a request that sends trailers unannounced is cut off (the server completed it)" ;;
+  *) fail "a request that sends trailers unannounced is cut off, not completed ($outcome)" ;;
+esac
+logged " refused standin.localhost $server_port limit trailers\$" &&
+  pass "trailers are logged as refused" || fail "trailers are logged as refused"
+
+echo "Large bodies (the broker's memory use is measured in megabytes):"
 megabytes=300
 start_memory=$(memory)
 
@@ -394,11 +717,24 @@ grown=$((end_memory - start_memory))
 echo "The log:"
 
 through -H "Authorization: token $placeholder" "$url/owner/repo?search=a-private-word" >/dev/null
-sleep 0.5
 check "a request is logged with its method, path and status" \
-  grep -Eq " allowed standin.localhost $server_port https GET /owner/repo 200\$" "$work/broker.log"
+  logged " allowed standin.localhost $server_port https GET /owner/repo 200\$"
 check "a refusal is logged with its reason" \
-  grep -Eq " refused standin.localhost $server_port https GET /a other-login\$" "$work/broker.log"
+  logged " refused standin.localhost $server_port https GET /a other-login\$"
+
+# mitmproxy and Python write to the same log as the broker, without the
+# broker's code seeing the line. So everything is checked for tokens on its
+# way to the log, whoever wrote it. Here a second script writes the token
+# the way mitmproxy would write an error, and once past Python altogether.
+echo scrub-probe >"$work/fail"
+through --http1.1 "$url/a" >/dev/null
+: >"$work/fail"
+logged "a line that mitmproxy wrote: <secret>" &&
+  pass "a token in a line that mitmproxy wrote is replaced" ||
+  fail "a token in a line that mitmproxy wrote is replaced"
+logged "a line written past Python: <secret>" &&
+  pass "a token written straight to the output is replaced" ||
+  fail "a token written straight to the output is replaced"
 if grep -q "a-private-word" "$work/broker.log"; then fail "the query string is not logged"; else pass "the query string is not logged"; fi
 if grep -rq "$standin_token" "$work/broker.log" "$work/state"; then
   fail "the token is in no log and no file of the broker"

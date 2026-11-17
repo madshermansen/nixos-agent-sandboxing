@@ -6,8 +6,10 @@ They need no network, no VM and no mitmproxy. Run them from the repo with
 
 import base64
 import json
+import os
 import pathlib
 import sys
+import threading
 
 import pytest
 
@@ -90,6 +92,13 @@ def test_nothing_the_vm_sent_stays_in_gits_login():
         basic(f"someone:{PLACEHOLDER}:more"),
         basic(PLACEHOLDER),
         "Basic not-base64!",
+        "Basic \u00e9",
+        "Basic \udcc3\udca9",
+        "token \u00e9",
+        "Basic " + "A" * 100_000,
+        "token " + "a" * 100_000,
+        f"token {PLACEHOLDER}\x00",
+        f"token nixt3-placeholder\t-not-a-real-token",
         "Basic " + base64.b64encode(b"\xff\xfe:x").decode(),
         f"Digest {PLACEHOLDER}",
         f"Negotiate {PLACEHOLDER}",
@@ -122,6 +131,51 @@ def test_a_refusal_never_holds_the_token():
         assert TOKEN.reveal() not in repr(swap.swap_authorization([header], TOKEN))
 
 
+def test_no_login_makes_the_swap_fail_with_an_error():
+    """Whatever arrives, the answer is a decision, never an exception.
+
+    An exception here once let a request through unchecked, because
+    mitmproxy carries on when a hook fails.
+    """
+    odd = ["\u00e9", "\udcff", "\x00", "\x7f", " ", "\t", "=", "====", ":", "\U0001f600"]
+    for scheme in ("Basic", "basic", "token", "Bearer", "Digest", ""):
+        for value in odd + [PLACEHOLDER + extra for extra in odd]:
+            for header in (f"{scheme} {value}", f"{scheme}{value}", value):
+                result = swap.swap_authorization([header], TOKEN)
+                assert result.action in ("refuse", "swap")
+                assert result.action == "refuse" or value.strip() == PLACEHOLDER
+
+
+# --- Headers that are left out -----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "X-HTTP-Method-Override",
+        "x-http-method",
+        "X-Method-Override",
+        "X-Forwarded-Host",
+        "x-forwarded-for",
+        "X-Forwarded-Proto",
+        "Forwarded",
+        "X-Original-URL",
+        "X-Rewrite-URL",
+        "X-Host",
+        " X-Real-IP ",
+    ],
+)
+def test_headers_that_claim_another_method_or_host_are_left_out(name):
+    assert swap.drops_header(name)
+
+
+@pytest.mark.parametrize(
+    "name", ["Host", "Accept", "User-Agent", "X-GitHub-Api-Version", "Content-Type", "X-Forward"]
+)
+def test_other_headers_stay(name):
+    assert not swap.drops_header(name)
+
+
 # --- The secret wrapper ------------------------------------------------------
 
 
@@ -135,6 +189,60 @@ def test_scrub_removes_every_token():
     text = f"error near {TOKEN.reveal()} and again {TOKEN.reveal()}"
     assert swap.scrub(text, [TOKEN]) == "error near <secret> and again <secret>"
     assert swap.scrub("nothing here", [TOKEN]) == "nothing here"
+
+
+def copied(pieces: list[bytes], secrets: list[swap.Secret]) -> bytes:
+    """What copy_scrubbed() lets through of `pieces`, written one by one."""
+    source_read, source_write = os.pipe()
+    target_read, target_write = os.pipe()
+    result = bytearray()
+
+    def collect() -> None:
+        # Read while the copying goes on: a pipe holds only so much.
+        while piece := os.read(target_read, 65536):
+            result.extend(piece)
+
+    def copy() -> None:
+        swap.copy_scrubbed(source_read, target_write, secrets)
+        os.close(target_write)
+
+    helpers = [threading.Thread(target=collect), threading.Thread(target=copy)]
+    for helper in helpers:
+        helper.start()
+    for piece in pieces:
+        os.write(source_write, piece)
+    os.close(source_write)
+    for helper in helpers:
+        helper.join(10)
+        assert not helper.is_alive()
+    os.close(source_read)
+    os.close(target_read)
+    return bytes(result)
+
+
+def test_output_is_copied_with_tokens_replaced():
+    token = TOKEN.reveal().encode()
+    assert copied([b"plain line\n"], [TOKEN]) == b"plain line\n"
+    assert copied([b"a " + token + b" b\n"], [TOKEN]) == b"a <secret> b\n"
+    assert copied([b"no line break " + token], [TOKEN]) == b"no line break <secret>"
+    assert copied([], [TOKEN]) == b""
+    assert copied([b"nothing to hide\n"], []) == b"nothing to hide\n"
+
+
+def test_a_token_that_arrives_in_parts_is_replaced_too():
+    token = TOKEN.reveal().encode()
+    for cut in range(1, len(token)):
+        result = copied([b"start " + token[:cut], token[cut:] + b" end\n"], [TOKEN])
+        assert result == b"start <secret> end\n", cut
+    # Also in a line too long to be held back whole.
+    long = b"x" * 200_000
+    result = copied([long + token[:5], token[5:] + long], [TOKEN])
+    assert result == long + b"<secret>" + long
+
+
+def test_the_start_of_a_token_alone_is_let_through_at_the_end():
+    token = TOKEN.reveal().encode()
+    assert copied([b"cut off: " + token[:6]], [TOKEN]) == b"cut off: " + token[:6]
 
 
 # --- Which host a request names ----------------------------------------------

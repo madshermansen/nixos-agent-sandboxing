@@ -7,10 +7,12 @@
 # cannot do. A check that hangs counts as blocked, so each one has a time
 # limit.
 #
-# No check needs a real GitHub token. With a made-up token on the Mac, GitHub
-# answers "Bad credentials", which still shows that the broker put something
-# in place of the placeholder. tests/github-live.sh is the check that needs a
-# real one.
+# No check needs a real GitHub token. What they cannot show without one is
+# the swap itself: GitHub answers "Bad credentials" to a made-up token and to
+# the placeholder alike, so from inside the VM the two look the same. That
+# the broker puts the token in place of the placeholder is shown on the Mac,
+# by tests/github-broker.sh, where the test can see what the broker sends
+# out. tests/github-live.sh is the check that needs a real token.
 
 set -u
 
@@ -67,6 +69,51 @@ curl -sv --max-time 15 https://example.com 2>&1 | grep -q "Refused by the sandbo
 # what stops it. Without the broker's check this would get an answer.
 must_fail "a tunnel cannot be used for a different site" \
   curl -sk --max-time 15 --connect-to example.com:443:github.com:443 https://example.com
+
+# The same again, timed. When the broker refuses a connection it closes it,
+# and the VM has to notice: a program should fail at once, not wait until
+# its own time limit runs out. Status 28 is curl giving up after 15 seconds.
+curl -sk --max-time 15 --connect-to example.com:443:github.com:443 https://example.com >/dev/null 2>&1
+[ $? -ne 28 ] &&
+  pass "a refused connection is closed at once, as seen from the VM" ||
+  fail "a refused connection is closed at once, as seen from the VM"
+
+# The broker runs on the Mac, so "localhost" and 127.0.0.1 mean the Mac to
+# it. A tunnel to either would reach the Mac's own services, the broker's
+# port among them. --noproxy '' is needed because the VM is told not to use
+# the broker for such names, which would make this ask the VM itself.
+[ "$(curl --noproxy '' -s -o /dev/null --max-time 15 -w '%{http_connect}' https://127.0.0.1:8474)" = 403 ] &&
+  pass "a tunnel to the Mac's own address is refused" ||
+  fail "a tunnel to the Mac's own address is refused"
+
+[ "$(curl --noproxy '' -s -o /dev/null --max-time 15 -w '%{http_connect}' https://localhost:22)" = 403 ] &&
+  pass "a tunnel to the Mac by the name localhost is refused" ||
+  fail "a tunnel to the Mac by the name localhost is refused"
+
+# The broker goes by where a request is sent, not by the host it names.
+[ "$(curl -s -o /dev/null --max-time 15 -w '%{http_code}' -H 'Host: github.com' http://example.com/)" = 403 ] &&
+  pass "plain HTTP to an unlisted host is refused, also when it names a listed one" ||
+  fail "plain HTTP to an unlisted host is refused, also when it names a listed one"
+
+# A request whose first line never ends. The broker has to read a request's
+# first lines before it can judge it, so it must stop taking them in at some
+# point, or a program in the VM could fill the Mac's memory. This sends 2 MB
+# and passes when the broker hangs up; it fails when the broker takes it all
+# and waits for more.
+endless_request() {
+  timeout 30 bash -c '
+    address=${HTTP_PROXY#http://}
+    exec 3<>"/dev/tcp/${address%:*}/${address##*:}" || exit 3
+    printf "GET http://example.com/" >&3
+    # A failure to send means the other side has closed.
+    head -c 2000000 /dev/zero | tr "\0" a >&3 2>/dev/null || exit 0
+    # All of it was sent. An end of the connection shows as a failed read
+    # at once; a read that waits out its 10 seconds has status above 128.
+    read -r -t 10 -n 1 _ <&3
+    [ $? -le 128 ]
+  '
+}
+must_work "a request that never ends is cut off by the broker" endless_request
 
 must_work "GitHub's API answers" \
   curl -sf --max-time 15 https://api.github.com/zen
@@ -144,21 +191,32 @@ tr '\0' '\n' <"/proc/$t3_pid/environ" 2>/dev/null | grep -qx "GH_TOKEN=$placehol
   pass "the T3 server, and so each agent, has the placeholder too" ||
   fail "the T3 server, and so each agent, has the placeholder too"
 
-# GitHub tells a request without a login from one with a wrong token. So its
-# answer shows whether the broker put a token in place of the placeholder,
-# also when the token on the Mac is a made-up one.
 curl -s --max-time 15 https://api.github.com/user | grep -q "Requires authentication" &&
   pass "without a login, GitHub asks for one" ||
   fail "without a login, GitHub asks for one"
 
-# GitHub ends its answer to a wrong token by closing the connection, which
-# the VM cannot see. The broker has to mark the end, or curl waits in vain.
+# A request with the placeholder. If GitHub answers with an account, the
+# broker has put a valid token in its place: the swap works end to end.
+#
+# If GitHub answers "Bad credentials", this check shows less: only that the
+# request went out with some login and that the answer came back whole.
+# GitHub says the same to the placeholder itself, so it does not show that
+# the broker swapped anything. That is the case while the token on the Mac
+# is a made-up one; tests/github-broker.sh on the Mac shows the swap then.
+#
+# GitHub ends that answer by closing the connection instead of stating its
+# length. The broker has to mark the end for the VM, or curl gives up after
+# its time limit, which counts as a failure here.
 answer=$(curl -s --max-time 15 -H "Authorization: token $placeholder" https://api.github.com/user) ||
   answer="curl did not get a whole answer"
 case "$answer" in
-  *'"login"'*) pass "with the placeholder, the broker adds a token, and GitHub accepts it" ;;
-  *"Bad credentials"*) pass "with the placeholder, the broker adds a token (GitHub does not know it: is it a made-up one?)" ;;
-  *) fail "with the placeholder, the broker adds a token" ;;
+  *'"login"'*) pass "with the placeholder, GitHub answers as the token's account: the swap works" ;;
+  *"Bad credentials"*)
+    pass "with the placeholder, GitHub's answer arrives whole"
+    echo "  note  GitHub does not accept the token on the Mac (a made-up one?), so this"
+    echo "        does not show the swap. tests/github-broker.sh on the Mac does."
+    ;;
+  *) fail "with the placeholder, GitHub's answer arrives whole" ;;
 esac
 
 curl -s --max-time 15 -H "Authorization: token some-other-token" https://api.github.com/zen |

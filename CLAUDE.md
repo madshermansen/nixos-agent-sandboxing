@@ -39,6 +39,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `broker/proxy.py` | The broker: a mitmproxy script that applies the rules |
 | `broker/swap.py` | The decisions about one opened request, among them the token swap; no mitmproxy in it |
 | `broker/fetch_tokens.py` | Fetches the tokens before the broker starts |
+| `broker/limits.py` | Size limits that mitmproxy lacks, patched into it; tied to the exact mitmproxy version |
 | `broker/tokens.example.yaml` | Example of `~/.config/nixt3/tokens.yaml`, which says where each token is kept |
 | `darwin/commands.nix` | The Mac-side commands behind every `nix run .#…` |
 | `darwin/default.nix` | nix-darwin module for the Mac |
@@ -148,10 +149,25 @@ The reply should name Linux and the host `agent-vm`.
   when it is declared to be at most 1 MiB; everything else is passed on in
   pieces. `body_size_limit` must stay off: it cuts off a large push or
   clone before the broker's code runs.
-- **The VM does not see a connection being closed.** QEMU's forward runs
-  `nc` per connection, and `nc` does not pass a close from the broker on.
-  An answer that ends by closing the connection is therefore re-framed as
-  chunked in `proxy.py`. Keep that in mind when a program in the VM hangs.
+- **The forward to the broker runs `socat`, not `nc`.** NixOS's own
+  `forwardPorts` would run `nc` per connection, which does not pass a close
+  from the broker on to the VM; a refused program then waited out its time
+  limit. So `vm/default.nix` writes the QEMU network option out in full.
+  With `socat` the VM sees a close about a second late. An answer that ends
+  by closing the connection is still re-framed as chunked in `proxy.py`.
+- **A hook that fails must refuse.** mitmproxy carries on when a hook raises
+  an error, which for a broker means letting the request through. Every
+  hook of `Broker` is wrapped by `fail_closed` in `proxy.py`. A new hook
+  needs an entry in `ON_FAILURE` there, or the broker does not load.
+- **Updating mitmproxy stops the broker until `limits.py` is checked.** It
+  replaces three mitmproxy functions to cap what a connection may send
+  before it makes sense (request heads, the first TLS message), and
+  compares their checksums at start. After an update of `flake.lock`, read
+  the top of `broker/limits.py`.
+- **At most 256 connections at once** (`MAX_CLIENTS` in `proxy.py`). With
+  the limits above this bounds the broker's memory.
+- **Everything the broker writes passes a token filter** on its way to the
+  log, also mitmproxy's and Python's own lines (`scrub_output`).
 - **The VM trusts the broker's certificate authority,** handed over at start
   with QEMU's `-fw_cfg` and read in the VM from
   `/sys/firmware/qemu_fw_cfg/by_name/opt/nixt3/broker-ca/raw`. The trusted
