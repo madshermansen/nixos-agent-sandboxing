@@ -65,13 +65,20 @@ API_HOST = "api.github.com"
 # the largest is a pull request text, which GitHub caps at 65536 characters.
 MAX_BODY = 1024 * 1024
 
-# Limits that keep a hostile request from keeping the broker busy.
+# Limits that keep a hostile request from keeping the broker busy. The
+# GraphQL ones are about ten times what gh sends: its longest query is 3300
+# characters long and uses two fragments.
 MAX_PATH = 4096
 MAX_QUERY = 8192
-MAX_GRAPHQL = 256 * 1024
+MAX_GRAPHQL = 32 * 1024
 MAX_DEPTH = 50
-MAX_TOKENS = 100_000
+MAX_TOKENS = 20_000
 MAX_ROOT_FIELDS = 100
+MAX_OPERATIONS = 8
+MAX_FRAGMENTS = 20
+# How many fields, fragments and the like are looked at while checking one
+# GraphQL request, counting each again every time a fragment is used.
+MAX_STEPS = 50_000
 
 METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"})
 READ_METHODS = frozenset({"GET", "HEAD"})
@@ -296,10 +303,10 @@ class _Refusal(Exception):
     def __init__(self, reason: str, what: str, ask: str, *, other_way: bool = False) -> None:
         super().__init__(reason)
         # Most refusals cannot be got around, and the agent is told not to
-        # try. A few have another request that is allowed, named in `ask`.
+        # try. A few have another way that is allowed, named in `ask`.
         again = (
             "Sending this request again will\n"
-            "not help. Another request will, and it is given below.\n"
+            "not help. There is another way, and it is given below.\n"
             if other_way
             else "Trying again, or sending the same\n"
             "request in another way or with another tool, will not help.\n"
@@ -409,12 +416,13 @@ NEVER = {
     "deploy-keys": "deploy keys are out of reach of the sandbox.",
     "webhooks": "webhooks are out of reach of the sandbox.",
     "collaborators": (
-        "who has access to a repo (collaborators, invitations, teams) is out "
-        "of reach of the sandbox."
+        "who has access to a repo is out of reach of the sandbox: "
+        "collaborators, invitations, teams, and the list of who an issue "
+        "can be assigned to."
     ),
     "branch-protection": (
-        "changing branches' protection, rules or names is not allowed from "
-        "the sandbox."
+        "branches' protection and rules are out of reach of the sandbox, and "
+        "so is renaming a branch. Reading protection shows who may push."
     ),
     "releases": "creating or changing releases is not allowed from the sandbox.",
     "actions": (
@@ -431,7 +439,9 @@ NEVER = {
     ),
     "merge-api": (
         "merging branches through the API is not allowed from the sandbox. "
-        "Use git instead: merge and push."
+        "That includes bringing a pull request's branch up to date: the "
+        "branch may be in another repo, which the broker cannot see. Use git "
+        "instead: merge and push."
     ),
     "assignees": (
         "assigning issues and pull requests is not allowed from the sandbox. "
@@ -842,7 +852,6 @@ def _git(method: str, segments: list[str], query: str, policy: Policy) -> Decisi
 # `actions` is handled apart, because only some of it is readable.
 READABLE = frozenset(
     {
-        "assignees",
         "branches",
         "check-runs",
         "check-suites",
@@ -900,7 +909,6 @@ WRITABLE = {
         ("issues", "comments", "#"),
     ),
     "PUT": (
-        ("pulls", "#", "update-branch"),
         ("pulls", "#", "reviews", "#"),
         ("issues", "#", "labels"),
     ),
@@ -987,8 +995,11 @@ def _closed_area(rest: list[str]) -> str | None:
         return "deploy-keys"
     if first == "hooks":
         return "webhooks"
-    if first in ("collaborators", "invitations", "teams"):
+    if first in ("collaborators", "invitations", "teams", "assignees"):
         return "collaborators"
+    # A branch's protection names the people and teams who may push to it.
+    if first == "branches" and "protection" in rest[2:]:
+        return "branch-protection"
     return None
 
 
@@ -1019,7 +1030,7 @@ def _repo_request(method: str, rest: list[str]) -> str:
         if method == "DELETE":
             raise _never("repo-deletion")
         raise _never("repo-settings")
-    if _matches(rest, [("pulls", "#", "merge-async")]):
+    if _matches(rest, [("pulls", "#", "merge-async"), ("pulls", "#", "update-branch")]):
         raise _never("merge-api")
     if _matches(rest, [("issues", "#", "assignees")]):
         raise _never("assignees")
@@ -1058,21 +1069,21 @@ def _api(
         raise _fix("body-odd", "the body is larger than the broker reads.")
     if method in READ_METHODS and body:
         raise _fix("body-odd", f"a {method} request must not have a body.")
+    if method not in READ_METHODS and pairs:
+        # GitHub takes values from the query string on a change as well, and
+        # fills in from it what the body leaves out. The checks here read the
+        # body, so anything in the query string would go out unread.
+        raise _fix(
+            "query-odd",
+            "a request that changes something must not have a query string. "
+            "Put its values in the body.",
+        )
 
     first = segments[0] if segments else ""
 
     if first == "graphql" and len(segments) == 1:
         if method != "POST":
             raise _unknown("GraphQL requests are sent with POST.")
-        if pairs:
-            # Many servers fill in what the body leaves out from the query
-            # string. `variables` given there would be used by GitHub and
-            # never seen by the checks below, which read the body.
-            raise _fix(
-                "query-odd",
-                "a GraphQL request must not have a query string. Everything "
-                "goes in the body.",
-            )
         return _graphql(headers, body, policy)
 
     if first == "repos":
@@ -1093,6 +1104,8 @@ def _api(
             data = _json_object(headers, body)
             if any(data.get(key) for key in ("assignees", "assignee", "agent_assignment")):
                 raise _never("assignees")
+            if rest == ["pulls"] or _matches(rest, [("pulls", "#")]):
+                _pull_request_body(data, owner, policy)
             decision = replace(decision, body=_fresh(data))
         return decision
 
@@ -1340,11 +1353,26 @@ class _Spread:
 
 
 class _Inline:
-    """`... on Type { fields }`: fields that apply to one type of thing."""
+    """`... on Type { fields }`: fields that apply to one type of thing.
 
-    __slots__ = ("selections",)
+    `on` is the type's name, or None when the request gives none.
+    """
 
-    def __init__(self, selections: list) -> None:
+    __slots__ = ("on", "selections")
+
+    def __init__(self, on: str | None, selections: list) -> None:
+        self.on = on
+        self.selections = selections
+
+
+class _Fragment:
+    """`fragment name on Type { fields }`: fields under a name, used with
+    `...name` wherever they are wanted."""
+
+    __slots__ = ("on", "selections")
+
+    def __init__(self, on: str, selections: list) -> None:
+        self.on = on
         self.selections = selections
 
 
@@ -1462,9 +1490,9 @@ class _Reader:
             raise _Syntax("expected a name")
         return text
 
-    def document(self) -> tuple[list[_Operation], dict[str, list]]:
+    def document(self) -> tuple[list[_Operation], dict[str, _Fragment]]:
         operations: list[_Operation] = []
-        fragments: dict[str, list] = {}
+        fragments: dict[str, _Fragment] = {}
         while self.peek()[0] != "end":
             kind, text = self.peek()
             if (kind, text) == ("punct", "{"):
@@ -1480,16 +1508,20 @@ class _Reader:
                 name = self.name()
                 if name == "on" or self.name() != "on":
                     raise _Syntax("badly formed fragment")
-                self.name()
+                on = self.name()
                 self.directives()
                 if name in fragments:
                     raise _Syntax("two fragments with one name")
-                fragments[name] = self.selection_set(1)
+                fragments[name] = _Fragment(on, self.selection_set(1))
+                if len(fragments) > MAX_FRAGMENTS:
+                    raise _Syntax("too many fragments")
             else:
                 # Anything else that can start a definition describes a
                 # schema. A request has no business sending that.
                 raise _Syntax("not an operation or a fragment")
         names = [operation.name for operation in operations]
+        if len(operations) > MAX_OPERATIONS:
+            raise _Syntax("too many operations")
         if not operations or len(set(names)) != len(names):
             raise _Syntax("no operation, or two with one name")
         if len(operations) > 1 and None in names:
@@ -1542,11 +1574,12 @@ class _Reader:
                     selections.append(_Spread(self.name()))
                     self.directives()
                     continue
+                on = None
                 if self.peek() == ("name", "on"):
                     self.take()
-                    self.name()
+                    on = self.name()
                 self.directives()
-                selections.append(_Inline(self.selection_set(depth + 1)))
+                selections.append(_Inline(on, self.selection_set(depth + 1)))
                 continue
             name = self.name()
             if self.has(":"):
@@ -1618,63 +1651,10 @@ class _Reader:
 
 
 class _Document:
+    """A GraphQL document, read: its operations and its named fragments."""
+
     def __init__(self, text: str) -> None:
         self.operations, self.fragments = _Reader(text).document()
-        self._flat: dict[str, list[_Field]] = {}
-
-    def fields(self, selections: list) -> list[_Field]:
-        """The fields a selection asks for, with every fragment opened up.
-
-        `{ a ...F ... on T { b } }` asks for `a`, the fields of F, and `b`.
-        A check that looked only at fields written out in place would be
-        walked around by putting the field in a fragment.
-        """
-        found: dict[_Field, None] = {}
-        self._collect(selections, found, set())
-        return list(found)
-
-    def _collect(self, selections: list, found: dict[_Field, None], open_now: set[str]) -> None:
-        for selection in selections:
-            if isinstance(selection, _Field):
-                found[selection] = None
-            elif isinstance(selection, _Inline):
-                self._collect(selection.selections, found, open_now)
-            else:
-                for field in self._fragment(selection.name, open_now):
-                    found[field] = None
-
-    def _fragment(self, name: str, open_now: set[str]) -> list[_Field]:
-        if name in self._flat:
-            return self._flat[name]
-        if name not in self.fragments:
-            raise _Syntax("a fragment is used but not defined")
-        if name in open_now:
-            raise _Syntax("a fragment uses itself")
-        open_now.add(name)
-        found: dict[_Field, None] = {}
-        self._collect(self.fragments[name], found, open_now)
-        open_now.discard(name)
-        self._flat[name] = list(found)
-        return self._flat[name]
-
-    def check_fragments(self) -> None:
-        """Open every fragment once, so that one that is missing or uses
-        itself is found before any check relies on it."""
-        for name in self.fragments:
-            self._fragment(name, set())
-
-    def every_field(self) -> Iterable[_Field]:
-        """Every field anywhere in the document, at any depth."""
-        stack = [operation.selections for operation in self.operations]
-        stack.extend(self.fragments.values())
-        while stack:
-            for selection in stack.pop():
-                if isinstance(selection, _Field):
-                    yield selection
-                    if selection.selections:
-                        stack.append(selection.selections)
-                elif isinstance(selection, _Inline):
-                    stack.append(selection.selections)
 
 
 def _resolve(value: object, operation: _Operation, variables: dict[str, object]) -> object:
@@ -1713,34 +1693,505 @@ QUERY_STARTS = frozenset(
     {"repository", "node", "search", "viewer", "user", "rateLimit", "__type", "__schema", "__typename"}
 )
 
-# What may be asked about an account.
-ACCOUNT_FIELDS = frozenset({"login", "id", "databaseId", "name", "url", "__typename"})
+SEARCH_TYPES = frozenset({"ISSUE", "ISSUE_ADVANCED"})
 
-# Fields that lead from one thing to a list of other repos or gists. A query
-# that starts at a listed repo could otherwise walk on from there:
-# `repository { owner { repositories { ... } } }`. See docs/github-rules.md,
-# "What the broker cannot see or enforce": this closes the plain routes, not
-# every route.
-WALKS_AWAY = frozenset(
-    {
-        "gist",
-        "gists",
-        "organizations",
-        "pinnableItems",
-        "pinnedItems",
-        "repositories",
-        "repositoriesContributedTo",
-        "starredRepositories",
-        "topRepositories",
-        "watching",
-    }
+# What a query may ask for after its start.
+#
+# A query is a tree. `repository { pullRequest { author { login } } }` starts
+# at a repo, steps to one of its pull requests, steps on to the author, and
+# reads the author's `login`. A step is a field with braces after it; a plain
+# field has none and ends the branch.
+#
+# Checking the start is not enough, because steps lead on: from a listed repo
+# to its owner, from the owner to all the owner's repos, and from any of
+# those to its files. So every step has to be on the list below. The list
+# says, for each place a query can be, which steps may be taken from there
+# and where each one leads. A step that is not listed is refused.
+#
+# The places are named after GitHub's types, and the list is the part of
+# GitHub's data model that gh's own read commands use: it was made by
+# recording those commands and following their queries through GitHub's
+# published schema. It was then checked against that schema, step by step,
+# to lead only where it says. The script for that is not in the repo; what it
+# checked is in docs/github-rules.md.
+#
+# Six places are not one of GitHub's types but a stand-in for several, used
+# wherever a step leaves the listed repo or may leave it:
+#
+#   Account          a user, an organization, a bot, or a list of them
+#   Reviewer         who a review was asked of: an account or a team
+#   OtherRepository  any repo reached by a step: a pull request's own repo,
+#                    the repo its branch is in, a fork's parent
+#   OtherRef         a branch of such a repo
+#   Reference        an issue or pull request that another one points to,
+#                    which may be in another repo
+#   Project          a project board and what is on it; boards belong to an
+#                    account, not to the repo
+#
+# In those places only a few plain fields may be read (`ONLY` below), and
+# the steps on from them lead only to more of the same. That is what keeps a
+# query from walking through an account or a fork into another repo.
+#
+# In every other place any plain field may be read. They are all things
+# inside the listed repo, and a plain field cannot lead anywhere.
+INSIDE: dict[str, dict[str, str]] = {
+    "Account": {
+        "edges": "Account",
+        "node": "Account",
+        "nodes": "Account",
+        "pageInfo": "PageInfo",
+    },
+    "AutoMergeRequest": {
+        "enabledBy": "Account",
+    },
+    "BranchProtectionRule": {},
+    "CheckRun": {
+        "checkSuite": "CheckSuite",
+    },
+    "CheckRunStateCount": {},
+    "CheckSuite": {
+        "workflowRun": "WorkflowRun",
+    },
+    "CodeOfConduct": {},
+    "Commit": {
+        "authors": "GitActorConnection",
+        "statusCheckRollup": "StatusCheckRollup",
+    },
+    "CreatePullRequestPayload": {
+        "pullRequest": "PullRequest",
+    },
+    "FundingLink": {},
+    "GitActor": {
+        "user": "Account",
+    },
+    "GitActorConnection": {
+        "nodes": "GitActor",
+    },
+    "Issue": {
+        "assignees": "Account",
+        "author": "Account",
+        "blockedBy": "Reference",
+        "blocking": "Reference",
+        "closedByPullRequestsReferences": "Reference",
+        "comments": "IssueCommentConnection",
+        "issueType": "IssueType",
+        "labels": "LabelConnection",
+        "milestone": "Milestone",
+        "parent": "Reference",
+        "projectCards": "Project",
+        "projectItems": "Project",
+        "reactionGroups": "ReactionGroup",
+        "repository": "OtherRepository",
+        "subIssues": "Reference",
+        "subIssuesSummary": "SubIssuesSummary",
+    },
+    "IssueComment": {
+        "author": "Account",
+        "reactionGroups": "ReactionGroup",
+    },
+    "IssueCommentConnection": {
+        "nodes": "IssueComment",
+        "pageInfo": "PageInfo",
+    },
+    "IssueConnection": {
+        "nodes": "Issue",
+        "pageInfo": "PageInfo",
+    },
+    "IssueOrPullRequest": {},
+    "IssueTemplate": {},
+    "IssueType": {},
+    "Label": {},
+    "LabelConnection": {
+        "nodes": "Label",
+        "pageInfo": "PageInfo",
+    },
+    "Language": {},
+    "LanguageConnection": {
+        "edges": "LanguageEdge",
+    },
+    "LanguageEdge": {
+        "node": "Language",
+    },
+    "License": {},
+    "Milestone": {},
+    "MilestoneConnection": {
+        "nodes": "Milestone",
+    },
+    "OtherRef": {},
+    "OtherRepository": {
+        "defaultBranchRef": "OtherRef",
+        "owner": "Account",
+    },
+    "PageInfo": {},
+    "Project": {
+        "column": "Project",
+        "edges": "Project",
+        "fieldValueByName": "Project",
+        "node": "Project",
+        "nodes": "Project",
+        "pageInfo": "PageInfo",
+        "project": "Project",
+    },
+    "PullRequest": {
+        "assignees": "Account",
+        "author": "Account",
+        "autoMergeRequest": "AutoMergeRequest",
+        "baseRef": "Ref",
+        "closingIssuesReferences": "Reference",
+        "comments": "IssueCommentConnection",
+        "commits": "PullRequestCommitConnection",
+        "files": "PullRequestChangedFileConnection",
+        "headRepository": "OtherRepository",
+        "headRepositoryOwner": "Account",
+        "labels": "LabelConnection",
+        "latestReviews": "PullRequestReviewConnection",
+        "mergeCommit": "Commit",
+        "mergedBy": "Account",
+        "milestone": "Milestone",
+        "potentialMergeCommit": "Commit",
+        "projectCards": "Project",
+        "projectItems": "Project",
+        "reactionGroups": "ReactionGroup",
+        "repository": "OtherRepository",
+        "reviewRequests": "ReviewRequestConnection",
+        "reviews": "PullRequestReviewConnection",
+    },
+    "PullRequestChangedFile": {},
+    "PullRequestChangedFileConnection": {
+        "nodes": "PullRequestChangedFile",
+    },
+    "PullRequestCommit": {
+        "commit": "Commit",
+    },
+    "PullRequestCommitConnection": {
+        "nodes": "PullRequestCommit",
+    },
+    "PullRequestConnection": {
+        "edges": "PullRequestEdge",
+        "nodes": "PullRequest",
+        "pageInfo": "PageInfo",
+    },
+    "PullRequestEdge": {
+        "node": "PullRequest",
+    },
+    "PullRequestReview": {
+        "author": "Account",
+        "commit": "Commit",
+        "reactionGroups": "ReactionGroup",
+    },
+    "PullRequestReviewConnection": {
+        "nodes": "PullRequestReview",
+        "pageInfo": "PageInfo",
+    },
+    "PullRequestTemplate": {},
+    "RateLimit": {},
+    "ReactionGroup": {
+        "users": "Account",
+    },
+    "Ref": {
+        "branchProtectionRule": "BranchProtectionRule",
+    },
+    "Reference": {
+        "edges": "Reference",
+        "node": "Reference",
+        "nodes": "Reference",
+        "pageInfo": "PageInfo",
+        "repository": "OtherRepository",
+    },
+    "Release": {},
+    "ReleaseConnection": {
+        "nodes": "Release",
+        "pageInfo": "PageInfo",
+    },
+    "Repository": {
+        "codeOfConduct": "CodeOfConduct",
+        "contactLinks": "RepositoryContactLink",
+        "defaultBranchRef": "Ref",
+        "fundingLinks": "FundingLink",
+        "issue": "Issue",
+        "issueOrPullRequest": "IssueOrPullRequest",
+        "issueTemplates": "IssueTemplate",
+        "issues": "IssueConnection",
+        "labels": "LabelConnection",
+        "languages": "LanguageConnection",
+        "latestRelease": "Release",
+        "licenseInfo": "License",
+        "milestones": "MilestoneConnection",
+        "owner": "Account",
+        "parent": "OtherRepository",
+        "primaryLanguage": "Language",
+        "projects": "Project",
+        "pullRequest": "PullRequest",
+        "pullRequestTemplates": "PullRequestTemplate",
+        "pullRequests": "PullRequestConnection",
+        "releases": "ReleaseConnection",
+        "repositoryTopics": "RepositoryTopicConnection",
+        "templateRepository": "OtherRepository",
+        "watchers": "Account",
+    },
+    "RepositoryContactLink": {},
+    "RepositoryTopic": {
+        "topic": "Topic",
+    },
+    "RepositoryTopicConnection": {
+        "nodes": "RepositoryTopic",
+    },
+    "ReviewRequest": {
+        "requestedReviewer": "Reviewer",
+    },
+    "ReviewRequestConnection": {
+        "nodes": "ReviewRequest",
+    },
+    "Reviewer": {
+        "organization": "Account",
+    },
+    "SearchResultItem": {},
+    "SearchResultItemConnection": {
+        "edges": "SearchResultItemEdge",
+        "nodes": "SearchResultItem",
+        "pageInfo": "PageInfo",
+    },
+    "SearchResultItemEdge": {
+        "node": "SearchResultItem",
+    },
+    "StatusCheckRollup": {
+        "contexts": "StatusCheckRollupContextConnection",
+    },
+    "StatusCheckRollupContext": {},
+    "StatusCheckRollupContextConnection": {
+        "checkRunCountsByState": "CheckRunStateCount",
+        "nodes": "StatusCheckRollupContext",
+        "pageInfo": "PageInfo",
+        "statusContextCountsByState": "StatusContextStateCount",
+    },
+    "StatusContext": {},
+    "StatusContextStateCount": {},
+    "SubIssuesSummary": {},
+    "Topic": {},
+    "Workflow": {},
+    "WorkflowRun": {
+        "workflow": "Workflow",
+    },
+}
+
+# Introspection (`__schema`, `__type`) asks about the API, not about data.
+# Everything may be asked there.
+ANYTHING = "Anything"
+
+# The plain fields that may be read in the places that stand for something
+# outside the listed repo. In a place that is not here, all may be read.
+ACCOUNT_FIELDS = frozenset({"login", "id", "databaseId", "name", "url", "totalCount", "__typename"})
+ONLY: dict[str, frozenset[str]] = {
+    "Account": ACCOUNT_FIELDS,
+    "Reviewer": ACCOUNT_FIELDS | {"slug"},
+    "OtherRepository": frozenset(
+        {
+            "id",
+            "databaseId",
+            "name",
+            "nameWithOwner",
+            "url",
+            "sshUrl",
+            "description",
+            "isPrivate",
+            "isFork",
+            "isArchived",
+            "hasIssuesEnabled",
+            "hasWikiEnabled",
+            "viewerPermission",
+            "__typename",
+        }
+    ),
+    "OtherRef": frozenset({"id", "name", "prefix", "__typename"}),
+    "Reference": frozenset({"id", "number", "title", "url", "state", "totalCount", "__typename"}),
+    "Project": frozenset(
+        {"id", "title", "name", "number", "body", "resourcePath", "optionId", "totalCount", "__typename"}
+    ),
+    # These three can be one of several types, and have no fields of their
+    # own. What is asked of them is asked under `... on Type`, see ONE_OF.
+    "IssueOrPullRequest": frozenset({"__typename"}),
+    "SearchResultItem": frozenset({"__typename"}),
+    "StatusCheckRollupContext": frozenset({"__typename"}),
+}
+
+# Places that can be one of several types. `... on PullRequest { }` says
+# which one the fields inside are for, and moves the query to that place.
+ONE_OF: dict[str, dict[str, str]] = {
+    "IssueOrPullRequest": {"Issue": "Issue", "PullRequest": "PullRequest"},
+    "SearchResultItem": {"Issue": "Issue", "PullRequest": "PullRequest"},
+    "StatusCheckRollupContext": {"CheckRun": "CheckRun", "StatusContext": "StatusContext"},
+}
+
+# Steps that are closed in the REST API too, under the names GraphQL has for
+# them. They get the same reason as there. (They would be refused anyway,
+# for not being on the list.)
+CLOSED_FIELDS = {
+    "assignableUsers": "collaborators",
+    "collaborators": "collaborators",
+    "deployKeys": "deploy-keys",
+    "mentionableUsers": "collaborators",
+}
+
+ASK_NOT_ON_LIST = (
+    "Through GraphQL the sandbox may read what gh's own commands read about a\n"
+    "listed repo: its pull requests, issues, comments, reviews, checks,\n"
+    "labels and releases. Of other repos and of accounts it may read a name\n"
+    "and an id, and nothing beyond them. The list is `INSIDE` in\n"
+    "broker/github_policy.py of the nixt3 repo.\n"
+    "\n"
+    "The REST API reads more of a listed repo, such as files and commits:\n"
+    "\n"
+    "    gh api repos/OWNER/REPO/contents/PATH\n"
+    "    gh api repos/OWNER/REPO/commits/SHA\n"
+    "\n"
+    "If the task needs something else, tell the user what you were trying to\n"
+    "read."
 )
 
-# Parts of a repo that are closed in the REST API, under the names GraphQL
-# has for them. GraphQL has no way to read secrets or webhooks at all.
-CLOSED_FIELDS = {"collaborators": "collaborators", "deployKeys": "deploy-keys"}
 
-SEARCH_TYPES = frozenset({"ISSUE", "ISSUE_ADVANCED"})
+def _not_on_list(name: str, parent: str, place: str) -> _Refusal:
+    if name in CLOSED_FIELDS:
+        return _never(CLOSED_FIELDS[name])
+    only = ONLY.get(place)
+    what = f"the query asks for `{_show(name, 40)}` inside `{_show(parent, 40)}`"
+    if only is not None and place not in ONE_OF:
+        fields = ", ".join(f"`{field}`" for field in sorted(only - {"__typename", "totalCount"}))
+        what += f". There, only these may be read: {fields}."
+    else:
+        what += ", which is not on the list of what may be read through GraphQL."
+    return _Refusal("graphql-not-on-list", what, ASK_NOT_ON_LIST)
+
+
+class _Check:
+    """Goes through a GraphQL document and refuses what is not allowed.
+
+    Each operation is followed from its start, through every fragment it
+    uses, with the place it has reached kept track of. A fragment is looked
+    at once for each place it is used in, and nothing about it is stored
+    beyond that it was looked at, so a document cannot be made expensive by
+    nesting fragments.
+    """
+
+    def __init__(self, document: _Document, variables: dict[str, object], policy: Policy) -> None:
+        self.document = document
+        self.variables = variables
+        self.policy = policy
+        self.steps = 0
+        self.used: set[str] = set()
+        self.repos: set[str] = set()
+
+    def run(self) -> set[str]:
+        """Check every operation. Returns the listed repos they are about."""
+        for operation in self.document.operations:
+            if operation.kind == "subscription":
+                raise _unknown("GraphQL subscriptions are not passed on.")
+            self.operation = operation
+            self.starts = 0
+            self.done: set[tuple[str, str]] = set()
+            self.open: list[str] = []
+            self.start(operation.selections, 1)
+        if set(self.document.fragments) - self.used:
+            # GitHub refuses these as well. Refusing them here means that
+            # nothing in a request goes unread.
+            raise _Syntax("a fragment is defined and not used")
+        return self.repos
+
+    def step(self, depth: int) -> None:
+        self.steps += 1
+        if self.steps > MAX_STEPS or depth > MAX_DEPTH:
+            raise _Syntax("too much to check")
+
+    def fragment(self, name: str) -> _Fragment:
+        fragment = self.document.fragments.get(name)
+        if fragment is None:
+            raise _Syntax("a fragment is used but not defined")
+        if name in self.open:
+            raise _Syntax("a fragment uses itself")
+        self.used.add(name)
+        return fragment
+
+    def start(self, selections: list, depth: int) -> None:
+        """The fields an operation starts at, with fragments opened up.
+
+        `{ a ...F ... on Query { b } }` starts at `a`, at the fields of F and
+        at `b`. Looking only at fields written out in place would be walked
+        around by putting one in a fragment.
+        """
+        for selection in selections:
+            self.step(depth)
+            if isinstance(selection, _Field):
+                self.starts += 1
+                if self.starts > MAX_ROOT_FIELDS:
+                    raise _Syntax("too many starts")
+                if self.operation.kind == "mutation":
+                    repo, place = _mutation(selection, self.operation, self.variables, self.policy)
+                else:
+                    repo, place = _query_start(selection, self.operation, self.variables, self.policy)
+                if repo is not None:
+                    self.repos.add(repo.full_name)
+                self.inside(selection.selections, place, selection.name, depth + 1)
+            elif isinstance(selection, _Inline):
+                self.start(selection.selections, depth + 1)
+            else:
+                fragment = self.fragment(selection.name)
+                if (selection.name, "") not in self.done:
+                    self.done.add((selection.name, ""))
+                    self.open.append(selection.name)
+                    self.start(fragment.selections, depth + 1)
+                    self.open.pop()
+
+    def inside(self, selections: list, place: str, parent: str, depth: int) -> None:
+        """Everything asked for at one place, and at the places it leads to."""
+        for selection in selections:
+            self.step(depth)
+            if isinstance(selection, _Field):
+                if selection.selections:
+                    self.inside(
+                        selection.selections,
+                        self.step_to(place, selection.name, parent),
+                        selection.name,
+                        depth + 1,
+                    )
+                elif place != ANYTHING and selection.name != "__typename":
+                    only = ONLY.get(place)
+                    if only is not None and selection.name not in only:
+                        raise _not_on_list(selection.name, parent, place)
+            elif isinstance(selection, _Inline):
+                self.inside(selection.selections, self.narrow(place, selection.on, parent), parent, depth + 1)
+            else:
+                fragment = self.fragment(selection.name)
+                there = self.narrow(place, fragment.on, parent)
+                if (selection.name, there) not in self.done:
+                    self.done.add((selection.name, there))
+                    self.open.append(selection.name)
+                    self.inside(fragment.selections, there, parent, depth + 1)
+                    self.open.pop()
+
+    @staticmethod
+    def step_to(place: str, name: str, parent: str) -> str:
+        """Where the step `name` leads from `place`, or a refusal."""
+        if place == ANYTHING:
+            return ANYTHING
+        there = INSIDE.get(place, {}).get(name)
+        if there is None:
+            raise _not_on_list(name, parent, place)
+        return there
+
+    @staticmethod
+    def narrow(place: str, on: str | None, parent: str) -> str:
+        """The place after `... on Type`.
+
+        Only a place that can be one of several types moves. Anywhere else
+        the fields are judged by the place they are in, whatever type the
+        request claims for them, so a claim cannot unlock anything.
+        """
+        options = ONE_OF.get(place)
+        if on is None or options is None:
+            return place
+        if on not in options:
+            raise _not_on_list(f"... on {on}", parent, place)
+        return options[on]
+
 
 # The one change ("mutation") that is allowed, with the names in its input
 # that hold the id of a repo. The first must be there, and each one that is
@@ -1775,7 +2226,7 @@ BY_ID: dict[str, tuple[str, str | None]] = {
     # Pull requests.
     "updatePullRequest": (
         "`gh pr edit` sends it",
-        "gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title='TITLE' -f body='TEXT'",
+        "gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title='TITLE'",
     ),
     "closePullRequest": (
         "`gh pr close` sends it",
@@ -1785,10 +2236,7 @@ BY_ID: dict[str, tuple[str, str | None]] = {
         "`gh pr reopen` sends it",
         "gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f state=open",
     ),
-    "updatePullRequestBranch": (
-        "`gh pr update-branch` sends it",
-        "gh api -X PUT repos/OWNER/REPO/pulls/NUMBER/update-branch",
-    ),
+    "updatePullRequestBranch": ("`gh pr update-branch` sends it", None),
     "requestReviews": (
         "`gh pr edit --add-reviewer` and `gh pr create --reviewer` send it",
         "gh api repos/OWNER/REPO/pulls/NUMBER/requested_reviewers -f 'reviewers[]=LOGIN'",
@@ -1860,7 +2308,29 @@ BY_ID: dict[str, tuple[str, str | None]] = {
     "disablePullRequestAutoMerge": ("`gh pr merge --disable-auto` sends it", None),
     "enqueuePullRequest": ("", None),
 }
-MERGE_NOTE = " This one also needs\n`merge: true` on the repo in the rules."
+# More to say about some of them, after the line to run.
+BY_ID_NOTES = {
+    "updatePullRequest": (
+        " To change the\ntext, use `-f body='TEXT'`, with the title or without it. What is left\n"
+        "out stays as it is."
+    ),
+    "addReaction": (
+        " That line is for\na pull request or an issue. For a comment on one:\n"
+        "\n"
+        "    gh api repos/OWNER/REPO/issues/comments/COMMENT_ID/reactions -f content=+1\n"
+        "\n"
+        "A comment on a line of code has its own address,\n"
+        "`pulls/comments/COMMENT_ID/reactions`."
+    ),
+    "mergePullRequest": " This one also needs\n`merge: true` on the repo in the rules.",
+}
+# What to do where there is no REST request but there is another way.
+BY_ID_INSTEAD = {
+    "updatePullRequestBranch": (
+        "Do it with git instead: fetch, merge the base branch into the pull\n"
+        "request's branch, and push."
+    ),
+}
 
 # Mutations that only assign, and the names under which other mutations can
 # assign on the side. `agentAssignment` also holds the id of a repo for the
@@ -1883,12 +2353,13 @@ def _by_id(name: str) -> _Refusal:
     )
     if sent_by:
         what += f" ({sent_by}.)"
+    if name in BY_ID_INSTEAD:
+        ask = f"{WHY_NOT_BY_ID} {BY_ID_INSTEAD[name]}"
+        return _Refusal("graphql-by-id", what, ask, other_way=True)
     if call is None:
         return _Refusal("graphql-by-id", what, ASK_NO_REST)
-    note = MERGE_NOTE if name == "mergePullRequest" else ""
-    return _Refusal(
-        "graphql-by-id", what, ASK_REST.format(call=call, note=note), other_way=True
-    )
+    ask = ASK_REST.format(call=call, note=BY_ID_NOTES.get(name, ""))
+    return _Refusal("graphql-by-id", what, ask, other_way=True)
 
 
 def _malformed(what: str) -> _Refusal:
@@ -1931,45 +2402,12 @@ def _graphql(headers: dict[str, list[str]], body: bytes, policy: Policy) -> Deci
     try:
         document = _Document(text)
         picked = _pick(document, picked_name)
-        document.check_fragments()
-        roots = {
-            operation: document.fields(operation.selections)
-            for operation in document.operations
-        }
+        repo_names = _Check(document, variables, policy).run()
     except _Syntax:
         raise _malformed(
-            "the `query` text is not a GraphQL request the broker can read."
+            "the `query` text is not a GraphQL request the broker can read, "
+            "or it is far larger than the ones gh sends."
         ) from None
-
-    repo_names: set[str] = set()
-    at_start: set[_Field] = set()
-    for operation, fields in roots.items():
-        if len(fields) > MAX_ROOT_FIELDS:
-            raise _malformed("the request asks for too many things at once.")
-        at_start.update(fields)
-        if operation.kind == "subscription":
-            raise _unknown("GraphQL subscriptions are not passed on.")
-        for field in fields:
-            if operation.kind == "mutation":
-                repo = _mutation(field, operation, variables, policy)
-            else:
-                repo = _query_start(field, document, operation, variables, policy)
-            if repo is not None:
-                repo_names.add(repo.full_name)
-
-    for field in document.every_field():
-        if field in at_start:
-            continue
-        if field.name in CLOSED_FIELDS:
-            raise _never(CLOSED_FIELDS[field.name])
-        if field.name in WALKS_AWAY or (field.name == "repository" and field.arguments):
-            raise _Refusal(
-                "graphql-walks-away",
-                f"the request asks for `{_show(field.name, 40)}` inside "
-                "something else, which leads to repos or gists outside the "
-                "allowed ones.",
-                ASK_UNKNOWN,
-            )
 
     clean: dict[str, object] = {"query": text}
     if data.get("variables") is not None:
@@ -2008,11 +2446,12 @@ def _text_argument(
 
 def _query_start(
     field: _Field,
-    document: _Document,
     operation: _Operation,
     variables: dict[str, object],
     policy: Policy,
-) -> Repo | None:
+) -> tuple[Repo | None, str]:
+    """Check where a query starts. Returns the listed repo it is about, if
+    any, and the place in `INSIDE` that its fields are judged at."""
     name = field.name
     if name not in QUERY_STARTS:
         raise _Refusal(
@@ -2043,7 +2482,7 @@ def _query_start(
                 "commands use.",
                 ASK_LIST,
             )
-        return repo
+        return repo, "Repository"
 
     if name == "node":
         node_id = _resolve(field.arguments.get("id", _UNKNOWN), operation, variables)
@@ -2058,7 +2497,7 @@ def _query_start(
                 ASK_READ_BY_NAME,
                 other_way=True,
             )
-        return _listed_repo(node_id, policy)
+        return _listed_repo(node_id, policy), "Repository"
 
     if name == "search":
         kind = _resolve(field.arguments.get("type", _UNKNOWN), operation, variables)
@@ -2070,18 +2509,13 @@ def _query_start(
                 ASK_UNKNOWN,
             )
         _search(_text_argument(field, "query", operation, variables), policy)
-        return None
+        return None, "SearchResultItemConnection"
 
     if name in ("viewer", "user"):
-        for inner in document.fields(field.selections):
-            if inner.name not in ACCOUNT_FIELDS or inner.selections:
-                raise _Refusal(
-                    "graphql-account",
-                    f"under `{name}` only an account's name and id may be "
-                    f"asked for, not `{_show(inner.name, 40)}`.",
-                    ASK_UNKNOWN,
-                )
-    return None
+        return None, "Account"
+    if name == "rateLimit":
+        return None, "RateLimit"
+    return None, ANYTHING
 
 
 def _search(text: str | None, policy: Policy) -> None:
@@ -2143,7 +2577,9 @@ def _search(text: str | None, policy: Policy) -> None:
 
 def _mutation(
     field: _Field, operation: _Operation, variables: dict[str, object], policy: Policy
-) -> Repo:
+) -> tuple[Repo, str]:
+    """Check a change. Returns the listed repo it is about, and the place
+    in `INSIDE` that the fields of its answer are judged at."""
     name = field.name
     if name in ASSIGNING:
         raise _never("assignees")
@@ -2184,4 +2620,60 @@ def _mutation(
                 ASK_WRITE,
             )
         repos.append(found)
-    return repos[0]
+    # The repo is proven. The branches must be plain names, or the pull
+    # request could still take its branch from a repo that is not listed.
+    _own_branch(given.get("headRefName"), "`headRefName`")
+    _own_branch(given.get("baseRefName"), "`baseRefName`")
+    return repos[0], "CreatePullRequestPayload"
+
+
+ASK_OWN_BRANCH = (
+    "A pull request from the sandbox takes its branch from the repo it is\n"
+    "opened in, or from another repo listed with `access: write`. Push the\n"
+    "branch to a listed repo, then open the pull request with the plain name\n"
+    "of the branch."
+)
+
+
+def _own_branch(value: object, where: str) -> None:
+    """Refuse a branch name that reaches into another repo.
+
+    GitHub reads `someone:branch` as the branch in that account's fork. A
+    pull request opened that way pulls a branch of an unlisted repo into a
+    listed one, and by default gives the listed repo's maintainers the right
+    to push to that branch. Which fork it would be cannot be told from the
+    name, so the form is refused. Git does not allow a colon in a branch
+    name, so no real branch is turned away.
+    """
+    if value is None:
+        return
+    if type(value) is not str or ":" in value:
+        raise _Refusal(
+            "head-elsewhere",
+            f"{where} must be the plain name of a branch. The form "
+            "`owner:branch` names a branch in another repo, which the broker "
+            "cannot check.",
+            ASK_OWN_BRANCH,
+        )
+
+
+def _pull_request_body(data: dict[str, object], owner: str, policy: Policy) -> None:
+    """The same, for a pull request created or edited through the REST API."""
+    _own_branch(data.get("head"), "`head`")
+    _own_branch(data.get("base"), "`base`")
+    other = data.get("head_repo")
+    if other is not None:
+        # The repo the branch is in, as `name` (same owner) or `owner/name`.
+        there, slash, name = other.partition("/") if type(other) is str else ("", "", "")
+        repo = policy.find(there, name) if slash else policy.find(owner, there)
+        if type(other) is not str or repo is None or not repo.write:
+            raise _Refusal(
+                "head-elsewhere",
+                "`head_repo` names a repo that is not listed with "
+                "`access: write`, as the place the pull request's branch is "
+                "in.",
+                ASK_OWN_BRANCH,
+            )
+    if data.get("issue") is not None:
+        # Turns an existing issue into the pull request.
+        raise _never("issues")

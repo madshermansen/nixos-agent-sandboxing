@@ -21,8 +21,11 @@ anything to be allowed on the strength of it.
 
 import base64
 import json
+import re
 import shlex
 import sys
+import time
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -411,7 +414,6 @@ READS = [
     "/releases/latest",
     "/labels",
     "/milestones",
-    "/assignees",
     "/languages",
     "/tarball/main",
     "/actions/runs",
@@ -470,6 +472,16 @@ def test_reading_a_listed_repo_keeps_the_token_when_others_are_public_only():
         ("/collaborators/someone/permission", "collaborators"),
         ("/invitations", "collaborators"),
         ("/teams", "collaborators"),
+        # Who an issue can be assigned to is the list of who can push.
+        ("/assignees", "collaborators"),
+        ("/assignees/someone", "collaborators"),
+        # A branch's protection names the people and teams who may push.
+        ("/branches/main/protection", "branch-protection"),
+        ("/branches/main/protection/restrictions", "branch-protection"),
+        ("/branches/main/protection/restrictions/users", "branch-protection"),
+        ("/branches/main/protection/restrictions/teams", "branch-protection"),
+        ("/branches/main/protection/required_pull_request_reviews", "branch-protection"),
+        ("/branches/release/1.x/protection/restrictions/users", "branch-protection"),
     ],
 )
 @pytest.mark.parametrize("method", ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])
@@ -511,7 +523,6 @@ def test_parts_of_a_repo_that_are_not_on_the_reading_list(rest):
 WRITES = [
     ("POST", "/pulls"),
     ("PATCH", "/pulls/1"),
-    ("PUT", "/pulls/1/update-branch"),
     ("POST", "/pulls/1/comments"),
     ("POST", "/pulls/1/comments/5/replies"),
     ("PATCH", "/pulls/comments/5"),
@@ -616,6 +627,8 @@ def test_merging_needs_the_merge_switch():
         ("PUT", "/topics", "repo-settings"),
         ("POST", "/pages", "repo-settings"),
         ("PUT", "/environments/production", "repo-settings"),
+        # The branch it would write to may be in another repo.
+        ("PUT", "/pulls/1/update-branch", "merge-api"),
         ("POST", "/issues/7/assignees", "assignees"),
         ("DELETE", "/issues/7/assignees", "assignees"),
         # Issues are for reading and commenting.
@@ -1331,7 +1344,7 @@ def test_gh_pr_checks_reads_by_id_and_is_refused():
     # the PullRequestByNumber query in the list above.
     assert "gh pr view NUMBER --repo OWNER/REPO --json statusCheckRollup" in decision.message
     assert "`gh pr checks` reads by id and does not work here" in decision.message
-    assert "Another request will" in decision.message
+    assert "There is another way" in decision.message
     allowed(ask("GET", "api.github.com/repos/octo-org/app/pulls/7"), "api-read")
     allowed(ask("GET", "api.github.com/repos/octo-org/app/commits/0123abc/check-runs"), "api-read")
 
@@ -1534,7 +1547,7 @@ def test_the_rest_request_a_refusal_names_is_allowed_in_a_write_repo(name):
     message = refused(gql(mutation(name), {"input": dict.fromkeys(ID_KEYS, PR_ID)}), "graphql-by-id").message
     # The agent is shown this very line, and told that it is a way on.
     assert f"\n    {call}\n" in message
-    assert "Another request will" in message and "in another way or with another tool" not in message
+    assert "There is another way" in message and "in another way or with another tool" not in message
     assert "access: write" in message
 
     assert rest_call(call, "x/y")[0] != "GET"
@@ -1552,8 +1565,12 @@ def test_the_rest_request_a_refusal_names_is_allowed_in_a_write_repo(name):
 @pytest.mark.parametrize("name", WITHOUT_REST)
 def test_a_change_with_no_rest_request_says_so(name):
     message = refused(gql(mutation(name), {"input": dict.fromkeys(ID_KEYS, PR_ID)}), "graphql-by-id").message
-    assert "cannot be done from the sandbox" in message
-    assert "gh api" not in message and "Another request will" not in message
+    assert "gh api" not in message
+    if name == "updatePullRequestBranch":
+        # No REST request, but git does the same.
+        assert "Do it with git instead" in message and "There is another way" in message
+    else:
+        assert "cannot be done from the sandbox" in message and "There is another way" not in message
 
 
 def test_the_changes_a_refusal_can_point_to():
@@ -1564,12 +1581,193 @@ def test_the_changes_a_refusal_can_point_to():
         "addPullRequestReviewThreadReply", "addLabelsToLabelable", "removeLabelsFromLabelable",
         "addReaction", "removeReaction", "mergePullRequest",
     }
-    # GitHub has no REST request for these.
+    # GitHub has no REST request for these, or the one it has is refused.
     assert set(WITHOUT_REST) == {
         "markPullRequestReadyForReview", "convertPullRequestToDraft", "resolveReviewThread",
         "unresolveReviewThread", "enablePullRequestAutoMerge", "disablePullRequestAutoMerge",
-        "enqueuePullRequest",
+        "enqueuePullRequest", "updatePullRequestBranch",
     }
+
+
+def test_every_gh_api_line_in_a_refusal_is_allowed():
+    # Some refusals say more than one line: a second request, or a note.
+    lines = set()
+    for name in policy_module.BY_ID:
+        message = refused(gql(mutation(name), {"input": dict.fromkeys(ID_KEYS, PR_ID)}), "graphql-by-id").message
+        lines.update(re.findall(r"^    (gh api .+)$", message, re.MULTILINE))
+    assert len(lines) > len(WITH_REST) - 3  # two share a line, and one adds a line
+    for line in lines:
+        allowed(ask(*rest_call(line, "octo-org/shipping")), "api-write", "octo-org/shipping")
+        refused(ask(*rest_call(line, "octo-org/library")), "repo-read-only")
+        refused(ask(*rest_call(line, "other-org/public"), policy=PUBLIC), "repo-not-listed")
+
+
+def test_editing_a_pull_request_does_not_have_to_overwrite_its_text():
+    message = refused(gql(mutation("updatePullRequest"), {"input": {"pullRequestId": PR_ID}}), "graphql-by-id").message
+    # The line to run changes the title only, and the note says how to change the text.
+    assert "\n    gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title='TITLE'\n" in message
+    assert "-f body='TEXT'" in message and "What is left\nout stays as it is." in message
+    allowed(ask("PATCH", "api.github.com/repos/octo-org/app/pulls/7", {"title": "new"}), "api-write")
+    allowed(ask("PATCH", "api.github.com/repos/octo-org/app/pulls/7", {"body": "new"}), "api-write")
+
+
+def test_a_reaction_on_a_comment_has_its_own_line():
+    message = refused(gql(mutation("addReaction"), {"input": {"subjectId": claims("IC", APP)}}), "graphql-by-id").message
+    assert "\n    gh api repos/OWNER/REPO/issues/NUMBER/reactions -f content=+1\n" in message
+    assert "\n    gh api repos/OWNER/REPO/issues/comments/COMMENT_ID/reactions -f content=+1\n" in message
+    assert "pulls/comments/COMMENT_ID/reactions" in message
+    allowed(ask("POST", "api.github.com/repos/octo-org/app/pulls/comments/5/reactions", {"content": "+1"}), "api-write")
+
+
+# ---------------------------------------------------------------------------
+# Pull requests: where the branch comes from
+# ---------------------------------------------------------------------------
+#
+# A pull request may name its branch as `someone:branch`, the branch in that
+# account's fork. Opened that way it pulls a branch of an unlisted repo into
+# a listed one, and by default lets the listed repo's maintainers push to it.
+
+PULLS = "api.github.com/repos/octo-org/app/pulls"
+
+
+def test_opening_a_pull_request_with_a_plain_branch_name():
+    base = {"repositoryId": APP_ID, "baseRefName": "main", "title": "t"}
+    for branch in ("my-branch", "feature/with/slashes", "v1.2", "dependabot/npm_and_yarn/x-1.0", "refs/heads/x"):
+        allowed(gql(CREATE_PR, {"input": {**base, "headRefName": branch}}), "graphql-write", "octo-org/app")
+        allowed(ask("POST", PULLS, {"title": "t", "head": branch, "base": "main"}), "api-write", "octo-org/app")
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        "attacker:exfil",
+        "octo-org:my-branch",  # the same owner, written the cross-repo way
+        "attacker:feature/x",
+        ":exfil",
+        "attacker:",
+        ":",
+        "a:b:c",
+        ["attacker:exfil"],
+        {"ref": "exfil"},
+        5,
+        True,
+    ],
+)
+def test_a_pull_request_may_not_take_its_branch_from_someones_fork(head):
+    for extra in ({}, {"maintainerCanModify": True}, {"maintainerCanModify": False}, {"draft": True}):
+        given = {"repositoryId": APP_ID, "baseRefName": "main", "headRefName": head, "title": "t", **extra}
+        decision = refused(gql(CREATE_PR, {"input": given}), "head-elsewhere")
+        assert "Push the\nbranch to a listed repo" in decision.message
+    # Also when the repo of the branch is named as well, and is a listed one.
+    given = {"repositoryId": APP_ID, "headRepositoryId": node_id("R", SHIPPING), "headRefName": head, "title": "t"}
+    refused(gql(CREATE_PR, {"input": given}), "head-elsewhere")
+    # The same through the REST API.
+    for extra in ({}, {"maintainer_can_modify": True}, {"draft": True}):
+        refused(ask("POST", PULLS, {"title": "t", "head": head, "base": "main", **extra}), "head-elsewhere")
+
+
+def test_the_branch_a_pull_request_goes_into_is_a_plain_name_too():
+    refused(gql(CREATE_PR, {"input": {"repositoryId": APP_ID, "baseRefName": "other:main", "headRefName": "x"}}), "head-elsewhere")
+    refused(ask("POST", PULLS, {"title": "t", "head": "x", "base": "other:main"}), "head-elsewhere")
+    refused(ask("POST", PULLS, {"title": "t", "head": "x", "base": ["main"]}), "head-elsewhere")
+    # Changing it afterwards.
+    allowed(ask("PATCH", PULLS + "/7", {"base": "release"}), "api-write")
+    refused(ask("PATCH", PULLS + "/7", {"base": "other:main"}), "head-elsewhere")
+
+
+def test_a_branch_name_written_into_the_query_is_checked_too():
+    inline = 'mutation { createPullRequest(input: {repositoryId: "%s", baseRefName: "main", headRefName: "%s", title: "t"}) { clientMutationId } }'
+    allowed(gql(inline % (APP_ID, "my-branch")), "graphql-write")
+    refused(gql(inline % (APP_ID, "attacker:exfil")), "head-elsewhere")
+    refused(gql(inline % (APP_ID, "attacker\\u003aexfil")), "head-elsewhere")  # the colon as an escape
+    by_default = 'mutation($repo: ID!, $head: String = "attacker:exfil") { createPullRequest(input: {repositoryId: $repo, headRefName: $head}) { clientMutationId } }'
+    refused(gql(by_default, {"repo": APP_ID}), "head-elsewhere")
+    allowed(gql(by_default, {"repo": APP_ID, "head": "my-branch"}), "graphql-write")
+
+
+@pytest.mark.parametrize(
+    ("head_repo", "ok"),
+    [
+        ("shipping", True),  # another listed write repo of the same owner
+        ("octo-org/shipping", True),
+        ("OCTO-ORG/Shipping", True),
+        ("app", True),
+        ("library", False),  # listed, but for reading
+        ("octo-org/library", False),
+        ("attacker/other", False),
+        ("other", False),
+        ("other-org/app", False),
+        ("octo-org/shipping/x", False),
+        ("", False),
+        ("/", False),
+        (["octo-org/shipping"], False),
+        ({"name": "shipping"}, False),
+        (5, False),
+        (True, False),
+    ],
+)
+def test_the_repo_a_pull_requests_branch_is_in_must_be_a_listed_write_repo(head_repo, ok):
+    decision = ask("POST", PULLS, {"title": "t", "head": "exfil", "head_repo": head_repo, "base": "main"})
+    if ok:
+        allowed(decision, "api-write", "octo-org/app")
+    else:
+        refused(decision, "head-elsewhere")
+    allowed(ask("POST", PULLS, {"title": "t", "head": "x", "head_repo": None, "base": "main"}), "api-write")
+
+
+def test_an_issue_is_not_turned_into_a_pull_request():
+    refused(ask("POST", PULLS, {"issue": 7, "head": "my-branch", "base": "main"}), "issues")
+    allowed(ask("POST", PULLS, {"issue": None, "title": "t", "head": "my-branch", "base": "main"}), "api-write")
+
+
+def test_a_pull_requests_branch_is_brought_up_to_date_with_git():
+    # The branch may be in a fork, where this would write a commit, and
+    # nothing in the request says so.
+    for repo in ("app", "shipping"):
+        decision = refused(ask("PUT", f"api.github.com/repos/octo-org/{repo}/pulls/7/update-branch", b""), "merge-api")
+        assert "Use git instead" in decision.message
+    message = refused(gql(mutation("updatePullRequestBranch"), {"input": {"pullRequestId": PR_ID}}), "graphql-by-id").message
+    assert "merge the base branch into the pull\nrequest's branch, and push" in message
+
+
+# ---------------------------------------------------------------------------
+# A query string on a change
+# ---------------------------------------------------------------------------
+#
+# GitHub reads values from the address on a change as well as from the body.
+# The checks read the body, so anything in the query string would go out
+# unread.
+
+
+@pytest.mark.parametrize(
+    ("method", "url", "body"),
+    [
+        ("PATCH", "api.github.com/repos/octo-org/app/pulls/1?assignees[]=evil", {"title": "t"}),
+        ("PATCH", "api.github.com/repos/octo-org/app/pulls/1?base=other:main", {"title": "t"}),
+        ("POST", "api.github.com/repos/octo-org/app/pulls?head=attacker:exfil&base=main&title=t", b""),
+        ("POST", "api.github.com/repos/octo-org/app/pulls?head_repo=attacker/other", {"title": "t", "head": "x"}),
+        ("POST", "api.github.com/repos/octo-org/app/issues/1/comments?body=hello", b""),
+        ("PUT", "api.github.com/repos/octo-org/shipping/pulls/1/merge?merge_method=squash", b""),
+        ("DELETE", "api.github.com/repos/octo-org/app/issues/comments/5?x=1", b""),
+        ("DELETE", "api.github.com/repos/octo-org/app/git/refs/heads/my-branch?x", b""),
+        ("POST", "api.github.com/repos/octo-org/app/pulls?", {"title": "t"}),
+        ("POST", "api.github.com/graphql?x=1", {"query": "{ viewer { login } }"}),
+    ],
+)
+def test_a_change_must_not_have_a_query_string(method, url, body):
+    if url.endswith("?"):
+        # An empty query string holds nothing to read.
+        allowed(ask(method, url, body), "api-write")
+        return
+    decision = refused(ask(method, url, body), "query-odd")
+    assert "Put its values in the body" in decision.message
+    # Without it, each of these is a request that is allowed.
+    allowed(ask(method, url.split("?")[0], body or ({"query": "{ viewer { login } }"} if "graphql" in url else b"")))
+
+
+def test_reading_may_have_a_query_string():
+    allowed(ask("GET", "api.github.com/repos/octo-org/app/pulls?state=all&per_page=100&head=octo-org:x"), "api-read")
+    allowed(ask("HEAD", "api.github.com/repos/octo-org/app/issues?labels=bug"), "api-read")
 
 
 # ---------------------------------------------------------------------------
@@ -1684,8 +1882,17 @@ def test_a_name_spelled_with_an_escape_is_still_that_name():
     refused(ask("POST", "api.github.com/repos/octo-org/app/pulls", raw), "assignees")
 
 
-def test_reading_who_can_be_assigned_is_allowed():
-    allowed(ask("GET", "api.github.com/repos/octo-org/app/assignees"), "api-read")
+def test_reading_who_can_be_assigned_is_refused_like_collaborators():
+    refused(ask("GET", "api.github.com/repos/octo-org/app/assignees"), "collaborators")
+    refused(gql('{ repository(owner: "octo-org", name: "app") { assignableUsers(first: 100) { nodes { login } } } }'), "collaborators")
+    refused(gql('{ repository(owner: "octo-org", name: "app") { mentionableUsers(first: 100) { nodes { login } } } }'), "collaborators")
+
+
+def test_a_branch_is_readable_and_its_protection_is_not():
+    allowed(ask("GET", "api.github.com/repos/octo-org/app/branches/main"), "api-read")
+    # A branch that happens to be called "protection".
+    allowed(ask("GET", "api.github.com/repos/octo-org/app/branches/protection"), "api-read")
+    refused(ask("GET", "api.github.com/repos/octo-org/app/branches/main/protection"), "branch-protection")
 
 
 # ---------------------------------------------------------------------------
@@ -1928,7 +2135,7 @@ def test_queries_about_the_account_and_the_api(query):
     ],
 )
 def test_only_the_name_and_id_of_an_account_may_be_asked_for(query):
-    refused(gql(query), "graphql-account")
+    refused(gql(query), "graphql-not-on-list")
 
 
 def test_a_repository_must_be_named_in_plain_text():
@@ -2126,13 +2333,124 @@ def test_broken_fragments_are_refused(query):
     refused(gql(query), "graphql-malformed")
 
 
-def test_many_fragments_that_use_each_other_do_not_take_long():
+def bounded(decision_maker, seconds=1.0, megabytes=16):
+    """Run one check and make sure it stays quick and small.
+
+    It is run twice: once against the clock, and once with Python counting
+    the memory it takes, which slows it down too much to time.
+    """
+    started = time.perf_counter()
+    decision = decision_maker()
+    took = time.perf_counter() - started
+    assert took < seconds, f"took {took:.2f} s"
+    tracemalloc.start()
+    try:
+        decision_maker()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < megabytes * 1024 * 1024, f"used {peak / 1024 / 1024:.0f} MB"
+    return decision
+
+
+def test_fragments_that_use_each_other_twice_are_cheap():
     # Each fragment uses the one before it twice. Opened up naively that is
-    # two to the power of sixty fields.
+    # two to the power of nineteen fields.
     parts = ["fragment f0 on Query { __typename }"]
-    for number in range(1, 60):
+    for number in range(1, policy_module.MAX_FRAGMENTS):
         parts.append(f"fragment f{number} on Query {{ ...f{number - 1} ...f{number - 1} }}")
-    allowed(gql("query { ...f59 } " + " ".join(parts)), "graphql-read")
+    last = policy_module.MAX_FRAGMENTS - 1
+    allowed(bounded(lambda: gql(f"query {{ ...f{last} }} " + " ".join(parts))), "graphql-read")
+    # One fragment more than the limit.
+    parts.append(f"fragment f{last + 1} on Query {{ ...f{last} }}")
+    refused(bounded(lambda: gql(f"query {{ ...f{last + 1} }} " + " ".join(parts))), "graphql-malformed")
+
+
+def test_fragments_inside_a_repo_that_use_each_other_twice_are_cheap():
+    # The same, below the start: each use is in the same place, so each
+    # fragment is looked at once.
+    parts = ["fragment f0 on PullRequest { title }"]
+    for number in range(1, policy_module.MAX_FRAGMENTS):
+        parts.append(f"fragment f{number} on PullRequest {{ ...f{number - 1} number ...f{number - 1} }}")
+    last = policy_module.MAX_FRAGMENTS - 1
+    text = (IN_APP % f"pullRequest(number: 1) {{ ...f{last} }}") + " " + " ".join(parts)
+    allowed(bounded(lambda: gql(text)), "graphql-read", "octo-org/app")
+    # One refused field at the bottom is still found.
+    bad = text.replace("fragment f0 on PullRequest { title }", "fragment f0 on PullRequest { headRepository { diskUsage } }")
+    refused(bounded(lambda: gql(bad)), "graphql-not-on-list")
+
+
+def test_a_request_may_start_at_a_hundred_things_and_no_more():
+    def starts(count):
+        return "{ " + " ".join(f"a{n}: viewer {{ login }}" for n in range(count)) + " }"
+
+    assert len(starts(policy_module.MAX_ROOT_FIELDS + 1)) < policy_module.MAX_GRAPHQL
+    allowed(gql(starts(policy_module.MAX_ROOT_FIELDS)), "graphql-read")
+    refused(gql(starts(policy_module.MAX_ROOT_FIELDS + 1)), "graphql-malformed")
+
+
+def test_the_request_from_the_review_that_took_a_second_and_400_megabytes():
+    # 9000 fragments, each holding one field and the fragment before it.
+    parts = ["fragment f0 on Q{a}"] + [f"fragment f{n} on Q{{a...f{n - 1}}}" for n in range(1, 9000)]
+    text = "".join(parts) + '{repository(owner:"octo-org",name:"app"){...f8999}}'
+    assert len(text) > 250_000
+    refused(bounded(lambda: gql(text), seconds=0.5), "graphql-malformed")
+    # The same shape cut down to just under the size limit is stopped by the
+    # limit on fragments.
+    count = 800
+    text = "".join(parts[:count]) + '{repository(owner:"octo-org",name:"app"){...f%d}}' % (count - 1)
+    assert len(text) < policy_module.MAX_GRAPHQL
+    refused(bounded(lambda: gql(text), seconds=0.5), "graphql-malformed")
+
+
+def test_a_request_that_makes_the_check_repeat_itself_is_cut_off():
+    # Long fragments of plain fields, each used in many places. Every use
+    # has to be looked at, so the work is counted and capped.
+    names = " ".join(f"x{n}" for n in range(200))
+    count = policy_module.MAX_FRAGMENTS
+    fragments = " ".join(f"fragment f{n} on Node {{ {names} }}" for n in range(count))
+    spreads = " ".join(f"...f{n}" for n in range(count))
+    places = (
+        "%s pullRequest(number: 1) { %s comments(first: 1) { %s nodes { %s } } reviews(first: 1) { %s nodes { %s } }"
+        " commits(first: 1) { %s nodes { %s commit { %s statusCheckRollup { %s contexts(first: 1) { %s } } } } }"
+        " labels(first: 1) { %s nodes { %s } } milestone { %s } files(first: 1) { %s nodes { %s } } }"
+        " issue(number: 1) { %s comments(first: 1) { %s nodes { %s } } labels(first: 1) { %s } milestone { %s } }"
+        " releases(first: 1) { %s nodes { %s } } labels(first: 1) { %s nodes { %s } }"
+    )
+    text = (IN_APP % (places % ((spreads,) * places.count("%s")))) + " " + fragments
+    assert len(text) < policy_module.MAX_GRAPHQL
+    refused(bounded(lambda: gql(text)), "graphql-malformed")
+    # A tenth of it is fine, and quick.
+    small = (IN_APP % f"{spreads} pullRequest(number: 1) {{ {spreads} }}") + " " + fragments
+    allowed(bounded(lambda: gql(small)), "graphql-read")
+
+
+def test_too_many_operations_in_one_request():
+    some = " ".join(f"query Q{n} {{ viewer {{ login }} }}" for n in range(policy_module.MAX_OPERATIONS))
+    allowed(gql(some, operation="Q0"), "graphql-read")
+    refused(gql(some + " query Extra { viewer { login } }", operation="Q0"), "graphql-malformed")
+
+
+def test_a_fragment_nobody_uses_is_refused():
+    # GitHub refuses it too. Here it means nothing in a request goes unread.
+    refused(gql("{ viewer { login } } fragment unused on User { email }"), "graphql-malformed")
+    refused(
+        gql('{ viewer { login } } fragment unused on Query { repository(owner: "other-org", name: "secret") { name } }'),
+        "graphql-malformed",
+    )
+
+
+def test_every_hostile_request_in_this_file_is_checked_quickly():
+    deep = "{ " * 49 + "x" + " }" * 49
+    wide = "{ " + " ".join(f"a{n}: viewer {{ login }}" for n in range(2000)) + " }"
+    strings = '{ repository(owner: "%s", name: "app") { name } }' % ("o" * 30_000)
+    escapes = '{ repository(owner: "%s", name: "app") { name } }' % ("\\u006f" * 4_000)
+    comments = "#" + "x" * 30_000 + "\n{ viewer { login } }"
+    for text in (deep, wide, strings, escapes, comments, "{" * 30_000, "(" * 30_000, '"' * 30_001, "." * 30_000, "$a" * 15_000):
+        decision = bounded(lambda: gql(text), seconds=0.5)
+        assert decision.allowed or decision.reason in ("graphql-malformed", "repo-not-listed", "graphql-query-not-allowed")
+    variables = {"a": [[[["x"] * 10] * 10] * 10] * 10}
+    allowed(bounded(lambda: gql("{ viewer { login } }", variables)), "graphql-read")
 
 
 def test_a_default_value_is_used_only_when_no_value_is_sent():
@@ -2224,7 +2542,7 @@ def test_a_query_may_not_walk_from_a_listed_repo_to_lists_of_others(inner):
     )
     if "...walk" not in inner:
         query = query.split(" fragment walk")[0]
-    refused(gql(query), "graphql-walks-away")
+    refused(gql(query), "graphql-not-on-list")
 
 
 @pytest.mark.parametrize(
@@ -2251,19 +2569,800 @@ def test_a_change_may_not_walk_away_in_what_it_asks_back():
         "mutation($input: X!) { createPullRequest(input: $input) {"
         " pullRequest { repository { owner { repositories(first: 100) { nodes { name } } } } } } }"
     )
-    refused(gql(query, {"input": {"repositoryId": APP_ID}}), "graphql-walks-away")
+    refused(gql(query, {"input": {"repositoryId": APP_ID}}), "graphql-not-on-list")
 
 
-def test_walks_that_gh_itself_makes_are_left_alone():
-    # gh asks for a repo's parent and for a pull request's own repo.
+IN_APP = 'query { repository(owner: "octo-org", name: "app") { %s } }'
+FILE = 'object(expression: "HEAD:README.md") { ... on Blob { text } }'
+
+# Each of these starts at a listed repo and walks out of it. They came from
+# the review of this module, which found them all allowed.
+WALKS_OUT = [
+    "owner { ... on User { pullRequests(first: 100) { nodes { repository { nameWithOwner isPrivate %s } } } } }" % FILE,
+    "owner { ... on User { issues(first: 100) { nodes { body repository { nameWithOwner } } } } }",
+    "owner { ... on User { contributionsCollection { commitContributionsByRepository { repository { nameWithOwner isPrivate } } } } }",
+    'owner { ... on User { organization(login: "x") { teams(first: 10) { nodes { members { nodes { login email } } } } } } }',
+    "owner { ... on Organization { membersWithRole(first: 100) { nodes { login email } } } }",
+    "owner { repositories(first: 100) { nodes { name } } }",
+    'owner { repository(name: "secret") { name } }',
+    "forks(first: 100) { nodes { nameWithOwner %s } }" % FILE,
+    "forks(first: 100) { nodes { nameWithOwner } }",
+    "parent { %s }" % FILE,
+    "parent { forks(first: 10) { nodes { name } } }",
+    "parent { pullRequests(first: 10) { nodes { body } } }",
+    "parent { owner { repositories(first: 10) { nodes { name } } } }",
+    "parent { parent { name } }",
+    "templateRepository { %s }" % FILE,
+    "pullRequest(number: 1) { headRepository { %s } }" % FILE,
+    "pullRequest(number: 1) { headRepository { defaultBranchRef { target { ... on Commit { history(first: 10) { nodes { message } } } } } } }",
+    "pullRequest(number: 1) { baseRepository { %s } }" % FILE,
+    "pullRequest(number: 1) { repository { %s } }" % FILE,
+    "pullRequest(number: 1) { repository { pullRequests(first: 10) { nodes { body } } } }",
+    "pullRequest(number: 1) { headRef { repository { %s } } }" % FILE,
+    "pullRequest(number: 1) { author { ... on User { repositories(first: 10) { nodes { name } } } } }",
+    "pullRequest(number: 1) { author { ... on User { email } } }",
+    "pullRequest(number: 1) { closingIssuesReferences(first: 10) { nodes { body } } }",
+    "pullRequest(number: 1) { closingIssuesReferences(first: 10) { nodes { comments(first: 10) { nodes { body } } } } }",
+    "pullRequest(number: 1) { closingIssuesReferences(first: 10) { nodes { repository { %s } } } }" % FILE,
+    "pullRequest(number: 1) { timelineItems(first: 10) { nodes { ... on CrossReferencedEvent { source { ... on Issue { body } } } } } }",
+    "pullRequest(number: 1) { commits(first: 1) { nodes { commit { associatedPullRequests(first: 10) { nodes { repository { name } } } } } } }",
+    "pullRequest(number: 1) { projectItems(first: 10) { nodes { project { repositories(first: 10) { nodes { name } } } } } }",
+    "pullRequest(number: 1) { projectItems(first: 10) { nodes { project { items(first: 10) { nodes { content { ... on Issue { body } } } } } } } }",
+    "pullRequest(number: 1) { reviewRequests(first: 10) { nodes { requestedReviewer { ... on Team { members { nodes { email } } } } } } }",
+    "pullRequest(number: 1) { reviewRequests(first: 10) { nodes { requestedReviewer { ... on Team { repositories(first: 10) { nodes { name } } } } } } }",
+    "issue(number: 1) { parent { body } }",
+    "issue(number: 1) { subIssues(first: 10) { nodes { body comments(first: 10) { nodes { body } } } } }",
+    "issue(number: 1) { blockedBy(first: 10) { nodes { repository { %s } } } }" % FILE,
+    "issue(number: 1) { closedByPullRequestsReferences(first: 10) { nodes { body } } }",
+    "issue(number: 1) { repository { %s } }" % FILE,
+    "issue(number: 1) { assignees(first: 10) { nodes { repositories(first: 10) { nodes { name } } } } }",
+    "issue(number: 1) { assignees(first: 10) { nodes { email } } }",
+    "issue(number: 1) { reactionGroups { users(first: 10) { nodes { email } } } }",
+    "issue(number: 1) { comments(first: 10) { nodes { author { ... on User { gists(first: 10) { nodes { name } } } } } } }",
+    "watchers(first: 10) { nodes { repositories(first: 10) { nodes { name } } } }",
+    "stargazers(first: 10) { nodes { repositories(first: 10) { nodes { name } } } }",
+    "repositoryTopics(first: 10) { nodes { topic { repositories(first: 10) { nodes { name } } } } }",
+    # Things of the listed repo itself that gh does not read through GraphQL.
+    FILE,
+    "defaultBranchRef { target { ... on Commit { history(first: 10) { nodes { message } } } } }",
+    "collaborators(first: 10) { nodes { login } }",
+    "branchProtectionRules(first: 10) { nodes { pushAllowances(first: 10) { nodes { actor { ... on User { login } } } } } }",
+    "defaultBranchRef { branchProtectionRule { pushAllowances(first: 10) { nodes { actor { ... on User { login } } } } } }",
+    "discussions(first: 10) { nodes { body } }",
+    "environments(first: 10) { nodes { name } }",
+    "vulnerabilityAlerts(first: 10) { nodes { id } }",
+    "somethingNew { id }",
+]
+
+
+OUTSIDE = ("Account", "Reviewer", "OtherRepository", "OtherRef", "Reference", "Project")
+
+
+def test_the_steps_that_lead_out_of_the_listed_repo_are_exactly_these():
+    # Written out, so that adding one is a decision somebody makes and reads,
+    # and not a line that slips into a long table. Each leads to a place
+    # where only a few named plain fields may be read.
+    table = policy_module.INSIDE
+    leaving = sorted(
+        (place, step, there)
+        for place, steps in table.items()
+        if place not in OUTSIDE
+        for step, there in steps.items()
+        if there in OUTSIDE
+    )
+    assert leaving == [
+        ("AutoMergeRequest", "enabledBy", "Account"),
+        ("GitActor", "user", "Account"),
+        ("Issue", "assignees", "Account"),
+        ("Issue", "author", "Account"),
+        ("Issue", "blockedBy", "Reference"),
+        ("Issue", "blocking", "Reference"),
+        ("Issue", "closedByPullRequestsReferences", "Reference"),
+        ("Issue", "parent", "Reference"),
+        ("Issue", "projectCards", "Project"),
+        ("Issue", "projectItems", "Project"),
+        ("Issue", "repository", "OtherRepository"),
+        ("Issue", "subIssues", "Reference"),
+        ("IssueComment", "author", "Account"),
+        ("PullRequest", "assignees", "Account"),
+        ("PullRequest", "author", "Account"),
+        ("PullRequest", "closingIssuesReferences", "Reference"),
+        ("PullRequest", "headRepository", "OtherRepository"),
+        ("PullRequest", "headRepositoryOwner", "Account"),
+        ("PullRequest", "mergedBy", "Account"),
+        ("PullRequest", "projectCards", "Project"),
+        ("PullRequest", "projectItems", "Project"),
+        ("PullRequest", "repository", "OtherRepository"),
+        ("PullRequestReview", "author", "Account"),
+        ("ReactionGroup", "users", "Account"),
+        ("Repository", "owner", "Account"),
+        ("Repository", "parent", "OtherRepository"),
+        ("Repository", "projects", "Project"),
+        ("Repository", "templateRepository", "OtherRepository"),
+        ("Repository", "watchers", "Account"),
+        ("ReviewRequest", "requestedReviewer", "Reviewer"),
+    ]
+    # And from those places, the only steps on.
+    onward = sorted((place, step, there) for place in OUTSIDE for step, there in table[place].items())
+    assert onward == [
+        ("Account", "edges", "Account"),
+        ("Account", "node", "Account"),
+        ("Account", "nodes", "Account"),
+        ("Account", "pageInfo", "PageInfo"),
+        ("OtherRepository", "defaultBranchRef", "OtherRef"),
+        ("OtherRepository", "owner", "Account"),
+        ("Project", "column", "Project"),
+        ("Project", "edges", "Project"),
+        ("Project", "fieldValueByName", "Project"),
+        ("Project", "node", "Project"),
+        ("Project", "nodes", "Project"),
+        ("Project", "pageInfo", "PageInfo"),
+        ("Project", "project", "Project"),
+        ("Reference", "edges", "Reference"),
+        ("Reference", "node", "Reference"),
+        ("Reference", "nodes", "Reference"),
+        ("Reference", "pageInfo", "PageInfo"),
+        ("Reference", "repository", "OtherRepository"),
+        ("Reviewer", "organization", "Account"),
+    ]
+
+
+def test_the_list_has_the_size_it_had_when_it_was_checked_against_githubs_schema():
+    # A change to the list should come with a new check against the schema,
+    # as described in docs/github-rules.md.
+    table = policy_module.INSIDE
+    assert (len(table), sum(len(steps) for steps in table.values())) == (66, 130)
+
+
+@pytest.mark.parametrize("inner", WALKS_OUT)
+def test_a_query_may_not_walk_out_of_the_listed_repo(inner):
+    for used in (POLICY, PUBLIC):
+        decision = gql(IN_APP % inner, policy=used)
+        assert not decision.allowed
+        assert decision.reason in ("graphql-not-on-list", "collaborators"), decision.reason
+    # The same walk from a repo asked for by its id.
+    by_id = 'query { node(id: "%s") { ... on Repository { %s } } }' % (APP_ID, inner)
+    assert gql(by_id).reason in ("graphql-not-on-list", "collaborators")
+    # ...in a fragment, so that it is not written out in place.
+    in_fragment = 'query { repository(owner: "octo-org", name: "app") { ...f } } fragment f on Repository { %s }' % inner
+    assert gql(in_fragment).reason in ("graphql-not-on-list", "collaborators")
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [
+        "repository { owner { repositories(first: 100) { nodes { name } } } }",
+        "repository { %s }" % FILE,
+        "headRepository { %s }" % FILE,
+        "author { ... on User { repositories(first: 10) { nodes { name } } } }",
+        "closingIssuesReferences(first: 10) { nodes { body } }",
+        "commits(first: 1) { nodes { commit { tree { entries { name object { ... on Blob { text } } } } } } }",
+    ],
+)
+def test_the_answer_to_a_change_may_not_walk_out_either(inner):
+    query = "mutation($input: X!) { createPullRequest(input: $input) { pullRequest { %s } } }" % inner
+    refused(gql(query, {"input": {"repositoryId": APP_ID, "title": "t"}}), "graphql-not-on-list")
+    # What gh asks back is fine.
+    asked_back = "mutation($input: X!) { createPullRequest(input: $input) { clientMutationId pullRequest { id url number } } }"
+    allowed(gql(asked_back, {"input": {"repositoryId": APP_ID, "title": "t"}}), "graphql-write")
+
+
+def test_a_search_result_may_not_walk_out_either():
+    walk = "{ search(query: \"repo:octo-org/app is:pr\", type: ISSUE, first: 10) { nodes { ... on PullRequest { %s } } } }"
+    allowed(gql(walk % "number title headRepository { nameWithOwner } author { login }"), "graphql-read")
+    refused(gql(walk % ("headRepository { %s }" % FILE)), "graphql-not-on-list")
+    refused(gql(walk % "author { ... on User { repositories(first: 1) { nodes { name } } } }"), "graphql-not-on-list")
+    refused(gql("{ search(query: \"repo:octo-org/app\", type: ISSUE, first: 10) { nodes { ... on Repository { name } } } }"), "graphql-not-on-list")
+    refused(gql("{ search(query: \"repo:octo-org/app\", type: ISSUE, first: 10) { nodes { ... on User { email } } } }"), "graphql-not-on-list")
+
+
+def test_the_few_things_readable_of_an_account_or_another_repo():
+    # What gh's own queries read there, and no more.
     allowed(
         gql(
-            '{ repository(owner: "octo-org", name: "app") { parent { name owner { login } }'
-            " pullRequest(number: 1) { repository { name } headRepository { nameWithOwner }"
-            " baseRepository { nameWithOwner } } forkCount } }"
+            IN_APP
+            % (
+                "owner { id login ... on User { name } }"
+                " parent { id databaseId name nameWithOwner sshUrl description viewerPermission"
+                "   owner { login } defaultBranchRef { name } }"
+                " templateRepository { id name owner { id login } }"
+                " pullRequest(number: 1) {"
+                "   repository { id name nameWithOwner owner { id login } }"
+                "   headRepository { id name nameWithOwner } headRepositoryOwner { id login ... on User { name } }"
+                "   author { login ... on User { id name } } mergedBy { login }"
+                "   assignees(first: 100) { nodes { id login name databaseId } totalCount }"
+                "   reviewRequests(first: 100) { nodes { requestedReviewer { __typename ... on User { login name }"
+                "     ... on Bot { login } ... on Team { organization { login } name slug } } } }"
+                "   closingIssuesReferences(first: 100) { nodes { id number url repository { id name owner { id login } } }"
+                "     pageInfo { hasNextPage endCursor } }"
+                "   projectItems(first: 100) { totalCount nodes { id project { id title } } }"
+                "   reactionGroups { content users { totalCount } }"
+                " }"
+                " issue(number: 1) { parent { id number title url state repository { nameWithOwner } }"
+                "   subIssues(first: 100) { nodes { id number title url state repository { nameWithOwner } } totalCount } }"
+                " forkCount"
+            )
         ),
         "graphql-read",
+        "octo-org/app",
     )
+
+
+@pytest.mark.parametrize(
+    "inner",
+    [
+        "owner { email }",
+        "owner { ... on User { email bio company } }",
+        "owner { ... on Organization { description } }",
+        "parent { diskUsage }",
+        "parent { homepageUrl }",
+        "parent { defaultBranchRef { target { oid } } }",
+        "parent { defaultBranchRef { associatedPullRequests(first: 1) { nodes { title } } } }",
+        "pullRequest(number: 1) { headRepository { pushedAt } }",
+        "pullRequest(number: 1) { closingIssuesReferences(first: 1) { nodes { bodyText } } }",
+        "pullRequest(number: 1) { projectItems(first: 1) { nodes { project { readme } } } }",
+        "pullRequest(number: 1) { reviewRequests(first: 1) { nodes { requestedReviewer { ... on Team { description } } } } }",
+        # An alias that reads like an allowed field.
+        "owner { login: email }",
+        "parent { name: diskUsage }",
+    ],
+)
+def test_plain_fields_outside_the_listed_repo_are_named_one_by_one(inner):
+    decision = refused(gql(IN_APP % inner), "graphql-not-on-list")
+    assert "only these may be read" in decision.message
+
+
+def test_a_type_claimed_for_fields_does_not_unlock_them():
+    # Inside an account, saying "these are a pull request's fields" changes
+    # nothing: they are judged as an account's.
+    refused(gql(IN_APP % "owner { ... on PullRequest { body } }"), "graphql-not-on-list")
+    refused(gql(IN_APP % "owner { ... on Repository { %s } }" % FILE), "graphql-not-on-list")
+    in_fragment = 'query { repository(owner: "octo-org", name: "app") { owner { ...f } } } fragment f on Repository { diskUsage }'
+    refused(gql(in_fragment), "graphql-not-on-list")
+    refused(gql(IN_APP % "parent { ... on Issue { body } }"), "graphql-not-on-list")
+    # Where one of several types is possible, only those may be named.
+    refused(gql(IN_APP % "issueOrPullRequest(number: 1) { ... on Repository { name } }"), "graphql-not-on-list")
+    refused(gql(IN_APP % "issueOrPullRequest(number: 1) { title }"), "graphql-not-on-list")
+    allowed(gql(IN_APP % "issueOrPullRequest(number: 1) { __typename ... on Issue { title } ... on PullRequest { title } }"))
+
+
+def test_what_may_be_read_is_a_list_and_anything_else_is_refused():
+    table = policy_module.INSIDE
+    # Every place a step leads to is itself on the list.
+    for place, steps in table.items():
+        for step, there in steps.items():
+            assert there in table, (place, step, there)
+    # A step into the place where a whole repo is readable exists only at the start.
+    assert not [(place, step) for place, steps in table.items() for step, there in steps.items() if there == "Repository"]
+    # The places that stand for something outside the listed repo allow named plain fields only.
+    for place in ("Account", "Reviewer", "OtherRepository", "OtherRef", "Reference", "Project"):
+        assert place in policy_module.ONLY
+        assert policy_module.ONLY[place] <= {
+            "login", "id", "databaseId", "name", "url", "totalCount", "__typename", "slug", "nameWithOwner", "sshUrl",
+            "description", "isPrivate", "isFork", "isArchived", "hasIssuesEnabled", "hasWikiEnabled",
+            "viewerPermission", "prefix", "number", "title", "state", "body", "resourcePath", "optionId",
+        }
+    # ...and lead only to more places of that kind.
+    outside = {"Account", "Reviewer", "OtherRepository", "OtherRef", "Reference", "Project", "PageInfo"}
+    for place in outside - {"PageInfo"}:
+        assert set(table[place].values()) <= outside, place
+    # Nobody reaches an account, another repo or a reference by a step that leads to a full one.
+    for place, steps in table.items():
+        for step in ("owner", "author", "mergedBy", "enabledBy", "headRepositoryOwner", "user", "users", "assignees", "watchers"):
+            assert steps.get(step, "Account") == "Account", (place, step)
+        for step in ("parent", "headRepository", "baseRepository", "templateRepository", "forks"):
+            if place == "Issue" and step == "parent":
+                assert steps[step] == "Reference"
+            else:
+                assert steps.get(step, "OtherRepository") == "OtherRepository", (place, step)
+        if place != "Repository":
+            assert "repository" not in steps or steps["repository"] == "OtherRepository"
+
+
+# ---------------------------------------------------------------------------
+# GraphQL: every query gh was recorded sending
+# ---------------------------------------------------------------------------
+#
+# Recorded with GH_DEBUG=api from gh 2.102, whole, by running each command
+# against one repo. Only the repo's name is changed. `--json (every field)`
+# stands for the full list of fields the command offers.
+#
+# This is the other half of the list of what may be read: the list keeps
+# queries from walking out of the repo, and these keep it from being so short
+# that gh stops working.
+
+RECORDED = [
+    (
+        'gh pr view 2 --json (every field)',
+        {'owner': 'octo-org', 'pr_number': 2, 'repo': 'app'},
+        r"""query PullRequestByNumber($owner: String!, $repo: String!, $pr_number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $pr_number) {additions,assignees(first:100){nodes{id,login,name,databaseId},totalCount},author{login,...on User{id,name}},autoMergeRequest {authorEmail,commitBody,commitHeadline,mergeMethod,enabledAt,enabledBy{login,...on User{id,name}}},baseRefName,baseRefOid,body,changedFiles,closed,closedAt,closingIssuesReferences(first: 100) {nodes {id,number,url,repository {id,name,owner {id,login}}}pageInfo{hasNextPage,endCursor}},comments(first: 100) {nodes {id,author{login,...on User{id,name}},authorAssociation,body,createdAt,includesCreatedEdit,isMinimized,minimizedReason,reactionGroups{content,users{totalCount}},url,viewerDidAuthor},pageInfo{hasNextPage,endCursor},totalCount},commits(first: 100) {nodes {commit {authors(first:100) {nodes {name,email,user{id,login}}},messageHeadline,messageBody,oid,committedDate,authoredDate}}},createdAt,deletions,files(first: 100) {nodes {additions,deletions,path,changeType}},fullDatabaseId,headRefName,headRefOid,headRepository{id,name,nameWithOwner},headRepositoryOwner{id,login,...on User{name}},id,isCrossRepository,isDraft,labels(first:100){nodes{id,name,description,color},totalCount},latestReviews(first: 100) {nodes {author{login},authorAssociation,submittedAt,body,state}},maintainerCanModify,mergeCommit{oid},mergeStateStatus,mergeable,mergedAt,mergedBy{login,...on User{id,name}},milestone{number,title,description,dueOn},number,potentialMergeCommit{oid},reactionGroups{content,users{totalCount}},reviewDecision,reviewRequests(first: 100) {nodes {requestedReviewer {__typename,...on User{login,name},...on Bot{login},...on Team{organization{login}name,slug}}}},reviews(first: 100) {nodes {id,author{login},authorAssociation,submittedAt,body,state,commit{oid},reactionGroups{content,users{totalCount}}}pageInfo{hasNextPage,endCursor}totalCount},state,statusCheckRollup: commits(last: 1) {nodes {commit {statusCheckRollup {contexts(first:100) {nodes {__typename...on StatusContext {context,state,targetUrl,createdAt,description},...on CheckRun {name,checkSuite{workflowRun{workflow{name}}},status,conclusion,startedAt,completedAt,detailsUrl}},pageInfo{hasNextPage,endCursor}}}}}},title,updatedAt,url}
+    }
+  }""",
+    ),
+    (
+        'gh pr view 2 --json (every field)',
+        {'endCursor': None, 'name': 'app', 'number': 2, 'owner': 'octo-org'},
+        r"""query PullRequestProjectItems($endCursor:String$name:String!$number:Int!$owner:String!){repository(owner: $owner, name: $name){pullRequest(number: $number){projectItems(first: 100, after: $endCursor){totalCount,nodes{id,project{id,title},status:fieldValueByName(name: "Status"){... on ProjectV2ItemFieldSingleSelectValue{optionId,name}}},pageInfo{hasNextPage,endCursor}}}}}""",
+    ),
+    (
+        'gh pr view 2',
+        {'owner': 'octo-org', 'pr_number': 2, 'repo': 'app'},
+        r"""query PullRequestByNumber($owner: String!, $repo: String!, $pr_number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $pr_number) {url,number,title,state,body,author{login,...on User{id,name}},autoMergeRequest {authorEmail,commitBody,commitHeadline,mergeMethod,enabledAt,enabledBy{login,...on User{id,name}}},isDraft,maintainerCanModify,mergeable,additions,deletions,commits{totalCount},baseRefName,headRefName,headRepositoryOwner{id,login,...on User{name}},headRepository{id,name,nameWithOwner},isCrossRepository,reviewRequests(first: 100) {nodes {requestedReviewer {__typename,...on User{login,name},...on Bot{login},...on Team{organization{login}name,slug}}}},reviews(first: 100) {nodes {id,author{login},authorAssociation,submittedAt,body,state,commit{oid},reactionGroups{content,users{totalCount}}}pageInfo{hasNextPage,endCursor}totalCount},assignees(first:100){nodes{id,login,name,databaseId},totalCount},labels(first:100){nodes{id,name,description,color},totalCount},milestone{number,title,description,dueOn},comments(first: 100) {nodes {id,author{login,...on User{id,name}},authorAssociation,body,createdAt,includesCreatedEdit,isMinimized,minimizedReason,reactionGroups{content,users{totalCount}},url,viewerDidAuthor},pageInfo{hasNextPage,endCursor},totalCount},reactionGroups{content,users{totalCount}},createdAt,statusCheckRollup: commits(last: 1) {nodes {commit {statusCheckRollup {contexts(first:100) {nodes {__typename...on StatusContext {context,state,targetUrl,createdAt,description},...on CheckRun {name,checkSuite{workflowRun{workflow{name}}},status,conclusion,startedAt,completedAt,detailsUrl}},pageInfo{hasNextPage,endCursor}}}}}},id}
+    }
+  }""",
+    ),
+    (
+        'gh pr view phase-5-github-policy',
+        {'headRefName': 'phase-5-github-policy', 'owner': 'octo-org', 'repo': 'app', 'states': None},
+        r"""query PullRequestForBranch($owner: String!, $repo: String!, $headRefName: String!, $states: [PullRequestState!]) {
+    repository(owner: $owner, name: $repo) {
+      pullRequests(headRefName: $headRefName, states: $states, first: 30, orderBy: { field: CREATED_AT, direction: DESC }) {
+        nodes {url,number,title,state,body,author{login,...on User{id,name}},autoMergeRequest {authorEmail,commitBody,commitHeadline,mergeMethod,enabledAt,enabledBy{login,...on User{id,name}}},isDraft,maintainerCanModify,mergeable,additions,deletions,commits{totalCount},baseRefName,headRefName,headRepositoryOwner{id,login,...on User{name}},headRepository{id,name,nameWithOwner},isCrossRepository,reviewRequests(first: 100) {nodes {requestedReviewer {__typename,...on User{login,name},...on Bot{login},...on Team{organization{login}name,slug}}}},reviews(first: 100) {nodes {id,author{login},authorAssociation,submittedAt,body,state,commit{oid},reactionGroups{content,users{totalCount}}}pageInfo{hasNextPage,endCursor}totalCount},assignees(first:100){nodes{id,login,name,databaseId},totalCount},labels(first:100){nodes{id,name,description,color},totalCount},milestone{number,title,description,dueOn},comments(first: 100) {nodes {id,author{login,...on User{id,name}},authorAssociation,body,createdAt,includesCreatedEdit,isMinimized,minimizedReason,reactionGroups{content,users{totalCount}},url,viewerDidAuthor},pageInfo{hasNextPage,endCursor},totalCount},reactionGroups{content,users{totalCount}},createdAt,statusCheckRollup: commits(last: 1) {nodes {commit {statusCheckRollup {contexts(first:100) {nodes {__typename...on StatusContext {context,state,targetUrl,createdAt,description},...on CheckRun {name,checkSuite{workflowRun{workflow{name}}},status,conclusion,startedAt,completedAt,detailsUrl}},pageInfo{hasNextPage,endCursor}}}}}},id}
+      }
+      defaultBranchRef { name }
+    }
+  }""",
+    ),
+    (
+        'gh pr list --state all --json (every field)',
+        {'limit': 30, 'owner': 'octo-org', 'repo': 'app', 'state': ['OPEN', 'CLOSED', 'MERGED']},
+        r"""fragment pr on PullRequest{additions,assignees(first:100){nodes{id,login,name,databaseId},totalCount},author{login,...on User{id,name}},autoMergeRequest {authorEmail,commitBody,commitHeadline,mergeMethod,enabledAt,enabledBy{login,...on User{id,name}}},baseRefName,baseRefOid,body,changedFiles,closed,closedAt,closingIssuesReferences(first: 100) {nodes {id,number,url,repository {id,name,owner {id,login}}}pageInfo{hasNextPage,endCursor}},comments(first: 100) {nodes {id,author{login,...on User{id,name}},authorAssociation,body,createdAt,includesCreatedEdit,isMinimized,minimizedReason,reactionGroups{content,users{totalCount}},url,viewerDidAuthor},pageInfo{hasNextPage,endCursor},totalCount},commits(first: 100) {nodes {commit {authors(first:100) {nodes {name,email,user{id,login}}},messageHeadline,messageBody,oid,committedDate,authoredDate}}},createdAt,deletions,files(first: 100) {nodes {additions,deletions,path,changeType}},fullDatabaseId,headRefName,headRefOid,headRepository{id,name,nameWithOwner},headRepositoryOwner{id,login,...on User{name}},id,isCrossRepository,isDraft,labels(first:100){nodes{id,name,description,color},totalCount},latestReviews(first: 100) {nodes {author{login},authorAssociation,submittedAt,body,state}},maintainerCanModify,mergeCommit{oid},mergeStateStatus,mergeable,mergedAt,mergedBy{login,...on User{id,name}},milestone{number,title,description,dueOn},number,potentialMergeCommit{oid},projectCards(first:100){nodes{project{name}column{name}},totalCount},projectItems(first:100){nodes{id, project{id,title}, status:fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue{optionId,name}}},totalCount},reactionGroups{content,users{totalCount}},reviewDecision,reviewRequests(first: 100) {nodes {requestedReviewer {__typename,...on User{login,name},...on Bot{login},...on Team{organization{login}name,slug}}}},reviews(first: 100) {nodes {id,author{login},authorAssociation,submittedAt,body,state,commit{oid},reactionGroups{content,users{totalCount}}}pageInfo{hasNextPage,endCursor}totalCount},state,statusCheckRollup: commits(last: 1) {nodes {commit {statusCheckRollup {contexts(first:100) {nodes {__typename...on StatusContext {context,state,targetUrl,createdAt,description},...on CheckRun {name,checkSuite{workflowRun{workflow{name}}},status,conclusion,startedAt,completedAt,detailsUrl}},pageInfo{hasNextPage,endCursor}}}}}},title,updatedAt,url}
+    query PullRequestList(
+      $owner: String!,
+      $repo: String!,
+      $limit: Int!,
+      $endCursor: String,
+      $baseBranch: String,
+      $headBranch: String,
+      $state: [PullRequestState!] = OPEN
+    ) {
+      repository(owner: $owner, name: $repo) {
+        pullRequests(
+          states: $state,
+          baseRefName: $baseBranch,
+          headRefName: $headBranch,
+          first: $limit,
+          after: $endCursor,
+          orderBy: {field: CREATED_AT, direction: DESC}
+        ) {
+          totalCount
+          nodes {
+            ...pr
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    }""",
+    ),
+    (
+        'gh pr list',
+        {'limit': 30, 'owner': 'octo-org', 'repo': 'app', 'state': ['OPEN']},
+        r"""fragment pr on PullRequest{number,title,state,url,headRefName,headRepositoryOwner{id,login,...on User{name}},isCrossRepository,isDraft,createdAt}
+    query PullRequestList(
+      $owner: String!,
+      $repo: String!,
+      $limit: Int!,
+      $endCursor: String,
+      $baseBranch: String,
+      $headBranch: String,
+      $state: [PullRequestState!] = OPEN
+    ) {
+      repository(owner: $owner, name: $repo) {
+        pullRequests(
+          states: $state,
+          baseRefName: $baseBranch,
+          headRefName: $headBranch,
+          first: $limit,
+          after: $endCursor,
+          orderBy: {field: CREATED_AT, direction: DESC}
+        ) {
+          totalCount
+          nodes {
+            ...pr
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    }""",
+    ),
+    (
+        'gh pr list --search lock --state all',
+        None,
+        r"""query SearchType_enumValues{SearchType: __type(name: "SearchType"){enumValues(includeDeprecated: true){name}}}""",
+    ),
+    (
+        'gh pr list --search lock --state all',
+        {'limit': 30, 'q': '( lock ) repo:octo-org/app type:pr', 'type': 'ISSUE_ADVANCED'},
+        r"""fragment pr on PullRequest{number,title,state,url,headRefName,headRepositoryOwner{id,login,...on User{name}},isCrossRepository,isDraft,createdAt}
+    query PullRequestSearch(
+      $q: String!,
+      $type: SearchType!,
+      $limit: Int!,
+      $endCursor: String,
+    ) {
+      search(query: $q, type: $type, first: $limit, after: $endCursor) {
+        issueCount
+        nodes {
+          ...pr
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }""",
+    ),
+    (
+        'gh pr status',
+        {'headRefName': '', 'number': 0, 'owner': 'octo-org', 'repo': 'app', 'reviewerQuery': 'repo:octo-org/app state:open review-requested:@me', 'viewerQuery': 'repo:octo-org/app state:open is:pr author:@me'},
+        r"""fragment pr on PullRequest {number,title,state,url,isDraft,isCrossRepository,headRefName,headRepositoryOwner{id,login,...on User{name}},mergeStateStatus,baseRef{branchProtectionRule{requiresStrictStatusChecks}},autoMergeRequest {authorEmail,commitBody,commitHeadline,mergeMethod,enabledAt,enabledBy{login,...on User{id,name}}},statusCheckRollup: commits(last: 1) {nodes {commit {statusCheckRollup {contexts {checkRunCount,checkRunCountsByState {state,count},statusContextCount,statusContextCountsByState {state,count}}}}}}}
+  fragment prWithReviews on PullRequest {...pr,reviewDecision,latestReviews(first: 100) {nodes {author{login},authorAssociation,submittedAt,body,state}}}
+
+  query PullRequestStatus($owner: String!, $repo: String!, $headRefName: String!, $viewerQuery: String!, $reviewerQuery: String!, $per_page: Int = 10) {
+    repository(owner: $owner, name: $repo) {
+      defaultBranchRef {
+        name
+      }
+      pullRequests(headRefName: $headRefName, first: $per_page, orderBy: { field: CREATED_AT, direction: DESC }) {
+        totalCount
+        edges {
+          node {
+            ...prWithReviews
+          }
+        }
+      }
+    }
+
+      viewerCreated: search(query: $viewerQuery, type: ISSUE, first: $per_page) {
+        totalCount: issueCount
+        edges {
+          node {
+          ...prWithReviews
+          }
+        }
+      }
+      reviewRequested: search(query: $reviewerQuery, type: ISSUE, first: $per_page) {
+        totalCount: issueCount
+        edges {
+          node {
+          ...pr
+          }
+        }
+      }
+    }""",
+    ),
+    (
+        'gh pr status --json (every field)',
+        None,
+        r"""query PullRequest_fields{PullRequest: __type(name: "PullRequest"){fields(includeDeprecated: true){name}},StatusCheckRollupContextConnection: __type(name: "StatusCheckRollupContextConnection"){fields(includeDeprecated: true){name}}}""",
+    ),
+    (
+        'gh pr status --json (every field)',
+        {'headRefName': '', 'number': 0, 'owner': 'octo-org', 'repo': 'app', 'reviewerQuery': 'repo:octo-org/app state:open review-requested:@me', 'viewerQuery': 'repo:octo-org/app state:open is:pr author:@me'},
+        r"""fragment pr on PullRequest{additions,assignees(first:100){nodes{id,login,name,databaseId},totalCount},author{login,...on User{id,name}},autoMergeRequest {authorEmail,commitBody,commitHeadline,mergeMethod,enabledAt,enabledBy{login,...on User{id,name}}},baseRefName,baseRefOid,body,changedFiles,closed,closedAt,closingIssuesReferences(first: 100) {nodes {id,number,url,repository {id,name,owner {id,login}}}pageInfo{hasNextPage,endCursor}},comments(first: 100) {nodes {id,author{login,...on User{id,name}},authorAssociation,body,createdAt,includesCreatedEdit,isMinimized,minimizedReason,reactionGroups{content,users{totalCount}},url,viewerDidAuthor},pageInfo{hasNextPage,endCursor},totalCount},commits(first: 100) {nodes {commit {authors(first:100) {nodes {name,email,user{id,login}}},messageHeadline,messageBody,oid,committedDate,authoredDate}}},createdAt,deletions,files(first: 100) {nodes {additions,deletions,path,changeType}},fullDatabaseId,headRefName,headRefOid,headRepository{id,name,nameWithOwner},headRepositoryOwner{id,login,...on User{name}},id,isCrossRepository,isDraft,labels(first:100){nodes{id,name,description,color},totalCount},latestReviews(first: 100) {nodes {author{login},authorAssociation,submittedAt,body,state}},maintainerCanModify,mergeCommit{oid},mergeStateStatus,mergeable,mergedAt,mergedBy{login,...on User{id,name}},milestone{number,title,description,dueOn},number,potentialMergeCommit{oid},projectCards(first:100){nodes{project{name}column{name}},totalCount},projectItems(first:100){nodes{id, project{id,title}, status:fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue{optionId,name}}},totalCount},reactionGroups{content,users{totalCount}},reviewDecision,reviewRequests(first: 100) {nodes {requestedReviewer {__typename,...on User{login,name},...on Bot{login},...on Team{organization{login}name,slug}}}},reviews(first: 100) {nodes {id,author{login},authorAssociation,submittedAt,body,state,commit{oid},reactionGroups{content,users{totalCount}}}pageInfo{hasNextPage,endCursor}totalCount},state,statusCheckRollup: commits(last: 1) {nodes {commit {statusCheckRollup {contexts(first:100) {nodes {__typename...on StatusContext {context,state,targetUrl,createdAt,description},...on CheckRun {name,checkSuite{workflowRun{workflow{name}}},status,conclusion,startedAt,completedAt,detailsUrl}},pageInfo{hasNextPage,endCursor}}}}}},title,updatedAt,url}fragment prWithReviews on PullRequest{...pr}
+  query PullRequestStatus($owner: String!, $repo: String!, $headRefName: String!, $viewerQuery: String!, $reviewerQuery: String!, $per_page: Int = 10) {
+    repository(owner: $owner, name: $repo) {
+      defaultBranchRef {
+        name
+      }
+      pullRequests(headRefName: $headRefName, first: $per_page, orderBy: { field: CREATED_AT, direction: DESC }) {
+        totalCount
+        edges {
+          node {
+            ...prWithReviews
+          }
+        }
+      }
+    }
+
+      viewerCreated: search(query: $viewerQuery, type: ISSUE, first: $per_page) {
+        totalCount: issueCount
+        edges {
+          node {
+          ...prWithReviews
+          }
+        }
+      }
+      reviewRequested: search(query: $reviewerQuery, type: ISSUE, first: $per_page) {
+        totalCount: issueCount
+        edges {
+          node {
+          ...pr
+          }
+        }
+      }
+    }""",
+    ),
+    (
+        'gh pr checks 2',
+        {'owner': 'octo-org', 'pr_number': 2, 'repo': 'app'},
+        r"""query PullRequestByNumber($owner: String!, $repo: String!, $pr_number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $pr_number) {number,headRefName,id}
+    }
+  }""",
+    ),
+    (
+        'gh pr checks 2',
+        {'id': 'PR_AN_ID'},
+        r"""query PullRequestStatusChecks($id: ID!, $endCursor: String) {
+    node(id: $id) {
+      ...on PullRequest {
+        statusCheckRollup: commits(last: 1) {nodes {commit {statusCheckRollup {contexts(first:100,after:$endCursor) {nodes {__typename...on StatusContext {context,state,targetUrl,createdAt,description,isRequired(pullRequestId: $id)},...on CheckRun {name,checkSuite{workflowRun{event,workflow{name}}},status,conclusion,startedAt,completedAt,detailsUrl,isRequired(pullRequestId: $id)}},pageInfo{hasNextPage,endCursor}}}}}}
+      }
+    }
+  }""",
+    ),
+    (
+        'gh pr diff 2',
+        {'owner': 'octo-org', 'pr_number': 2, 'repo': 'app'},
+        r"""query PullRequestByNumber($owner: String!, $repo: String!, $pr_number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $pr_number) {number,id}
+    }
+  }""",
+    ),
+    (
+        'gh issue list --state all --json (every field)',
+        {'limit': 30, 'owner': 'octo-org', 'repo': 'app', 'states': ['OPEN', 'CLOSED']},
+        r"""fragment issue on Issue {assignees(first:100){nodes{id,login,name,databaseId},totalCount},author{login,...on User{id,name}},blockedBy(first:50){nodes{id,number,title,url,state,repository{nameWithOwner}},totalCount},blocking(first:50){nodes{id,number,title,url,state,repository{nameWithOwner}},totalCount},body,closed,closedAt,closedByPullRequestsReferences(first: 100) {nodes {id,number,url,repository {id,name,owner {id,login}}}pageInfo{hasNextPage,endCursor}},comments(first: 100) {nodes {id,author{login,...on User{id,name}},authorAssociation,body,createdAt,includesCreatedEdit,isMinimized,minimizedReason,reactionGroups{content,users{totalCount}},url,viewerDidAuthor},pageInfo{hasNextPage,endCursor},totalCount},createdAt,id,isPinned,issueType{id,name,description,color},labels(first:100){nodes{id,name,description,color},totalCount},milestone{number,title,description,dueOn},number,parent{id,number,title,url,state,repository{nameWithOwner}},projectCards(first:100){nodes{project{name}column{name}},totalCount},projectItems(first:100){nodes{id, project{id,title}, status:fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue{optionId,name}}},totalCount},reactionGroups{content,users{totalCount}},state,stateReason,subIssues(first:100){nodes{id,number,title,url,state,repository{nameWithOwner}},totalCount},subIssuesSummary{total,completed,percentCompleted},title,updatedAt,url}
+  query IssueList($owner: String!, $repo: String!, $limit: Int, $endCursor: String, $states: [IssueState!] = OPEN, $assignee: String, $author: String, $mention: String) {
+    repository(owner: $owner, name: $repo) {
+      hasIssuesEnabled
+      issues(first: $limit, after: $endCursor, orderBy: {field: CREATED_AT, direction: DESC}, states: $states, filterBy: {assignee: $assignee, createdBy: $author, mentioned: $mention}) {
+        totalCount
+        nodes {
+          ...issue
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }""",
+    ),
+    (
+        'gh issue list',
+        {'limit': 30, 'owner': 'octo-org', 'repo': 'app', 'states': ['OPEN']},
+        r"""fragment issue on Issue {number,title,url,state,updatedAt,labels(first:100){nodes{id,name,description,color},totalCount},stateReason}
+  query IssueList($owner: String!, $repo: String!, $limit: Int, $endCursor: String, $states: [IssueState!] = OPEN, $assignee: String, $author: String, $mention: String) {
+    repository(owner: $owner, name: $repo) {
+      hasIssuesEnabled
+      issues(first: $limit, after: $endCursor, orderBy: {field: CREATED_AT, direction: DESC}, states: $states, filterBy: {assignee: $assignee, createdBy: $author, mentioned: $mention}) {
+        totalCount
+        nodes {
+          ...issue
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }""",
+    ),
+    (
+        'gh issue list --search x',
+        {'limit': 30, 'owner': 'octo-org', 'query': '( x ) repo:octo-org/app state:open type:issue', 'repo': 'app', 'type': 'ISSUE_ADVANCED'},
+        r"""fragment issue on Issue {number,title,url,state,updatedAt,labels(first:100){nodes{id,name,description,color},totalCount},stateReason}query IssueSearch($repo: String!, $owner: String!, $type: SearchType!, $limit: Int, $after: String, $query: String!) {
+      repository(name: $repo, owner: $owner) {
+        hasIssuesEnabled
+      }
+      search(type: $type, last: $limit, after: $after, query: $query) {
+        issueCount
+        nodes { ...issue }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }""",
+    ),
+    (
+        'gh issue view 1 --json (every field)',
+        {'number': 1, 'owner': 'octo-org', 'repo': 'app'},
+        r"""query IssueByNumber($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      hasIssuesEnabled
+      issue: issueOrPullRequest(number: $number) {
+        __typename
+        ...on Issue{assignees(first:100){nodes{id,login,name,databaseId},totalCount},author{login,...on User{id,name}},blockedBy(first:50){nodes{id,number,title,url,state,repository{nameWithOwner}},totalCount},blocking(first:50){nodes{id,number,title,url,state,repository{nameWithOwner}},totalCount},body,closed,closedAt,closedByPullRequestsReferences(first: 100) {nodes {id,number,url,repository {id,name,owner {id,login}}}pageInfo{hasNextPage,endCursor}},comments(first: 100) {nodes {id,author{login,...on User{id,name}},authorAssociation,body,createdAt,includesCreatedEdit,isMinimized,minimizedReason,reactionGroups{content,users{totalCount}},url,viewerDidAuthor},pageInfo{hasNextPage,endCursor},totalCount},createdAt,id,isPinned,issueType{id,name,description,color},labels(first:100){nodes{id,name,description,color},totalCount},milestone{number,title,description,dueOn},number,parent{id,number,title,url,state,repository{nameWithOwner}},projectCards(first:100){nodes{project{name}column{name}},totalCount},reactionGroups{content,users{totalCount}},state,stateReason,subIssues(first:100){nodes{id,number,title,url,state,repository{nameWithOwner}},totalCount},subIssuesSummary{total,completed,percentCompleted},title,updatedAt,url}
+        ...on PullRequest{assignees(first:100){nodes{id,login,name,databaseId},totalCount},author{login,...on User{id,name}},body,closed,closedAt,comments(first: 100) {nodes {id,author{login,...on User{id,name}},authorAssociation,body,createdAt,includesCreatedEdit,isMinimized,minimizedReason,reactionGroups{content,users{totalCount}},url,viewerDidAuthor},pageInfo{hasNextPage,endCursor},totalCount},createdAt,id,labels(first:100){nodes{id,name,description,color},totalCount},milestone{number,title,description,dueOn},number,projectCards(first:100){nodes{project{name}column{name}},totalCount},reactionGroups{content,users{totalCount}},state,title,updatedAt,url}
+      }
+    }
+  }""",
+    ),
+    (
+        'gh issue view 1 --comments',
+        {'number': 1, 'owner': 'octo-org', 'repo': 'app'},
+        r"""query IssueByNumber($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      hasIssuesEnabled
+      issue: issueOrPullRequest(number: $number) {
+        __typename
+        ...on Issue{number,url,state,createdAt,title,body,author{login,...on User{id,name}},milestone{number,title,description,dueOn},assignees(first:100){nodes{id,login,name,databaseId},totalCount},labels(first:100){nodes{id,name,description,color},totalCount},reactionGroups{content,users{totalCount}},stateReason,issueType{id,name,description,color},parent{id,number,title,url,state,repository{nameWithOwner}},subIssues(first:100){nodes{id,number,title,url,state,repository{nameWithOwner}},totalCount},subIssuesSummary{total,completed,percentCompleted},comments(first: 100) {nodes {id,author{login,...on User{id,name}},authorAssociation,body,createdAt,includesCreatedEdit,isMinimized,minimizedReason,reactionGroups{content,users{totalCount}},url,viewerDidAuthor},pageInfo{hasNextPage,endCursor},totalCount},blockedBy(first:50){nodes{id,number,title,url,state,repository{nameWithOwner}},totalCount},blocking(first:50){nodes{id,number,title,url,state,repository{nameWithOwner}},totalCount},id}
+        ...on PullRequest{number,url,state,createdAt,title,body,author{login,...on User{id,name}},milestone{number,title,description,dueOn},assignees(first:100){nodes{id,login,name,databaseId},totalCount},labels(first:100){nodes{id,name,description,color},totalCount},reactionGroups{content,users{totalCount}},comments(first: 100) {nodes {id,author{login,...on User{id,name}},authorAssociation,body,createdAt,includesCreatedEdit,isMinimized,minimizedReason,reactionGroups{content,users{totalCount}},url,viewerDidAuthor},pageInfo{hasNextPage,endCursor},totalCount},id}
+      }
+    }
+  }""",
+    ),
+    (
+        'gh issue view 1 --comments',
+        {'endCursor': None, 'name': 'app', 'number': 1, 'owner': 'octo-org'},
+        r"""query IssueProjectItems($endCursor:String$name:String!$number:Int!$owner:String!){repository(owner: $owner, name: $name){issue(number: $number){projectItems(first: 100, after: $endCursor){totalCount,nodes{id,project{id,title},status:fieldValueByName(name: "Status"){... on ProjectV2ItemFieldSingleSelectValue{optionId,name}}},pageInfo{hasNextPage,endCursor}}}}}""",
+    ),
+    (
+        'gh repo view OWNER/REPO --json (every field)',
+        {'name': 'app', 'owner': 'octo-org'},
+        r"""query RepositoryInfo($owner: String!, $name: String!) {
+    repository(owner: $owner, name: $name) {archivedAt,assignableUsers(first:100){nodes{id,login,name}},codeOfConduct{key,name,url},contactLinks{about,name,url},createdAt,defaultBranchRef{name},deleteBranchOnMerge,description,diskUsage,forkCount,fundingLinks{platform,url},hasDiscussionsEnabled,hasIssuesEnabled,hasProjectsEnabled,hasWikiEnabled,homepageUrl,id,isArchived,isBlankIssuesEnabled,isEmpty,isFork,isInOrganization,isMirror,isPrivate,isSecurityPolicyEnabled,isTemplate,isUserConfigurationRepository,issueTemplates{name,title,body,about},issues(states:OPEN){totalCount},labels(first:100){nodes{id,color,name,description}},languages(first:100){edges{size,node{name}}},latestRelease{publishedAt,tagName,name,url},licenseInfo{key,name,nickname},mentionableUsers(first:100){nodes{id,login,name}},mergeCommitAllowed,milestones(first:100,states:OPEN){nodes{number,title,description,dueOn}},mirrorUrl,name,nameWithOwner,openGraphImageUrl,owner{id,login},parent{id,name,owner{id,login}},primaryLanguage{name},projects(first:100,states:OPEN){nodes{id,name,number,body,resourcePath}},pullRequestTemplates{body,filename},pullRequests(states:OPEN){totalCount},pushedAt,rebaseMergeAllowed,repositoryTopics(first:100){nodes{topic{name}}},securityPolicyUrl,squashMergeAllowed,sshUrl,stargazerCount,templateRepository{id,name,owner{id,login}},updatedAt,url,usesCustomOpenGraphImage,viewerCanAdminister,viewerDefaultCommitEmail,viewerDefaultMergeMethod,viewerHasStarred,viewerPermission,viewerPossibleCommitEmails,viewerSubscription,visibility,watchers{totalCount}}
+  }""",
+    ),
+    (
+        'gh repo view OWNER/REPO',
+        {'name': 'app', 'owner': 'octo-org'},
+        r"""query RepositoryInfo($owner: String!, $name: String!) {
+    repository(owner: $owner, name: $name) {name,owner{id,login},description}
+  }""",
+    ),
+    (
+        'gh release list --json (every field)',
+        None,
+        r"""query Release_fields{Release: __type(name: "Release"){fields{name}}}""",
+    ),
+    (
+        'gh release list --json (every field)',
+        {'direction': 'DESC', 'endCursor': None, 'name': 'app', 'owner': 'octo-org', 'perPage': 30},
+        r"""query RepositoryReleaseList($direction:OrderDirection!$endCursor:String$name:String!$owner:String!$perPage:Int!){repository(owner: $owner, name: $name){releases(first: $perPage, orderBy: {field: CREATED_AT, direction: $direction}, after: $endCursor){nodes{name,tagName,isDraft,immutable,isLatest,isPrerelease,createdAt,publishedAt},pageInfo{hasNextPage,endCursor}}}}""",
+    ),
+    (
+        'gh label list --json (every field)',
+        {'limit': 30, 'orderBy': {'direction': 'ASC', 'field': 'CREATED_AT'}, 'owner': 'octo-org', 'query': '', 'repo': 'app'},
+        r"""fragment label on Label{color,createdAt,description,id,isDefault,name,updatedAt,url}
+  query LabelList($owner: String!, $repo: String!, $limit: Int!, $endCursor: String, $query: String, $orderBy: LabelOrder) {
+    repository(owner: $owner, name: $repo) {
+      labels(first: $limit, after: $endCursor, query: $query, orderBy: $orderBy) {
+        totalCount,
+        nodes {
+          ...label
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }""",
+    ),
+    (
+        'gh label list',
+        {'limit': 30, 'orderBy': {'direction': 'ASC', 'field': 'CREATED_AT'}, 'owner': 'octo-org', 'query': '', 'repo': 'app'},
+        r"""fragment label on Label{color,description,name}
+  query LabelList($owner: String!, $repo: String!, $limit: Int!, $endCursor: String, $query: String, $orderBy: LabelOrder) {
+    repository(owner: $owner, name: $repo) {
+      labels(first: $limit, after: $endCursor, query: $query, orderBy: $orderBy) {
+        totalCount,
+        nodes {
+          ...label
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }""",
+    ),
+    (
+        'gh pr status',
+        None,
+        r"""query PullRequest_fields2{WorkflowRun: __type(name: "WorkflowRun"){fields(includeDeprecated: true){name}}}""",
+    ),
+    (
+        'gh pr create --dry-run --title x --body y --base main',
+        {'name': 'app', 'owner': 'octo-org'},
+        r"""fragment repo on Repository {
+    id
+    databaseId
+    name
+    owner { login }
+    sshUrl
+    hasIssuesEnabled
+    description
+    hasWikiEnabled
+    viewerPermission
+    defaultBranchRef {
+      name
+    }
+  }
+
+  query RepositoryInfo($owner: String!, $name: String!) {
+    repository(owner: $owner, name: $name) {
+      ...repo
+      parent {
+        ...repo
+      }
+      mergeCommitAllowed
+      rebaseMergeAllowed
+      squashMergeAllowed
+    }
+  }""",
+    ),
+    (
+        'gh pr create --dry-run --title x --body y --base main',
+        {'headRefName': 'phase-5-github-policy', 'owner': 'octo-org', 'repo': 'app', 'states': ['OPEN']},
+        r"""query PullRequestForBranch($owner: String!, $repo: String!, $headRefName: String!, $states: [PullRequestState!]) {
+    repository(owner: $owner, name: $repo) {
+      pullRequests(headRefName: $headRefName, states: $states, first: 30, orderBy: { field: CREATED_AT, direction: DESC }) {
+        nodes {url,id,number,state,baseRefName,headRefName,isCrossRepository,headRepositoryOwner{id,login,...on User{name}}}
+      }
+      defaultBranchRef { name }
+    }
+  }""",
+    ),
+]
+
+# The two that are refused, and why.
+RECORDED_REFUSALS = {
+    "gh pr checks 2": {"PullRequestStatusChecks": "graphql-by-id"},
+    # Among every field of a repo are the two lists of who has access.
+    "gh repo view OWNER/REPO --json (every field)": {"RepositoryInfo": "collaborators"},
+}
+
+
+@pytest.mark.parametrize(("command", "variables", "query"), RECORDED, ids=[f"{n}-{c}" for n, (c, _, _) in enumerate(RECORDED)])
+def test_the_queries_gh_was_recorded_sending(command, variables, query):
+    operation = re.search(r"\bquery\s+(\w+)", query).group(1)
+    reason = RECORDED_REFUSALS.get(command, {}).get(operation)
+    if reason:
+        refused(gql(query, variables), reason)
+        return
+    decision = allowed(gql(query, variables), "graphql-read")
+    assert decision.with_token
+    text = json.dumps(variables)
+    if "octo-org" in text:
+        if "owner" in variables:
+            assert decision.repo == "octo-org/app"
+        # The same query about a repo listed for reading...
+        swapped = json.loads(text.replace('"app"', '"library"').replace("octo-org/app", "octo-org/library"))
+        # A search names its repo in the search text, which is checked but
+        # not handed back as the repo the request is about.
+        allowed(gql(query, swapped), "graphql-read", "octo-org/library" if "owner" in variables else None)
+        # ...and about one that is not listed.
+        elsewhere = json.loads(text.replace("octo-org", "other-org"))
+        for used in (POLICY, PUBLIC):
+            refused(gql(query, elsewhere, policy=used), "repo-not-listed")
+
+
+def test_the_recorded_queries_cover_the_commands_the_docs_say_work():
+    commands = " | ".join(command for command, _, _ in RECORDED)
+    for command in ("pr view", "pr list", "pr status", "pr diff", "pr create --dry-run", "issue list", "issue view",
+                    "repo view", "release list", "label list"):
+        assert f"gh {command}" in commands, command
+    assert len(RECORDED) == 29
+    # Far below the limits, so the limits do not get in gh's way.
+    assert max(len(query) for _, _, query in RECORDED) * 8 < policy_module.MAX_GRAPHQL
+    assert max(query.count("fragment ") for _, _, query in RECORDED) * 8 < policy_module.MAX_FRAGMENTS
+
+
+def test_every_field_of_a_repo_but_the_two_lists_of_who_has_access():
+    command, variables, query = next(r for r in RECORDED if r[0] == "gh repo view OWNER/REPO --json (every field)")
+    assert "assignableUsers(first:100){nodes{id,login,name}}," in query
+    assert "mentionableUsers(first:100){nodes{id,login,name}}," in query
+    without = query.replace("assignableUsers(first:100){nodes{id,login,name}},", "")
+    without = without.replace("mentionableUsers(first:100){nodes{id,login,name}},", "")
+    allowed(gql(without, variables), "graphql-read", "octo-org/app")
 
 
 # ---------------------------------------------------------------------------
@@ -2510,6 +3609,12 @@ def all_refusals():
     yield gql(ADD_COMMENT, {"input": {"subjectId": HOSTILE}})
     yield gql(CREATE_PR, {"input": {"repositoryId": HOSTILE}})
     yield gql("query($id: ID!) { node(id: $id) { id } }", {"id": HOSTILE})
+    yield gql(CREATE_PR, {"input": {"repositoryId": APP_ID, "headRefName": HOSTILE + ":x"}})
+    yield ask("POST", "api.github.com/repos/octo-org/app/pulls", {"head": "x", "head_repo": HOSTILE})
+    yield gql(IN_APP % ("%s { id }" % ("w" * 500)))
+    yield gql(IN_APP % ("owner { %s }" % ("v" * 500)))
+    yield gql(IN_APP % ("issueOrPullRequest(number: 1) { ... on %s { id } }" % ("U" * 500)))
+    yield ask("POST", "api.github.com/repos/octo-org/app/pulls?" + "q=" + "x" * 500, {"title": "t"})
 
 
 def test_a_refusal_explains_itself_and_carries_nothing_hostile():
@@ -2517,7 +3622,7 @@ def test_a_refusal_explains_itself_and_carries_nothing_hostile():
         "repo-not-listed", "repo-read-only", "merge", "not-recognised", "github-host-not-covered",
         "host-differs", "header-repeated", "method-override", "path-odd", "query-odd", "body-odd",
         "graphql-malformed", "graphql-query-not-allowed", "graphql-mutation-not-allowed",
-        "graphql-id-not-listed", "graphql-by-id", "graphql-account", "graphql-search", "graphql-walks-away",
+        "graphql-id-not-listed", "graphql-by-id", "graphql-not-on-list", "graphql-search", "head-elsewhere",
         "policy-error",
     }
     count = 0
@@ -2528,11 +3633,11 @@ def test_a_refusal_explains_itself_and_carries_nothing_hostile():
         assert decision.reason in known_reasons, decision.reason
         # The message goes back to the VM: printable, and not a flood.
         assert all(char == "\n" or " " <= char <= "~" for char in decision.message), decision.message
-        assert len(decision.message) < 1500
+        assert len(decision.message) < 2000
         assert "A" * 100 not in decision.message
         # It ends by saying what to do next.
         assert decision.message.endswith(".\n")
-    assert count == 20
+    assert count == 26
 
 
 def test_messages_say_what_to_ask_the_user_for():
