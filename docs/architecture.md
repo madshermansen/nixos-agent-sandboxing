@@ -2,7 +2,8 @@
 
 A coding agent can be tricked by what it reads, or simply make a mistake. This
 project gives it a machine of its own, so that a mistake stays inside that
-machine and there is nothing in it worth stealing.
+machine and there is little in it worth stealing: none of your files, and no
+GitHub token. The one thing of value in it is the Claude sign-in.
 
 The work is done in phases, listed in [PLAN.md](../PLAN.md). This page
 describes what runs today first, and the target design after it.
@@ -19,7 +20,7 @@ describes what runs today first, and the target design after it.
 | Claude Code | VM | The agent. It runs as the `agent` user, which has no `sudo`. |
 | SSH server | VM | A shell for you, for signing in to Claude and for debugging. |
 | Broker | Mac | A proxy that is the VM's only way out. It passes on the destinations listed in [`broker/rules.yaml`](../broker/rules.yaml) and refuses the rest. For GitHub it also puts the real token into each request. |
-| State folder | Mac | `~/.local/state/agent-vm` holds the VM's disk, the SSH key that reaches it, and the broker's log. While the VM runs it also holds QEMU's control socket, which the stop command uses. |
+| State folder | Mac | `~/.local/state/agent-vm` holds the VM's disk, the SSH key that reaches it, the broker's log, and the broker's own files, among them the private key of its certificate authority. While the VM runs it also holds QEMU's control socket, which the stop command uses. |
 | Linux builder | Mac | A small NixOS VM that builds Linux packages. It is needed to build the agent VM, and plays no part while the agent VM runs. |
 
 ### What crosses the line between the Mac and the VM
@@ -221,17 +222,25 @@ token in the VM" above.
 
 The system (programs, services, settings) comes from the repo on every start,
 so a change to `vm/default.nix` takes effect after a restart. The disk is kept
-between starts, and with it `/home/agent`: cloned repos, the Claude sign-in
-and T3's data.
+between starts. It is the VM's whole root filesystem, and with it
+`/home/agent`: cloned repos, the Claude sign-in and T3's data.
 
 ## What this does not protect against
+
+This is the short list. [threat-model.md](threat-model.md) is the full
+version: each thing an attacker can try, what stops it, and what proves it.
+The reasons behind the design are in [decisions.md](decisions.md), and
+threads that run on the Mac itself are covered in
+[local-threads.md](local-threads.md).
 
 - **An allowed destination is still a way out.** The agent can send data to
   any listed host, for example to someone else's repo on GitHub. The lock
   narrows where data can go; it does not stop it.
-- **The Claude sign-in is in the VM.** A program in the VM can use it to talk
-  to Anthropic as you. Claude's connectors to other services are not
-  reachable, because their address is not on the list; keep it that way.
+- **The Claude sign-in is in the VM.** A program in the VM can use it to do
+  whatever the sign-in allows on the listed Anthropic hosts, as you. The
+  address of Claude's connectors to other services is not on the list, and
+  the broker refuses it; keep it that way. Whether the listed hosts offer
+  another way to the connectors has not been tested.
 - **Programs on the Mac can use the broker's port.** The broker adds the
   GitHub token for anyone who sends the placeholder, and the placeholder is
   public. So while the broker runs, any program on the Mac can act on GitHub
