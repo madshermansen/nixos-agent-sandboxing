@@ -9,8 +9,10 @@ a machine of its own that shares nothing with the Mac. Its network is locked:
 the only way out is a broker on the Mac, which passes on a short list of
 destinations and refuses the rest.
 
-The plan is for the broker to also hold the keys and attach them to outgoing
-requests, so the VM never holds one. That part is not built yet.
+The broker also holds the GitHub token. Programs in the VM log in with a
+placeholder, and the broker puts the real token in its place on the way out,
+so the VM never holds it. Limits on which repos and actions the agent may
+use are planned.
 
 ![The Mac, the agent VM inside it, the broker, and the internet](docs/images/vm-today.svg)
 
