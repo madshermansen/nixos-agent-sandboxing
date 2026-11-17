@@ -6,10 +6,13 @@ out at all. This page says which ones do, which do not, and what the broker
 cannot check.
 
 The deciding is done by [`broker/github_policy.py`](../broker/github_policy.py).
-It takes effect once the broker opens GitHub traffic and asks it about each
-request, which is phase 4 of [PLAN.md](../PLAN.md). Until then the broker
-passes GitHub traffic on unread, as described in
-[architecture.md](architecture.md).
+The broker opens the traffic to GitHub, as described in
+[architecture.md](architecture.md), and asks that module about every request
+before it adds the token and before anything is sent. A refused request
+never leaves the Mac: the program in the VM gets a 403 with a text that says
+what was refused and what to do instead. `git` shows that text as `remote:`
+lines, and `gh` shows it after `HTTP 403:`. A broker whose rules open a
+GitHub host but have no `github` part does not start.
 
 ## Why
 

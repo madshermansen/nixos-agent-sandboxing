@@ -17,16 +17,23 @@ What the broker does:
   VM uses GitHub without holding a token. Programs in the VM log in with a
   placeholder, and the broker puts the real token in its place. A request
   with any other login is refused. See swap.py for those decisions.
+- Because the broker adds the token, it also decides which requests to an
+  opened destination go out at all: only those about a repo listed in the
+  `github` part of rules.yaml, and only what that part allows there.
+  github_policy.py makes that decision for each request, and
+  github_request.py joins it with the token swap.
 - Each decision is written as one line on standard output:
 
       2026-01-31T12:00:00+01:00 allowed api.anthropic.com 443 connect
       2026-01-31T12:00:01+01:00 refused example.com 443 connect host-not-listed
-      2026-01-31T12:00:02+01:00 allowed github.com 443 https GET /o/r/info/refs 200
+      2026-01-31T12:00:02+01:00 allowed github.com 443 https GET /o/r/info/refs 200 git-read
+      2026-01-31T12:00:03+01:00 refused github.com 443 https GET /x/y/info/refs repo-not-listed
 
   The fields are the time, the decision, the host, the port, how the request
   arrived, and for a refusal the reason. For a request to an opened
   destination the line also has the method, the path without its query
-  string, and the status of the answer. Nothing else from inside a request
+  string, the status of the answer, and what kind of request the policy
+  found it to be. Nothing else from inside a request
   is logged: no headers, no bodies, no tokens. For a destination that is
   passed on untouched, the site named at the start of the encrypted
   connection is checked, but what is sent after that cannot be seen here.
@@ -75,6 +82,8 @@ from ruamel.yaml.error import YAMLError
 
 # These lie next to this file. mitmproxy puts this file's folder on the
 # search path before loading it.
+import github_policy
+import github_request
 import limits
 import swap
 
@@ -107,8 +116,10 @@ MAX_CLIENTS = 256
 # phases add their keys here.
 DESTINATION_KEYS = {"host", "inspect", "note", "ports", "token"}
 
-# Where the broker notes, on a request, how far it has come with it.
+# Where the broker notes, on a request, how far it has come with it, and
+# what kind of request the policy found it to be.
 STATE = "nixt3"
+KIND = "nixt3-kind"
 
 
 # Letters, digits and hyphens, in parts separated by dots. This keeps out
@@ -138,10 +149,12 @@ class Rule:
     token: str | None = None
 
 
-def load_rules(path: str) -> dict[str, Rule]:
-    """Read rules.yaml and return the rule for each host name.
+def load_rules(path: str) -> tuple[dict[str, Rule], github_policy.Policy | None]:
+    """Read rules.yaml. Returns the rule for each host name, and the policy.
 
-    Host names are stored in lower case. Any mistake raises RulesError.
+    The policy is the `github` part of the file: which repos the agent may
+    use, and how. It is None only when the file opens no host at all. Host
+    names are stored in lower case. Any mistake raises RulesError.
     """
     try:
         with open(path, encoding="utf-8") as file:
@@ -155,7 +168,7 @@ def load_rules(path: str) -> dict[str, Rule]:
 
     if not isinstance(data, dict):
         raise RulesError("it must start with a `destinations:` list")
-    unknown = set(data) - {"destinations"}
+    unknown = set(data) - {"destinations", "github"}
     if unknown:
         raise RulesError(f"unknown top-level key: {sorted(map(str, unknown))[0]}")
     destinations = data.get("destinations")
@@ -233,7 +246,16 @@ def load_rules(path: str) -> dict[str, Rule]:
                 )
 
         rules[host] = Rule(frozenset(ports), inspect, token)
-    return rules
+
+    # The broker adds the token to what it lets through to an opened host,
+    # so there must be rules for what that may be. See github_request.py.
+    try:
+        policy = github_request.load_policy(
+            data, [host for host, rule in rules.items() if rule.inspect]
+        )
+    except github_policy.PolicyError as error:
+        raise RulesError(str(error)) from error
+    return rules, policy
 
 
 class HandoverError(Exception):
@@ -339,6 +361,16 @@ REFUSALS = {
     "upgrade": (
         "the request asks to switch to another protocol (an Upgrade header), "
         "such as WebSocket, which the broker does not pass on."
+    ),
+    "body-not-read": (
+        "this request to {host} has a body that is larger than the broker "
+        "reads (1 MiB), or that does not say how long it is. The broker "
+        "has to read the body of a request to the GitHub API to decide "
+        "about it, so it does not pass on one it cannot read."
+    ),
+    "no-policy": (
+        "the broker has no rules for what may be sent to {host}. This is a "
+        "mistake in how it was started on the host."
     ),
     "odd-header": (
         "one of the request's header lines is split over several lines, or "
@@ -512,8 +544,14 @@ def fail_closed(cls):
 
 @fail_closed
 class Broker:
-    def __init__(self, rules: dict[str, Rule], tokens: dict[str, swap.Secret]) -> None:
+    def __init__(
+        self,
+        rules: dict[str, Rule],
+        policy: github_policy.Policy | None,
+        tokens: dict[str, swap.Secret],
+    ) -> None:
         self.rules = rules
+        self.policy = policy
         self.tokens = tokens
         # The connections from the VM that are open now.
         self.clients: set[str] = set()
@@ -534,11 +572,20 @@ class Broker:
             return "port-not-listed"
         return None
 
-    def refuse(self, flow: http.HTTPFlow, how: str, reason: str, *details: object) -> None:
+    def refuse(
+        self,
+        flow: http.HTTPFlow,
+        how: str,
+        reason: str,
+        *details: object,
+        message: str | None = None,
+    ) -> None:
         """Log a refusal, and answer the request with a 403 that explains it.
 
         `details` are extra log fields that go before the reason: for an
-        opened request, its method and path.
+        opened request, its method and path. `message` is the whole text
+        for the VM when the policy wrote one; it is never logged, because it
+        can repeat part of the request.
 
         A request whose body is large, or of unknown size, gets no answer.
         Its connection is closed instead, which the program in the VM sees
@@ -560,21 +607,24 @@ class Broker:
             flow.kill()
             return
 
-        if reason == "port-not-listed":
-            allowed = ", ".join(map(str, sorted(self.rules[host.lower()].ports)))
-            what = (
-                f"{host} is an allowed destination, but not on port {port}. "
-                f"Allowed on this host: port {allowed}."
-            )
+        if message is None:
+            if reason == "port-not-listed":
+                allowed = ", ".join(map(str, sorted(self.rules[host.lower()].ports)))
+                what = (
+                    f"{host} is an allowed destination, but not on port {port}. "
+                    f"Allowed on this host: port {allowed}."
+                )
+            else:
+                what = REFUSALS.get(reason, "this request to {host} is not allowed ({reason}).")
+                what = what.format(host=host, port=port, reason=reason)
+            message = f"Refused by the sandbox broker: {what}\n\n{REFUSAL_HELP}"
+        if how == "https":
+            # A request to an opened host. For the API the text is wrapped
+            # the way `gh` expects an error, or `gh` would not show it.
+            body, content_type = github_request.refusal_answer(host, message)
         else:
-            # A reason without a text of its own comes from the policy.
-            what = REFUSALS.get(reason, "this request to {host} is not allowed ({reason}).")
-            what = what.format(host=host, port=port, reason=reason)
-        flow.response = http.Response.make(
-            403,
-            f"Refused by the sandbox broker: {what}\n\n{REFUSAL_HELP}",
-            {"Content-Type": "text/plain; charset=utf-8"},
-        )
+            body, content_type = message.encode("utf-8"), "text/plain; charset=utf-8"
+        flow.response = http.Response.make(403, body, {"Content-Type": content_type})
         # Many programs show only the first line of a refused CONNECT, so the
         # short version goes there as well.
         flow.response.reason = "Refused by the sandbox broker"
@@ -752,9 +802,12 @@ class Broker:
             self.refuse(flow, "https", reason, method, path)
             return
 
-        if self.body_is_small(flow):
-            # Wait for the body, so that the policy can look at it. The
-            # request is passed on from request() below.
+        # Whether the policy needs the body to decide, see github_request.py.
+        when = github_request.when_to_decide(host, self.body_is_small(flow))
+        if when == "refuse":
+            self.refuse(flow, "https", "body-not-read", method, path)
+        elif when == "after-body":
+            # The request is decided on and passed on from request() below.
             flow.metadata[STATE] = "reading"
         elif self.pass_on(flow, body=None):
             flow.request.stream = True
@@ -763,67 +816,60 @@ class Broker:
         """The whole of a request has arrived, body included."""
         if flow.metadata.get(STATE) != "reading":
             return
-        if "content-encoding" in flow.request.headers:
-            # A compressed body. Unpacking it could take far more memory
-            # than its size suggests, so the policy does not get to see it.
-            body = None
-        else:
-            body = flow.request.raw_content or b""
-        self.pass_on(flow, body)
+        # The body as it was sent, not unpacked: the policy must judge the
+        # bytes GitHub will get, and it refuses a compressed body itself.
+        self.pass_on(flow, flow.request.raw_content or b"")
 
     def token_for(self, rule: Rule) -> swap.Secret | None:
         return self.tokens.get(rule.token) if rule.token else None
 
-    def policy(
-        self, method: str, host: str, path: str, query: str, body: bytes | None
-    ) -> str | None:
-        """Whether this request to an opened destination may be passed on.
-
-        PHASE 5 GOES HERE. This is the one place where a request that is
-        about to leave with a token can still be stopped by what it asks
-        for: which repo, which action. Call the decision function of
-        broker/github_policy.py from here.
-
-        Return None to allow the request, or a short reason without spaces,
-        such as "repo-not-listed". The reason goes in the log and in the
-        answer to the VM. Add a text for it to REFUSALS above.
-
-        `path` is the request's path without the query string, and `query`
-        is the query string, both as the VM sent them. `body` is the body
-        when it was at most swap.MAX_READ_BODY long and not compressed.
-        Otherwise it is None: the body is not known here, because it is
-        passed on piece by piece. A large `git push` is one such request. A
-        rule that needs to see the body must refuse when it is None, or a
-        request could avoid the rule by sending its body in pieces.
-        """
-        return None
-
     def pass_on(self, flow: http.HTTPFlow, body: bytes | None) -> bool:
         """The last step for an opened request. True when it may leave.
 
-        Asks the policy, then puts the real token in place of the
-        placeholder. Nothing is changed before the policy has agreed.
+        This is where the policy decides: which repo the request is about,
+        what it does there, and whether that is allowed
+        (github_policy.py, called through github_request.plan). Every
+        request to an opened host comes through here before the token is
+        put in and before anything is sent. `body` is the whole body, or
+        None when it was not read because the policy does not need it.
+
+        What the policy is given is the request as it arrived and as it
+        will be sent on: the method, the path and query string, the headers
+        and the body are handed over unchanged, and nothing about them is
+        changed before the policy has agreed. The host is the one the
+        tunnel was opened for, which opened_request() has checked against
+        the name in the encrypted connection and in the Host header.
         """
         request = flow.request
         host = request.host.lower()
-        rule = self.rules[host]
         method = request.method
-        path, query = swap.split_path(request.path)
+        path, _ = swap.split_path(request.path)
 
-        reason = self.policy(method, host, path, query, body)
-        if reason is None:
-            credential = swap.swap_authorization(
-                request.headers.get_all("authorization"), self.token_for(rule)
-            )
-            # Checked in opened_request() already; here in case the headers
-            # changed in between.
-            reason = credential.reason if credential.action == "refuse" else None
-        if reason is not None:
-            self.refuse(flow, "https", reason, method, path)
+        plan = github_request.plan(
+            self.policy,
+            self.token_for(self.rules[host]),
+            method=method,
+            host=host,
+            target=request.path,
+            headers=list(request.headers.items(multi=True)),
+            authority=request.host_header,
+            body=body,
+        )
+        if not plan.allowed:
+            self.refuse(flow, "https", plan.reason, method, path, message=plan.message)
             return False
 
-        if credential.action == "swap":
-            request.headers["authorization"] = credential.value
+        if plan.authorization is None:
+            # No login was sent, or the policy allows this request only
+            # without the token: it reads a repo that is not listed.
+            request.headers.pop("authorization", None)
+        else:
+            request.headers["authorization"] = plan.authorization
+        if plan.body is not None:
+            # The body written out afresh from what the policy read, so
+            # that GitHub reads exactly what was judged.
+            request.content = plan.body
+        flow.metadata[KIND] = plan.kind if plan.with_token else f"{plan.kind}-without-token"
         # A cookie is a login too: one copied from a browser gives access to
         # the account it was taken from. Nothing in the VM needs GitHub's
         # cookies, so they are left out instead of refused; a program that
@@ -875,7 +921,7 @@ class Broker:
             path, _ = swap.split_path(request.path)
             log(
                 "allowed", request.host, request.port, "https",
-                request.method, path, response.status_code,
+                request.method, path, response.status_code, flow.metadata.get(KIND, "-"),
             )  # fmt: skip
             flow.metadata[STATE] = "answered"
 
@@ -1048,7 +1094,7 @@ def start() -> Broker:
     try:
         if not path:
             raise RulesError(f"{RULES_ENV} is not set, so there is no rules file")
-        rules = load_rules(path)
+        rules, policy = load_rules(path)
     except RulesError as error:
         print(
             f"broker: not starting, because the rules file cannot be used.\n"
@@ -1079,9 +1125,10 @@ def start() -> Broker:
         f"destinations={len(rules)}",
         f"opened={sum(rule.inspect for rule in rules.values())}",
         f"tokens={len(tokens)}",
+        f"repos={len(policy.repos) if policy else 0}",
         f"rules={path}",
     )
-    return Broker(rules, tokens)
+    return Broker(rules, policy, tokens)
 
 
 addons = [start()]

@@ -165,6 +165,45 @@ When you end it, the VM has no way out until the next start.
 Every host on the list is a place the agent can send data to, so add only
 what a task needs.
 
+## Letting the agent use a repo
+
+The agent can use only the repos listed in the `github` part of
+[`broker/rules.yaml`](../broker/rules.yaml). A request about any other repo
+is refused by the broker, and the agent is told so:
+`Refused by the sandbox broker: owner/name is not a repo the sandbox may use.`
+
+To list a repo, add an entry:
+
+```yaml
+github:
+  repos:
+    - repo: your-name/your-repo
+      note: The repo the agent works on.
+      access: write
+      id: R_kgDOExample1
+```
+
+- `access` is `read` (clone, fetch, read pull requests and issues) or
+  `write` (also push, open and work on pull requests, comment).
+- `id` is needed for `gh pr create`. It is public; get it with
+  `gh repo view your-name/your-repo --json id --jq .id`.
+- Merging pull requests stays refused unless the entry says `merge: true`.
+
+Then restart the broker: `nix run .#stop` and `nix run .#vm`, or
+`nix run .#broker` in a terminal while the VM keeps running. A mistake in
+the file stops the broker from starting, and the message names the entry
+and says what to fix. The token must also be allowed to use the repo; that
+is set on GitHub.
+
+Update the list of repos in [`vm/agent-instructions.md`](../vm/agent-instructions.md)
+as well, so that the agent knows what it may use; that takes effect at the
+next start of the VM. The line `listed=` in
+[`tests/network-lock.sh`](../tests/network-lock.sh) names the repo that
+`nix run .#check` reads; keep it a repo that is listed.
+
+What is allowed in a listed repo, what is refused everywhere, and which
+`gh` commands work is in [github-rules.md](github-rules.md).
+
 ## Changing the GitHub token
 
 Change the command in `~/.config/nixt3/tokens.yaml`, or the secret it points
@@ -206,6 +245,17 @@ sandbox's own".**
 The request to GitHub carried a login other than the placeholder, for
 example a token in a git address or in `GH_TOKEN`. The broker never passes
 those on. Remove it; `git` and `gh` in the VM need no login of their own.
+
+**The agent is refused with "is not a repo the sandbox may use".**
+The repo is not in the `github` part of `broker/rules.yaml`. See "Letting
+the agent use a repo" above. `nix run .#logs` shows the refusal as
+`repo-not-listed`, with the path that names the repo.
+
+**`gh pr comment`, `gh pr close` or another `gh pr` command is refused.**
+The change is allowed, but not in the form `gh` sends it, which names the
+pull request by an id that does not prove its repo. The refusal names the
+`gh api` line that does the same. [github-rules.md](github-rules.md) has
+the table.
 
 **A program in the VM reports a certificate error for GitHub.**
 The VM trusts the broker's certificate only when it was started with

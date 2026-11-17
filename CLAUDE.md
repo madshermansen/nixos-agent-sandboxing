@@ -38,13 +38,15 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `broker/rules.yaml` | The destinations the VM may reach |
 | `broker/proxy.py` | The broker: a mitmproxy script that applies the rules |
 | `broker/swap.py` | The decisions about one opened request, among them the token swap; no mitmproxy in it |
+| `broker/github_policy.py` | Which GitHub requests may go out: the repos and actions allowed; pure, no mitmproxy |
+| `broker/github_request.py` | Joins policy and swap for one request; pure, no mitmproxy |
 | `broker/fetch_tokens.py` | Fetches the tokens before the broker starts |
 | `broker/limits.py` | Size limits that mitmproxy lacks, patched into it; tied to the exact mitmproxy version |
 | `broker/tokens.example.yaml` | Example of `~/.config/nixt3/tokens.yaml`, which says where each token is kept |
 | `darwin/commands.nix` | The Mac-side commands behind every `nix run .#…` |
 | `darwin/default.nix` | nix-darwin module for the Mac |
 | `tests/network-lock.sh` | Checks run inside the VM by `nix run .#check` |
-| `tests/github-broker.sh` | The token swap, checked on the Mac against a stand-in for GitHub |
+| `tests/github-broker.sh` | The token swap and the policy, checked on the Mac through a real broker against a stand-in for GitHub |
 | `tests/github-live.sh` | The round trip with a real token, run inside the VM |
 | `tests/unit/` | pytest files for the broker's decisions; no network needed |
 | `docs/` | Setup, architecture, diagrams |
@@ -61,7 +63,7 @@ nix run .#ssh                # shell in the VM as `agent`
 nix run .#ssh -- <command>   # one command in the VM
 nix run .#pair               # add the VM to the T3 app on the Mac
 nix build .#vm --no-link     # build only
-tests/github-broker.sh       # check the token swap on the Mac, without the VM or a token
+tests/github-broker.sh       # check the token swap and the policy on the Mac, without the VM or a token
 nix fmt                      # format the Nix files; run before committing
 ```
 
@@ -101,9 +103,10 @@ The reply should name Linux and the host `agent-vm`.
 - **Log lines** are `time event host port how [reason]`, with the event one
   of `allowed`, `refused`, `failed`. A `started` line, with the number of
   destinations and the rules file, marks each broker start. For a request to
-  an opened destination, the method, the path without its query string and
-  the answer's status are added. Never log query strings, headers, bodies or
-  tokens.
+  an opened destination, the method, the path without its query string, the
+  answer's status and the kind of request (`git-read`, `api-write`, ...) are
+  added. Never log query strings, headers, bodies or tokens, nor the text a
+  refusal gives the agent, which can repeat part of the request.
 - **Only a broker of ours may hold the port.** `nix run .#vm` refuses to
   start when `localhost:8474` is taken by anything but a broker started with
   `nix run .#broker`.
@@ -140,8 +143,9 @@ The reply should name Linux and the host `agent-vm`.
   stops the broker from starting.
 - **Never call the user's password manager from a test.** Use a tokens file
   whose command prints a made-up token, as `tests/github-broker.sh` does.
-  GitHub answers "Bad credentials" to a made-up token and "Requires
-  authentication" to no login, which is enough to show the swap happened.
+  That test shows the swap, because it sees what the broker sends out. From
+  inside the VM a made-up token cannot show it: GitHub answers "Bad
+  credentials" to it and to the placeholder alike.
 - **The broker speaks HTTP/1.1 where it opens traffic** (`http2=false`).
   The body handling relies on it: in HTTP/2 a request can carry a body
   without declaring one.
@@ -174,7 +178,44 @@ The reply should name Linux and the host `agent-vm`.
   list is built at boot in `/run/broker-ca`, and `/etc/ssl/certs` points
   there. The private key (`broker/mitmproxy-ca.pem` in the state folder)
   must never be passed to the VM.
-- **Phase 5 hooks in at one place:** `Broker.policy()` in `proxy.py`.
+- **The policy is asked in one place:** `Broker.pass_on()` in `proxy.py`,
+  through `github_request.plan()`, for every request to an opened host,
+  before the token is put in. `github_policy.py` decides; do not change
+  what it decides without reading `docs/github-rules.md` and its tests.
+- **An opened host needs the `github` part of `rules.yaml`.** Without it, or
+  with a mistake in it, the broker does not start. Only `github.com` and
+  `api.github.com` can be opened: for any other host the policy refuses
+  every request.
+- **The policy must see what GitHub will see.** It is given the method, the
+  path with its query string, the headers and the body as they arrived, and
+  the broker sends on the same. Do not tidy a request before the policy is
+  asked, and do not hand it a decoded or normalised form: a difference
+  between what is judged and what is sent is a way around the policy.
+- **The API is decided after the body, git before it.** For
+  `api.github.com` the body is read first (at most 1 MiB, not compressed,
+  with a declared length) and a request whose body cannot be read that way
+  is refused. For `github.com` the decision is made from the first lines
+  and the body streams.
+- **A refusal on `api.github.com` is JSON with a `message`,** like GitHub's
+  own errors, because `gh` shows that message and only the status line of
+  a plain-text answer. The message is where the agent is told which
+  `gh api` line to use instead. For git it stays plain text, which git
+  shows line by line.
+- **`with_token` false means no login at all.** With
+  `other_repos: read-public` the policy allows reading unlisted repos
+  without the token. The broker then removes the Authorization header, the
+  placeholder included.
+- **The repos are named in four places:** the `github` part of
+  `rules.yaml`, `vm/agent-instructions.md`, `listed=` in
+  `tests/network-lock.sh`, and `tests/github-live.sh`. A unit test checks
+  the first two against each other.
+- **`nix run .#check` uses GitHub without a login,** and GitHub allows an
+  address 60 such requests an hour. Do not add checks that make many, and
+  run load tests against the stand-in only (`tests/github-broker.sh`).
+- **The local test uses GitHub's real names.** `tests/github-broker.sh`
+  sends requests to `github.com` and `api.github.com` through a broker
+  with this repo's rules, and a script loaded only there sends the broker's
+  connection to a stand-in. So the broker and the policy run unchanged.
 
 ## Things that are easy to get wrong
 
@@ -280,7 +321,14 @@ Update this section when a phase is finished or a decision is made.
   thread in the VM read a GitHub repo through the broker. Not done yet: the
   final check with a real token, `tests/github-live.sh` (push a branch, open
   a pull request). It waits for the user's token in 1Password.
-- **Next, phase 5:** limits on which repos and actions the agent may use.
+- **Phase 5, limits on GitHub:** built, and checked with a made-up token.
+  The broker asks `github_policy.py` about every request to GitHub. The
+  rules list one repo, `madshermansen/nixt3`, for writing; merging and
+  reading other repos are off. `tests/github-broker.sh` shows allowed
+  requests arriving with the token and refused ones never leaving, and
+  `nix run .#check` shows the same refusals from inside the VM. Not done
+  yet, as for phase 4: `tests/github-live.sh` with a real token.
+- **Next, phase 6:** docs, background services, confining the broker.
 - **Decided:** the GitHub token is kept in 1Password. `rules.yaml` names it
   only as `github`. `~/.config/nixt3/tokens.yaml` on the Mac names the
   command that prints it. That command is run once per broker start, and

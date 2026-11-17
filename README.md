@@ -11,8 +11,9 @@ destinations and refuses the rest.
 
 The broker also holds the GitHub token. Programs in the VM log in with a
 placeholder, and the broker puts the real token in its place on the way out,
-so the VM never holds it. Limits on which repos and actions the agent may
-use are planned.
+so the VM never holds it. Because the broker adds the token, it also decides
+which requests go out: only those about the repos you list, and nothing that
+changes a repo's settings, secrets or access.
 
 ![The Mac, the agent VM inside it, the broker, and the internet](docs/images/vm-today.svg)
 
