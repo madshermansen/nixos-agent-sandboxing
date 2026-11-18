@@ -261,7 +261,20 @@ let
       #                        is, which the broker relies on; in HTTP/2 it
       #                        need not. Traffic passed on untouched is not
       #                        affected and may be HTTP/2.
-      exec mitmdump \
+      #
+      # mitmdump gets an environment that is made up here, not the one this
+      # command was run in. mitmproxy, Python and the TLS library each read
+      # variables that change what they do. SSLKEYLOGFILE, which some people
+      # set for good to use Wireshark, makes mitmproxy write the keys of
+      # every encrypted connection to a file, and one of those connections
+      # carries the token. A short list of what is passed is safer than a
+      # growing list of what to remove. The broker checks at start that it
+      # got no more than this (broker/settings.py).
+      exec /usr/bin/env -i \
+        PYTHONUNBUFFERED=1 \
+        AGENT_BROKER_RULES="$AGENT_BROKER_RULES" \
+        AGENT_BROKER_TOKENS_FD=3 \
+        ${mitmproxy}/bin/mitmdump \
         --listen-host 127.0.0.1 \
         --listen-port ${toString ports.broker} \
         --set confdir="$state/broker" \

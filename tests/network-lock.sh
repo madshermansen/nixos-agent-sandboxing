@@ -7,6 +7,8 @@
 # cannot do. A check that hangs counts as blocked, so each one has a time
 # limit.
 #
+# The repo these checks use is the one broker/rules.yaml lists for the agent.
+#
 # No check needs a real GitHub token. What they cannot show without one is
 # the swap itself: GitHub answers "Bad credentials" to a made-up token and to
 # the placeholder alike, so from inside the VM the two look the same. That
@@ -115,11 +117,18 @@ endless_request() {
 }
 must_work "a request that never ends is cut off by the broker" endless_request
 
-must_work "GitHub's API answers" \
-  curl -sf --max-time 15 https://api.github.com/zen
+# The repo that broker/rules.yaml on the Mac lists for the agent, and one
+# that it does not list. Keep the first equal to the rules.
+listed="madshermansen/nixt3"
+unlisted="octocat/Hello-World"
 
-must_work "git can read a public repo" \
-  timeout 30 git ls-remote https://github.com/octocat/Hello-World HEAD
+# GitHub allows an address about 60 requests an hour without a login, and
+# several agents share this one. Asking for the limit itself is free.
+must_work "GitHub's API answers" \
+  curl -sf --max-time 15 https://api.github.com/rate_limit
+
+must_work "git can read the listed repo" \
+  timeout 30 git ls-remote "https://github.com/$listed" HEAD
 
 # Any answer from Anthropic will do; without a key it is an error status.
 case "$(status_of https://api.anthropic.com/v1/models)" in
@@ -170,7 +179,7 @@ must_work "Node trusts the broker's certificate for GitHub" timeout 20 node -e '
 # gh is written in Go, which reads certificates in its own way. Whatever
 # GitHub answers, gh must get the answer and not complain about the
 # certificate. With a made-up token on the Mac the answer is an error.
-answer=$(timeout 30 gh api zen 2>&1)
+answer=$(timeout 30 gh api rate_limit 2>&1)
 if [ $? -eq 124 ] || echo "$answer" | grep -qiE "x509|certificate|tls"; then
   fail "gh gets an answer from GitHub and trusts the broker's certificate"
 else
@@ -219,7 +228,7 @@ case "$answer" in
   *) fail "with the placeholder, GitHub's answer arrives whole" ;;
 esac
 
-curl -s --max-time 15 -H "Authorization: token some-other-token" https://api.github.com/zen |
+curl -s --max-time 15 -H "Authorization: token some-other-token" "https://api.github.com/repos/$listed" |
   grep -q "Refused by the sandbox broker" &&
   pass "a request with any other token is refused by the broker" ||
   fail "a request with any other token is refused by the broker"
@@ -240,16 +249,63 @@ for host in github.com api.anthropic.com; do
 done
 
 must_work "git uses HTTPS for a git@github.com: address" \
-  timeout 30 git ls-remote git@github.com:octocat/Hello-World.git HEAD
+  timeout 30 git ls-remote "git@github.com:$listed.git" HEAD
 
 must_work "git uses HTTPS for an ssh://git@github.com/ address" \
-  timeout 30 git ls-remote ssh://git@github.com/octocat/Hello-World.git HEAD
+  timeout 30 git ls-remote "ssh://git@github.com/$listed.git" HEAD
 
-# About 10 MB, far more than the broker reads into memory at once.
 scratch=$(mktemp -d)
-must_work "a large download gets through: a shallow clone of git itself" \
-  timeout 180 git clone --quiet --depth 1 --no-checkout https://github.com/git/git "$scratch/git"
+must_work "git can clone the listed repo" \
+  timeout 180 git clone --quiet "https://github.com/$listed" "$scratch/clone"
 rm -rf "$scratch"
+
+echo "What the agent may do on GitHub (the policy in the broker):"
+
+# The broker adds the token, so it also decides which requests go out: only
+# those about a listed repo, and only what is allowed there. A refusal is
+# the broker's own answer; the request never reaches GitHub.
+timeout 30 git ls-remote "https://github.com/$unlisted" HEAD 2>&1 | grep -q "is not a repo the sandbox may use" &&
+  pass "git: a repo that is not listed is refused, and git shows the broker's reason" ||
+  fail "git: a repo that is not listed is refused, and git shows the broker's reason"
+
+curl -s --max-time 15 "https://api.github.com/repos/$unlisted" | grep -q "is not a repo the sandbox may use" &&
+  pass "the API: a repo that is not listed is refused with the broker's reason" ||
+  fail "the API: a repo that is not listed is refused with the broker's reason"
+
+timeout 30 git ls-remote "https://github.com/$unlisted" HEAD 2>&1 | grep -q "Trying again" &&
+  pass "the refusal says that trying again will not help" ||
+  fail "the refusal says that trying again will not help"
+
+# Changing a repo's settings is refused on every repo. This one would make
+# the repo private; it is stopped on the Mac and is never sent.
+curl -s --max-time 15 -X PATCH -H "Authorization: token $placeholder" -H "Content-Type: application/json" \
+  --data '{"private":true}' "https://api.github.com/repos/$listed" | grep -q "Refused by the sandbox broker" &&
+  pass "changing the listed repo's settings is refused" ||
+  fail "changing the listed repo's settings is refused"
+
+curl -s --max-time 15 -H "Authorization: token $placeholder" "https://api.github.com/repos/$listed/actions/secrets" |
+  grep -q "Refused by the sandbox broker" &&
+  pass "reading the listed repo's secrets is refused" ||
+  fail "reading the listed repo's secrets is refused"
+
+# What `gh pr close` sends: a change that names its pull request only by an
+# id, which does not prove the repo. The refusal names the line to use instead.
+curl -s --max-time 15 -H "Authorization: token $placeholder" -H "Content-Type: application/json" \
+  --data '{"query":"mutation { closePullRequest(input: {pullRequestId: \"PR_kwDOAbCdEf8AAAABPlDjjg\"}) { clientMutationId } }"}' \
+  https://api.github.com/graphql | grep -q "gh api" &&
+  pass "a change by the id of a pull request is refused, and the refusal names the gh api line to use" ||
+  fail "a change by the id of a pull request is refused, and the refusal names the gh api line to use"
+
+# An allowed request is passed on, and it is GitHub that answers: with the
+# repo when the token on the Mac is real, with "Bad credentials" when it is
+# a made-up one. Either way it is not the broker's refusal.
+answer=$(curl -s --max-time 15 -H "Authorization: token $placeholder" "https://api.github.com/repos/$listed/pulls?per_page=1") ||
+  answer="curl did not get a whole answer"
+case "$answer" in
+  *"Refused by the sandbox broker"* | "curl did not"*) fail "reading the listed repo's pull requests is passed on to GitHub" ;;
+  "["* | *"Bad credentials"*) pass "reading the listed repo's pull requests is passed on to GitHub" ;;
+  *) fail "reading the listed repo's pull requests is passed on to GitHub" ;;
+esac
 
 echo "Around the broker:"
 

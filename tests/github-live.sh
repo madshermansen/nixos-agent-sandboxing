@@ -3,8 +3,13 @@
 # the VM, with the real token on the Mac and none in the VM.
 #
 # It clones a repo over HTTPS, pushes a branch, opens a pull request with gh,
-# then closes the pull request and deletes the branch again. Every step goes
-# through the broker, which puts the real token in place of the placeholder.
+# comments on it, then closes the pull request and deletes the branch again.
+# Every step goes through the broker, which puts the real token in place of
+# the placeholder, and lets through only what the `github` rules allow. So
+# the steps are the ones those rules allow: `gh pr create` works, while
+# commenting and closing go through `gh api`, because `gh pr comment` and
+# `gh pr close` are refused (docs/github-rules.md says why). The script also
+# checks that two things are refused that should be.
 #
 # This one needs a real token: set up ~/.config/nixt3/tokens.yaml on the Mac
 # first (see docs/setup.md), and restart the VM. Then, from the repo on the
@@ -16,8 +21,9 @@
 #
 #   nix run .#ssh -- bash -s -- owner/name < tests/github-live.sh
 #
-# The token must be allowed to push to that repo and to open pull requests in
-# it. It leaves nothing behind when it passes. If it stops half way, it says
+# The repo must be listed in broker/rules.yaml with `access: write` and its
+# `id`, and the token must be allowed to push to it and to open pull requests
+# in it. It leaves nothing behind when it passes. If it stops half way, it says
 # what is left to remove by hand.
 
 set -u
@@ -80,15 +86,45 @@ pr=$(timeout 120 gh pr create --repo "$repo" --base "$base" --head "$branch" \
 }
 pass "opened $pr"
 
-timeout 120 gh pr close "$pr" --comment "Closed by tests/github-live.sh." >/dev/null 2>"$work/error" ||
+number=${pr##*/}
+
+# `gh pr close` names the pull request by an id, which the broker cannot tie
+# to a repo. It must be refused, and the refusal must name the way on.
+if timeout 120 gh pr close "$pr" >"$work/refusal" 2>&1; then
+  pr=""
+  stop "\`gh pr close\` went through. The broker should have refused it"
+fi
+if grep -q "gh api" "$work/refusal"; then
+  pass "\`gh pr close\` is refused, and the refusal names the gh api line to use"
+elif grep -q "Refused by the sandbox broker" "$work/refusal"; then
+  pass "\`gh pr close\` is refused by the broker"
+  echo "  note  gh did not show the whole refusal, so the agent would not see the way on."
+else
+  stop "\`gh pr close\` failed, but not with the broker's refusal: $(tail -n 1 "$work/refusal")"
+fi
+
+timeout 120 gh api "repos/$repo/issues/$number/comments" -f body="A comment from tests/github-live.sh." \
+  >/dev/null 2>"$work/error" ||
+  stop "commenting on the pull request failed: $(tail -n 1 "$work/error")"
+pass "commented on the pull request with gh api"
+
+timeout 120 gh api -X PATCH "repos/$repo/pulls/$number" -f state=closed >/dev/null 2>"$work/error" ||
   stop "closing the pull request failed: $(tail -n 1 "$work/error")"
 pr=""
-pass "closed the pull request"
+pass "closed the pull request with gh api"
 
 timeout 120 git push --quiet origin --delete "$branch" 2>"$work/error" ||
   stop "deleting the branch failed: $(tail -n 1 "$work/error")"
 pushed=no
 pass "deleted the branch"
+
+# A repo that is not listed must be out of reach, token or not.
+if timeout 60 git ls-remote https://github.com/octocat/Hello-World HEAD >"$work/refusal" 2>&1; then
+  stop "a repo that is not in the rules could be read"
+fi
+grep -q "is not a repo the sandbox may use" "$work/refusal" ||
+  stop "a repo that is not in the rules failed, but not with the broker's refusal"
+pass "a repo that is not in the rules is refused"
 
 # The clone's settings are where a token would end up if git had been given
 # one, for example in the address of the remote.
