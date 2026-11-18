@@ -1,0 +1,153 @@
+;; The sandbox the broker runs in.
+;;
+;; The broker (mitmdump with proxy.py) is the one program on the Mac that
+;; reads what the agent VM sends. It is a large program, and a bug in it
+;; could let a hostile program in the VM run code on the Mac. Without this
+;; file that code would have all of the user's rights: every file, every
+;; key, every program. With it, macOS itself holds the broker to the short
+;; list below, and nothing the broker does can lift that.
+;;
+;; This is a profile for macOS's built-in sandbox, put on by
+;; /usr/bin/sandbox-exec just before mitmdump starts; see `brokerRun` in
+;; ../darwin/commands.nix. The language is a small Scheme. A rule names an
+;; operation (reading a file, connecting out) and what it applies to.
+;;
+;; The start command passes three values:
+;;
+;;   BROKER_DIR  the broker's own folder, `broker` in the state folder,
+;;               as a full path without symbolic links
+;;   PORT        the port the broker listens on
+;;   RULES       the rules file, as a full path without symbolic links
+;;
+;; This file is not the whole profile. When the commands are built, rules
+;; for the Nix store are added below it: reading the packages mitmproxy is
+;; made of and the broker's own scripts, and starting mitmdump. They are
+;; worked out from the packages, so they cannot be written here by hand;
+;; `brokerSandbox` in ../darwin/commands.nix adds them, and
+;; tests/broker-sandbox.sh shows the result.
+;;
+;; What the sandbox cannot hold back is in docs/threat-model.md, under
+;; "The broker is confined".
+;;
+;; To change this file: run tests/broker-sandbox.sh, which tries each thing
+;; below from inside the sandbox, and tests/github-broker.sh, which runs a
+;; whole broker in it. A rule that is missing shows as a broker that does
+;; not start; macOS writes what it refused to its log:
+;;
+;;   log show --last 2m --predicate 'sender == "Sandbox"' | grep deny
+
+(version 1)
+
+;; Everything is refused unless a rule below allows it. That covers files,
+;; the network, starting programs, and talking to other programs and to the
+;; system's services. So the list below is all the broker can do. In
+;; particular there is no rule for:
+;;
+;;   process-fork  the broker cannot start a second process, so it can run
+;;                 no program beside itself
+;;   mach-lookup   it cannot talk to the system's services: the keychain,
+;;                 the clipboard, the screen, other programs
+;;   reading or writing anywhere in the home folder but its own folder
+(deny default)
+
+;; --- Reading -----------------------------------------------------------
+
+;; The parts of macOS that every program is made of: the system's
+;; libraries. Nothing of the user's is in these folders.
+(allow file-read*
+  (subpath "/usr/lib")
+  (subpath "/System/Library")
+  (subpath "/System/Volumes/Preboot/Cryptexes/OS")
+  (subpath "/System/Cryptexes/OS"))
+
+;; The time zone, so that the times in the log are the Mac's.
+(allow file-read*
+  (literal "/private/etc/localtime")
+  (subpath "/private/var/db/timezone")
+  (subpath "/usr/share/zoneinfo")
+  (subpath "/usr/share/zoneinfo.default"))
+
+;; Random numbers for the encryption, and the place where unwanted output
+;; goes.
+(allow file-read*
+  (literal "/dev/null")
+  (literal "/dev/random")
+  (literal "/dev/urandom"))
+(allow file-write-data (literal "/dev/null"))
+
+;; A program looks at each folder on the way to a file. This allows seeing
+;; that the folders above the allowed ones exist, and what kind of thing
+;; they are. It does not allow listing them or reading anything in them.
+(allow file-read-metadata
+  (literal "/")
+  (literal "/nix")
+  (literal "/nix/store")
+  (literal "/etc")
+  (literal "/var")
+  (literal "/tmp")
+  (literal "/private")
+  (literal "/private/etc")
+  (literal "/private/var")
+  (literal "/private/var/db")
+  (literal "/usr")
+  (literal "/usr/share")
+  (literal "/System")
+  (literal "/dev")
+  (path-ancestors (param "BROKER_DIR"))
+  (path-ancestors (param "RULES")))
+
+;; The rules. By default they are the repo's copy in the Nix store. A file
+;; named in AGENT_BROKER_RULES for `nix run .#broker` can be anywhere, so
+;; this one file is allowed by its name.
+(allow file-read* (literal (param "RULES")))
+
+;; --- Reading and writing ------------------------------------------------
+
+;; The broker's own folder, where mitmproxy keeps its certificate authority.
+;; This is the only place the broker can create, change or delete a file.
+;;
+;; The log is not in it and needs no rule: the start command opens the log
+;; and hands it to the broker already open, as its output. The same goes
+;; for the pipe the tokens arrive on. The sandbox is asked when a file is
+;; opened, not when an open one is written to.
+(allow file-read* file-write* (subpath (param "BROKER_DIR")))
+
+;; --- The network ---------------------------------------------------------
+
+;; Listen on the broker's port, where the VM's connections arrive.
+;;
+;; The profile language knows two names for a machine: "*", any machine,
+;; and "localhost", this Mac by any of its addresses. It has no name for
+;; 127.0.0.1 alone. So this rule cannot hold the broker to the address that
+;; only programs on this Mac can reach; mitmproxy's `--listen-host
+;; 127.0.0.1` does that, and proxy.py refuses to run with another value. A
+;; broker that was taken over could listen on this one port on the Mac's
+;; network address as well. See docs/threat-model.md.
+(allow network-bind network-inbound
+  (local ip (string-append "localhost:" (param "PORT"))))
+
+;; Connect out to port 443, the port of HTTPS, on any machine. The profile
+;; language cannot tell machines apart by name or by address, so which
+;; hosts the broker connects to stays the job of proxy.py and rules.yaml.
+;; What this rule adds is that every other port is out of reach.
+(allow network-outbound (remote ip "*:443"))
+
+;; But not to this Mac itself, by any of its addresses. Programs on a Mac
+;; often trust whatever comes from the Mac. A later rule wins over an
+;; earlier one, so this takes the Mac's own port 443 back out of the rule
+;; above.
+(deny network-outbound (remote ip "localhost:*"))
+
+;; Looking up a host's address. macOS does that in a service of its own,
+;; which a program reaches through this socket.
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))
+
+;; --- What a program needs to run at all ---------------------------------
+
+;; The top folder itself. macOS's loader opens it when a program starts,
+;; and no program starts without this. It holds only the names of the
+;; system's main folders.
+(allow file-read-data (literal "/"))
+
+;; Reading facts about the machine, such as the number of processors.
+(allow sysctl-read)

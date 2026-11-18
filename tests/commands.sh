@@ -378,6 +378,7 @@ wait_for sh -c "(exec 3<>/dev/tcp/127.0.0.1/$t3_port)"
 check "it ends with 0 when everything is up" test "$(status_of)" = 0
 check "it says the VM runs on its normal disk" said "$work/status.out" "on its normal disk"
 check "it shows the broker's own start line" grep -qE "^ +[0-9T:+-]+ started destinations=" "$work/status.out"
+check "it says that macOS holds the broker in its sandbox" said "$work/status.out" "confined: macOS holds it in the sandbox"
 check "it says Claude is signed in, and not as whom" \
   sh -c 'grep -qF "signed in inside the VM" "$1" && ! grep -qF "someone@example.com" "$1"' sh "$work/status.out"
 
@@ -417,6 +418,29 @@ check "the broker has ended" sh -c "! (exec 3<>/dev/tcp/127.0.0.1/$broker_port) 
 check_not "qemu.pid and qmp.sock are gone" sh -c 'test -e "$1/qemu.pid" || test -e "$1/qmp.sock"' sh "$state"
 check "nothing of the test is left running" nothing_runs
 check "status ends with 2 again" test "$(status_of)" = 2
+
+# A broker that is not in the sandbox. One started by these commands refuses
+# to run that way, so on a real Mac it can only be a broker from a checkout
+# older than the sandbox. A stand-in plays it here: a program with
+# "mitmdump" in its command line that listens on the broker's port.
+"$built/python" -c '
+import socket, sys
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", int(sys.argv[2])))
+server.listen(8)
+while True:
+    server.accept()[0].close()
+' mitmdump "$broker_port" &
+old_broker=$!
+echo "$old_broker" >"$state/broker.pid"
+wait_for broker_up
+check "status warns about a broker that is in no sandbox" \
+  sh -c 'test "$1" = 2 && grep -qE "^ +warn +not confined .*in no sandbox at all" "$2"' sh "$(status_of)" "$work/status.out"
+check_not "and does not call it confined" said "$work/status.out" "confined: macOS holds it"
+kill "$old_broker"
+wait_for gone "$old_broker"
+rm -f "$state/broker.pid"
 
 # --- A qemu.pid that outlived its VM -----------------------------------------
 

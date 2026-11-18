@@ -648,6 +648,78 @@ if [ ! -x "$broker" ]; then
   exit 1
 fi
 
+# The broker runs inside a sandbox of macOS (broker/sandbox.sb). It can read
+# what it is made of, the rules and its own folder, listen on the real
+# broker's port, and connect out to port 443 of other machines, and that is
+# all. tests/broker-sandbox.sh checks the sandbox itself. Here every broker
+# runs in it too, which shows that a whole broker works confined.
+#
+# This test needs four things the sandbox does not give:
+#
+#   - its own ports to listen on, because the real broker may be running;
+#   - a connection to the stand-in, which is a program on this Mac. That is
+#     exactly what the sandbox forbids the real broker;
+#   - reading the two helper scripts, the files that steer them, and the
+#     stand-in's certificate authority, which are in the test's folder;
+#   - writing two files there: one in which a helper script reports, and
+#     `flows`, which mitmproxy creates when it is given the setting
+#     `save_stream_file`, before the broker's own check of the settings
+#     runs. Without it the sandbox would stop that start first, and the
+#     test could not show that the broker refuses the setting.
+#
+# The start command has no way to take more rules: no variable and no
+# option reaches the sandbox, so that nothing can loosen it for the real
+# broker. So the test does not ask it to. It makes a copy of the start
+# command's two scripts for itself, and in the copy names a profile of its
+# own: the real profile, with the test's rules added at the end. The real
+# scripts and the real profile are in the Nix store and are not changed.
+#
+# The added rules name single files, not the test's folder: the broker
+# checks at start that the folder around its own is out of reach
+# (broker/confinement.py), and the state folders used here are in the
+# test's folder.
+run=$(grep -o '/nix/store/[a-z0-9]*-agent-vm-broker-run/bin/agent-vm-broker-run' "$broker" | head -n 1)
+profile=$(grep -o '/nix/store/[a-z0-9]*-broker-sandbox.sb' "$run" | head -n 1)
+if [ ! -f "$profile" ]; then
+  echo "The test did not find the sandbox profile in the start command: $run"
+  exit 1
+fi
+# The sandbox goes by full paths without symbolic links, and the temporary
+# folder of a Mac is reached through one.
+real_work=$(cd "$work" && pwd -P)
+mkdir "$work/third"
+{
+  cat "$profile"
+  cat <<EOF
+
+;; --- Added by tests/github-broker.sh, for this run of the test only ---
+(allow network-bind network-inbound
+  (local ip "localhost:$broker_port")
+  (local ip "localhost:$second_port"))
+;; After the rule that refuses this Mac's own ports, so this one wins.
+(allow network-outbound (remote ip "localhost:$server_port"))
+(allow file-read*
+  (literal "$real_work/redirect.py")
+  (literal "$real_work/inject.py")
+  (literal "$real_work/stand-in-port")
+  (literal "$real_work/fail")
+  (literal "$real_work/ca.pem")
+  (subpath "$real_work/third"))
+(allow file-write*
+  (literal "$real_work/fail.limits")
+  (literal "$real_work/third/fail.limits")
+  (literal "$real_work/flows"))
+EOF
+} >"$work/sandbox.sb"
+sed "s|$profile|$work/sandbox.sb|" "$run" >"$work/agent-vm-broker-run"
+sed "s|$run|$work/agent-vm-broker-run|" "$broker" >"$work/agent-vm-broker"
+chmod +x "$work/agent-vm-broker-run" "$work/agent-vm-broker"
+if ! grep -q "$work/sandbox.sb" "$work/agent-vm-broker-run" || ! grep -q "$work/agent-vm-broker-run" "$work/agent-vm-broker"; then
+  echo "The test could not put its profile into a copy of the start command."
+  exit 1
+fi
+broker="$work/agent-vm-broker"
+
 # start_broker <log file> [variable=value...]: starts the broker in the
 # background with this test's state folder and port, and this repo's rules
 # unless a variable names other ones. What is in `extra` is added to
@@ -800,17 +872,28 @@ if [ -s "$work/flows" ]; then fail "nothing was written to the traffic file"; el
 # below are all started with a hostile one). Here mitmproxy is started by
 # hand, the way the start command does, but with the shell's environment:
 # the broker itself must then refuse.
-run=$(grep -o '/nix/store/[a-z0-9]*-agent-vm-broker-run/bin/agent-vm-broker-run' "$broker" | head -n 1)
 mitmdump=$(grep -o '/nix/store/[^ "]*/bin/mitmdump' "$run" | head -n 1)
 proxy_script=$(grep -o '/nix/store/[^ "]*-broker/proxy.py' "$run" | head -n 1)
-# by_hand <variable=value> [size]: starts mitmproxy with the broker's script
-# and that one variable more, and with `stream_large_bodies` set to the size
-# if one is given. Prints what it said.
+# by_hand <variable=value> [size] [unconfined]: starts mitmproxy with the
+# broker's script and that one variable more, and with `stream_large_bodies`
+# set to the size if one is given. It is started inside the sandbox, as the
+# start command does, unless the third word says otherwise. Prints what it
+# said.
+mkdir -p "$work/state-by-hand"
 by_hand() {
-  /usr/bin/env -i PYTHONUNBUFFERED=1 AGENT_BROKER_RULES="${proxy_script%proxy.py}rules.yaml" "$1" \
-    "$mitmdump" --listen-host 127.0.0.1 --listen-port "$broker_port" --set confdir="$work/state-by-hand" \
-    --set connection_strategy=lazy --set flow_detail=0 --set termlog_verbosity=error --set onboarding=false \
-    --set stream_large_bodies="${2:-1m}" --set rawtcp=false --set http2=false --scripts "$proxy_script" 2>&1 &
+  local sandbox=(/usr/bin/sandbox-exec -f "$work/sandbox.sb" -D BROKER_DIR="$real_work/state-by-hand"
+    -D PORT="$broker_port" -D RULES="${proxy_script%proxy.py}rules.yaml")
+  if [ "${3:-}" = unconfined ]; then sandbox=(); fi
+  # Started in the broker's folder, as the start command does: the folder
+  # the test runs in is out of reach inside the sandbox.
+  (
+    cd "$work/state-by-hand" &&
+      exec /usr/bin/env -i PYTHONUNBUFFERED=1 AGENT_BROKER_RULES="${proxy_script%proxy.py}rules.yaml" "$1" \
+        ${sandbox[@]+"${sandbox[@]}"} \
+        "$mitmdump" --listen-host 127.0.0.1 --listen-port "$broker_port" --set confdir="$work/state-by-hand" \
+        --set connection_strategy=lazy --set flow_detail=0 --set termlog_verbosity=error --set onboarding=false \
+        --set stream_large_bodies="${2:-1m}" --set rawtcp=false --set http2=false --scripts "$proxy_script"
+  ) 2>&1 &
   local pid=$!
   for _ in $(seq 100); do
     kill -0 "$pid" 2>/dev/null || break
@@ -843,6 +926,13 @@ if [ -x "$mitmdump" ] && [ -f "$proxy_script" ]; then
   case "$(by_hand PYTHONUNBUFFERED=1 1k)" in
     *'`stream_large_bodies` must be'*) pass "started by hand with stream_large_bodies=1k: the broker does not start, and says why" ;;
     *) fail "started by hand with stream_large_bodies=1k: the broker does not start, and says why" ;;
+  esac
+  # The same start, as the start command does it but for the sandbox: the
+  # broker asks macOS whether it is confined, and refuses to run.
+  case "$(by_hand PYTHONUNBUFFERED=1 1m unconfined)" in
+    *"IT STARTED"*) fail "started by hand without the sandbox: the broker does not start" ;;
+    *"not starting, because it is not confined"*"is in no sandbox at all"*) pass "started by hand without the sandbox: the broker does not start, and says why" ;;
+    *) fail "started by hand without the sandbox: the broker does not start, and says why" ;;
   esac
 else
   fail "the test found mitmdump and the broker's script in the start command"
@@ -1467,7 +1557,6 @@ echo "A setting that changes while the broker runs:"
 
 # A third broker, with helper scripts of its own, so that what is done to it
 # does not touch the one the other checks use.
-mkdir "$work/third"
 cp "$work/redirect.py" "$work/inject.py" "$work/stand-in-port" "$work/third/"
 third_port=$second_port
 # start_third <log file>: starts it; its id is in second_pid, so that it is
