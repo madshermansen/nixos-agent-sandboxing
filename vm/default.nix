@@ -20,10 +20,17 @@ let
 
   # Programs find the broker through these variables. Both spellings are set
   # because programs disagree on which one they read.
+  #
+  # Node reads them only when NODE_USE_ENV_PROXY is set. Without it, a
+  # request that a Node program makes by itself goes straight out, which in
+  # this VM means nowhere. The T3 server is such a program: it asks GitHub
+  # about a repo with a request of its own, not through `gh`, and that failed
+  # with "lookupRepository failed for github" until this was set.
   proxyVariables = {
     HTTP_PROXY = brokerUrl;
     HTTPS_PROXY = brokerUrl;
     NO_PROXY = "127.0.0.1,localhost";
+    NODE_USE_ENV_PROXY = "1";
   };
 
   # What programs in the VM use in place of a GitHub token. It is public and
