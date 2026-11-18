@@ -23,6 +23,8 @@
 {
   lib,
   callPackage,
+  runCommand,
+  writeClosure,
   writeShellApplication,
   coreutils,
   curl,
@@ -199,6 +201,56 @@ let
     }
   '';
 
+  # The sandbox the broker runs in, as one file for macOS's `sandbox-exec`.
+  # It is ../broker/sandbox.sb, which says what the broker may do and why,
+  # with the rules below it that depend on what was built and so cannot be
+  # written by hand:
+  #
+  #   - Reading the packages mitmproxy is made of, by their paths in the Nix
+  #     store, and the broker's own scripts. The rest of the store stays out
+  #     of reach. Nothing secret belongs in the store, but it holds a copy
+  #     of every project that was ever built from a checkout on this Mac.
+  #   - Starting mitmdump. The sandbox is put on before mitmdump starts, so
+  #     that start has to be allowed. mitmdump is a small script that turns
+  #     into the script beside it, and each of the two is run by the program
+  #     its first line names (a shell, Python). Those four files are all
+  #     that can be started. A broker that was taken over could at most
+  #     start itself again, in the same sandbox.
+  #
+  # If a later nixpkgs wraps mitmdump another way, this fails to build or
+  # the broker fails to start, and tests/broker-sandbox.sh says which.
+  brokerSandbox = runCommand "broker-sandbox.sb" { } ''
+    {
+      cat ${brokerFiles}/sandbox.sb
+      echo
+      echo ";; --- Added when the commands were built (darwin/commands.nix) ---"
+      echo
+      echo ";; The broker's own scripts and the repo's rules."
+      echo "(allow file-read* (subpath \"${brokerFiles}\"))"
+      echo
+      echo ";; mitmproxy and every package it needs."
+      while read -r path; do
+        echo "(allow file-read* (subpath \"$path\"))"
+      done <${writeClosure [ mitmproxy ]}
+      echo
+      echo ";; Starting mitmdump: the two scripts, and the program that runs each."
+      for program in ${mitmproxy}/bin/mitmdump ${mitmproxy}/bin/.mitmdump-wrapped; do
+        while true; do
+          if [ ! -f "$program" ]; then
+            echo "broker-sandbox: $program is not there. mitmdump is wrapped in another way than darwin/commands.nix expects." >&2
+            exit 1
+          fi
+          echo "(allow process-exec (literal \"$program\"))"
+          if [ "$(head -c 2 "$program")" != "#!" ]; then
+            break
+          fi
+          # The first line of a script: `#!`, then the program that runs it.
+          read -r program _ < <(head -n 1 "$program" | cut -c 3-)
+        done
+      done
+    } >$out
+  '';
+
   # Runs the broker in the foreground. The two commands below start it: one
   # for a terminal, one for the background.
   brokerRun = writeShellApplication {
@@ -270,10 +322,43 @@ let
       # carries the token. A short list of what is passed is safer than a
       # growing list of what to remove. The broker checks at start that it
       # got no more than this (broker/settings.py).
+      #
+      # mitmdump is started inside a sandbox of macOS, by `sandbox-exec`. It
+      # is the one program on the Mac that reads what the VM sends, so a bug
+      # in it is a way onto the Mac. In the sandbox it can read what it is
+      # made of, the rules and its own folder; write to its own folder;
+      # listen on its port; look names up and connect out to port 443. It
+      # can start no program and reach nothing else of the user's. The rules
+      # and the reasons are in broker/sandbox.sb.
+      #
+      # Only this last step is inside. Fetching the tokens, above, has to
+      # stay outside: it runs the user's password manager.
+      #
+      # If the sandbox cannot be put on (no `sandbox-exec`, a profile macOS
+      # does not accept), `sandbox-exec` ends with an error and mitmdump is
+      # never started. So there is then no broker, and no VM. The broker
+      # also asks macOS at its start whether it is held, and refuses to run
+      # if not (broker/confinement.py).
+      #
+      # The sandbox goes by full paths without symbolic links, so the two
+      # paths it is given are made such. The rules file is handed to the
+      # broker in that form too, because the broker is started in its own
+      # folder and a path such as `./rules.yaml` would no longer fit. `-m`
+      # accepts a file that is not there; the broker then says so itself.
+      broker_dir=$(${coreutils}/bin/realpath "$state/broker")
+      rules=$(${coreutils}/bin/realpath -m "$AGENT_BROKER_RULES")
+      # The folder this command was run in is out of reach in the sandbox,
+      # and a program that cannot look at the folder it is in complains.
+      cd "$broker_dir"
       exec /usr/bin/env -i \
         PYTHONUNBUFFERED=1 \
-        AGENT_BROKER_RULES="$AGENT_BROKER_RULES" \
+        AGENT_BROKER_RULES="$rules" \
         AGENT_BROKER_TOKENS_FD=3 \
+        /usr/bin/sandbox-exec \
+        -f ${brokerSandbox} \
+        -D BROKER_DIR="$broker_dir" \
+        -D PORT=${toString ports.broker} \
+        -D RULES="$rules" \
         ${mitmproxy}/bin/mitmdump \
         --listen-host 127.0.0.1 \
         --listen-port ${toString ports.broker} \
