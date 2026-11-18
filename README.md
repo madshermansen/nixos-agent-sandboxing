@@ -11,8 +11,9 @@ destinations and refuses the rest.
 
 The broker also holds the GitHub token. Programs in the VM log in with a
 placeholder, and the broker puts the real token in its place on the way out,
-so the VM never holds it. Limits on which repos and actions the agent may
-use are planned.
+so the VM never holds it. Because the broker adds the token, it also decides
+which requests go out: only those about the repos you list, and nothing that
+changes a repo's settings, secrets or access.
 
 ![The Mac, the agent VM inside it, the broker, and the internet](docs/images/vm-today.svg)
 
@@ -21,12 +22,15 @@ use are planned.
 With the Linux builder on (see [setup](docs/setup.md)):
 
 ```sh
-nix run .#vm     # start the VM and its broker; the terminal becomes the console
-nix run .#stop   # shut both down cleanly, from another terminal
-nix run .#ssh    # open a shell in the VM as the `agent` user
-nix run .#pair   # add the VM to the T3 app as an environment
-nix run .#logs   # watch which destinations the VM asks for
-nix run .#check  # test the network lock from inside the VM
+nix run .#vm         # start the VM and its broker; the terminal becomes the console
+nix run .#stop       # shut both down cleanly, from another terminal
+nix run .#status     # one screen that says whether everything is up
+nix run .#ssh        # open a shell in the VM as the `agent` user
+nix run .#pair       # add the VM to the T3 app as an environment
+nix run .#logs       # watch which destinations the VM asks for
+nix run .#check      # test the network lock from inside the VM
+nix run .#vm-fresh   # a throwaway run: what the VM writes is discarded when it stops
+nix run .#update-t3  # bring the T3 server in the VM to the version of the T3 app
 ```
 
 Claude also needs a one-time sign-in inside the VM. The steps are in

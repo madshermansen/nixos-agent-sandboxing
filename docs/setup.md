@@ -131,6 +131,7 @@ t3 environment link http://127.0.0.1:3774 --pairing-code <code>
 | Task | Command |
 | --- | --- |
 | Start the VM | `nix run .#vm` |
+| See whether everything is up | `nix run .#status` |
 | Open a shell in it | `nix run .#ssh` |
 | Add it to the T3 app | `nix run .#pair` |
 | Run one command in it | `nix run .#ssh -- <command>` |
@@ -139,11 +140,56 @@ t3 environment link http://127.0.0.1:3774 --pairing-code <code>
 | Test the network lock and the GitHub setup | `nix run .#check` |
 | Test GitHub end to end with the real token | `nix run .#ssh -- bash -s < tests/github-live.sh` |
 | Test the token swap without a VM or a token | `tests/github-broker.sh` |
+| Test the commands on this page without a VM | `tests/commands.sh` |
 | Stop the VM and the broker | `nix run .#stop` |
+| Start a clean VM for one task, keeping the sign-in and the link to T3 | `nix run .#vm-fresh` |
+| Bring the T3 server in the VM to the T3 app's version | `nix run .#update-t3` |
 | Start over with a clean VM | Stop it, then delete `~/.local/state/agent-vm` |
 
 Starting over removes everything in `/home/agent`, including the Claude
 sign-in, and the link to T3 has to be made again.
+
+### Is it working?
+
+`nix run .#status` answers on one screen: whether the VM and the broker run
+and for how long, whether SSH and the T3 server answer, whether the T3
+server is the version of the T3 app, whether Claude is signed in, whether the
+tokens file is in order, whether an agent holds the VM, what the broker
+refused last, and how large the disk and the logs are. It changes nothing
+and takes about a second.
+
+A line marked `FAIL` is something that should be up and is not. A line marked
+`warn` works today but wants attention. The command ends with status 0 when
+everything is up, 1 when a line says `FAIL`, and 2 when the VM is simply not
+running or is still starting, so a script can wait for the VM with it.
+
+### A throwaway run
+
+`nix run .#vm-fresh` starts the VM from its disk as it is now, so Claude is
+signed in and T3 is paired, and discards everything written during that run
+when the VM stops: cloned repos, T3's threads, changed settings. The normal
+disk is not changed. Nothing is built, so it starts as fast as the normal
+VM. Stop it with `nix run .#stop` as usual; every other command works on it
+too, and `nix run .#status` says which kind is running.
+
+Things to know:
+
+- It cannot run beside the normal VM. Stop that one first.
+- What you want to keep from a throwaway run has to leave it before it
+  stops, for example as a pushed branch.
+- The T3 app on the Mac may still list threads from a throwaway run. The
+  server no longer has them.
+- If Claude renews its sign-in during a throwaway run, the renewal is
+  discarded with the rest. Should the normal VM then ask you to sign in
+  again, do so. This has not been seen to happen.
+
+### The logs
+
+`broker.log` and `console.log` in the state folder are kept from growing
+without end. When one is larger than 5 MiB at a start, it is moved aside as
+`broker.log.1`, and up to three such older parts are kept. This happens at a
+start only, because a running broker cannot be told to switch files; a log
+can pass the limit during a long run, and `nix run .#status` then says so.
 
 ## Allowing a destination
 
@@ -167,6 +213,45 @@ When you end it, the VM has no way out until the next start.
 Every host on the list is a place the agent can send data to, so add only
 what a task needs.
 
+## Letting the agent use a repo
+
+The agent can use only the repos listed in the `github` part of
+[`broker/rules.yaml`](../broker/rules.yaml). A request about any other repo
+is refused by the broker, and the agent is told so:
+`Refused by the sandbox broker: owner/name is not a repo the sandbox may use.`
+
+To list a repo, add an entry:
+
+```yaml
+github:
+  repos:
+    - repo: your-name/your-repo
+      note: The repo the agent works on.
+      access: write
+      id: R_kgDOExample1
+```
+
+- `access` is `read` (clone, fetch, read pull requests and issues) or
+  `write` (also push, open and work on pull requests, comment).
+- `id` is needed for `gh pr create`. It is public; get it with
+  `gh repo view your-name/your-repo --json id --jq .id`.
+- Merging pull requests stays refused unless the entry says `merge: true`.
+
+Then restart the broker: `nix run .#stop` and `nix run .#vm`, or
+`nix run .#broker` in a terminal while the VM keeps running. A mistake in
+the file stops the broker from starting, and the message names the entry
+and says what to fix. The token must also be allowed to use the repo; that
+is set on GitHub.
+
+Update the list of repos in [`vm/agent-instructions.md`](../vm/agent-instructions.md)
+as well, so that the agent knows what it may use; that takes effect at the
+next start of the VM. The line `listed=` in
+[`tests/network-lock.sh`](../tests/network-lock.sh) names the repo that
+`nix run .#check` reads; keep it a repo that is listed.
+
+What is allowed in a listed repo, what is refused everywhere, and which
+`gh` commands work is in [github-rules.md](github-rules.md).
+
 ## Changing the GitHub token
 
 Change the command in `~/.config/nixt3/tokens.yaml`, or the secret it points
@@ -181,8 +266,20 @@ again.
 ## Updating T3
 
 The T3 server in the VM should be the same version as the T3 app on the Mac.
-When the app updates, change the version and checksum in
-[`vm/t3.nix`](../vm/t3.nix) and restart the VM. The checksum is the line for
+`nix run .#status` warns when they differ. When the app has updated, run this
+in your clone of the repo:
+
+```sh
+nix run .#update-t3
+```
+
+It reads the app's version, fetches the checksum of that release from
+GitHub, and writes both into [`vm/t3.nix`](../vm/t3.nix). Then restart the
+VM (`nix run .#stop`, `nix run .#vm`); that start builds the VM anew. Commit
+the change to keep it. To pin another version than the app's, name it:
+`nix run .#update-t3 -- 0.1.8`.
+
+By hand it is the same two values: the version, and the line for
 `linux-arm64` in the release's `SHA256SUMS` file on GitHub.
 
 ## Problems
@@ -209,10 +306,34 @@ The request to GitHub carried a login other than the placeholder, for
 example a token in a git address or in `GH_TOKEN`. The broker never passes
 those on. Remove it; `git` and `gh` in the VM need no login of their own.
 
+**The agent is refused with "is not a repo the sandbox may use".**
+The repo is not in the `github` part of `broker/rules.yaml`. See "Letting
+the agent use a repo" above. `nix run .#logs` shows the refusal as
+`repo-not-listed`, with the path that names the repo.
+
+**`gh pr comment`, `gh pr close` or another `gh pr` command is refused.**
+The change is allowed, but not in the form `gh` sends it, which names the
+pull request by an id that does not prove its repo. The refusal names the
+`gh api` line that does the same. [github-rules.md](github-rules.md) has
+the table.
+
 **A program in the VM reports a certificate error for GitHub.**
 The VM trusts the broker's certificate only when it was started with
 `nix run .#vm`, which hands the certificate over. If the broker's folder in
 the state folder was deleted while the VM ran, restart the VM.
+
+**`nix run .#vm` says "a VM is running or starting".**
+Only one VM can use the disk at a time, the normal one or a throwaway run.
+`nix run .#status` shows which one runs, or that one is starting.
+`nix run .#stop` stops it. If it is still starting, stop waits for it to
+come up, for at most 90 seconds, and shuts it down then; if the start takes
+longer than that, stop ends with an error and changes nothing, and you can
+end the start command itself or run stop again.
+
+**`nix run .#ssh` says "there is no SSH key for the VM".**
+The key is made by `nix run .#vm` the first time it starts the VM. Without
+it the command does not start `ssh` at all, because `ssh` would then try
+your own keys on the VM.
 
 **`nix shell` or `nix run` fails inside the VM.**
 Nix's download servers are not on the list of destinations. Add tools to

@@ -46,6 +46,9 @@
 # If this file is missing or has a mistake in it, the broker refuses to start.
 # It never falls back to letting everything through. The same goes for a token
 # that an entry names and the broker cannot get.
+#
+# The file has a second part, `github:`, at the end. It says which repos the
+# agent may use on GitHub. It is explained there.
 
 destinations:
   # Claude Code. Passed on untouched: the broker has no business reading what
@@ -66,3 +69,47 @@ destinations:
     note: The GitHub API, used by the gh command.
     inspect: true
     token: github
+
+# What the agent may do on GitHub.
+#
+# The broker adds your GitHub token to the requests it lets through to the two
+# GitHub hosts above, so it also decides which requests those are. This part
+# lists the repos the agent may use. A request about any other repo is
+# refused, and so is everything that could do lasting damage in a listed one:
+# changing its settings, deleting it, reading its secrets, and more.
+# docs/github-rules.md has the whole list and the reasons.
+#
+# Because a GitHub host is opened above, this part must be here: without it
+# the broker refuses to start, since it would otherwise add the token to any
+# request at all.
+#
+# Each repo has:
+#
+#   repo    One exact repo as owner/name. No wildcards, no `.git`.
+#   note    A few words on why the agent needs it. Required.
+#   access  `read`: clone, fetch, and read pull requests, issues and checks.
+#           `write`: also push, open and work on pull requests, and comment.
+#           Required; there is no default.
+#   id      Optional. GitHub's id for the repo, which `gh pr create` needs.
+#           It is public; get it with:
+#             gh repo view OWNER/NAME --json id --jq .id
+#   merge   Optional, true or false. Whether the agent may merge pull
+#           requests in the repo. Off unless it says true.
+#
+# And for every repo that is not listed:
+#
+#   other_repos  `refuse`: every request about them is refused. This is also
+#                what happens when the line is left out.
+#                `read-public`: they may be read, and those requests go out
+#                without your token, so GitHub answers only for public repos.
+#                Nothing can ever be written to a repo that is not listed.
+
+github:
+  repos:
+    - repo: madshermansen/nixt3
+      note: This project. The agent works on it and opens pull requests.
+      access: write
+      id: R_kgDOVwfBeQ
+      merge: false
+
+  other_repos: refuse

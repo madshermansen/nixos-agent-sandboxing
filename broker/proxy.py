@@ -17,23 +17,30 @@ What the broker does:
   VM uses GitHub without holding a token. Programs in the VM log in with a
   placeholder, and the broker puts the real token in its place. A request
   with any other login is refused. See swap.py for those decisions.
+- Because the broker adds the token, it also decides which requests to an
+  opened destination go out at all: only those about a repo listed in the
+  `github` part of rules.yaml, and only what that part allows there.
+  github_policy.py makes that decision for each request, and
+  github_request.py joins it with the token swap.
 - Each decision is written as one line on standard output:
 
       2026-01-31T12:00:00+01:00 allowed api.anthropic.com 443 connect
       2026-01-31T12:00:01+01:00 refused example.com 443 connect host-not-listed
-      2026-01-31T12:00:02+01:00 allowed github.com 443 https GET /o/r/info/refs 200
+      2026-01-31T12:00:02+01:00 allowed github.com 443 https GET /o/r/info/refs 200 git-read
+      2026-01-31T12:00:03+01:00 refused github.com 443 https GET /x/y/info/refs repo-not-listed
 
   The fields are the time, the decision, the host, the port, how the request
   arrived, and for a refusal the reason. For a request to an opened
   destination the line also has the method, the path without its query
-  string, and the status of the answer. Nothing else from inside a request
+  string, the status of the answer, and what kind of request the policy
+  found it to be. Nothing else from inside a request
   is logged: no headers, no bodies, no tokens. For a destination that is
   passed on untouched, the site named at the start of the encrypted
   connection is checked, but what is sent after that cannot be seen here.
   Two more kinds of line exist: "started" when the broker starts, and
   "failed" when an allowed destination could not be reached.
 
-It fails closed, in three ways:
+It fails closed, in four ways:
 
 - If rules.yaml is missing or has a mistake, or a token that a rule asks for
   was not handed over, the broker prints the reason and exits. mitmproxy
@@ -43,6 +50,10 @@ It fails closed, in three ways:
   error and carry on as if the code had agreed. See `fail_closed`.
 - If mitmproxy is not the version that limits.py was written for, the broker
   does not start.
+- If mitmproxy would run with a setting that the broker does not allow, or
+  finds a settings file in its folder, the broker does not start. Some of
+  mitmproxy's settings rewrite a request after the broker has judged it.
+  See settings.py.
 
 What the VM can make the broker hold in memory is bounded: limits.py bounds
 what a connection may send before it makes sense, bodies are passed on in
@@ -75,7 +86,10 @@ from ruamel.yaml.error import YAMLError
 
 # These lie next to this file. mitmproxy puts this file's folder on the
 # search path before loading it.
+import github_policy
+import github_request
 import limits
+import settings
 import swap
 
 RULES_ENV = "AGENT_BROKER_RULES"
@@ -107,8 +121,10 @@ MAX_CLIENTS = 256
 # phases add their keys here.
 DESTINATION_KEYS = {"host", "inspect", "note", "ports", "token"}
 
-# Where the broker notes, on a request, how far it has come with it.
+# Where the broker notes, on a request, how far it has come with it, and
+# what kind of request the policy found it to be.
 STATE = "nixt3"
+KIND = "nixt3-kind"
 
 
 # Letters, digits and hyphens, in parts separated by dots. This keeps out
@@ -138,10 +154,12 @@ class Rule:
     token: str | None = None
 
 
-def load_rules(path: str) -> dict[str, Rule]:
-    """Read rules.yaml and return the rule for each host name.
+def load_rules(path: str) -> tuple[dict[str, Rule], github_policy.Policy | None]:
+    """Read rules.yaml. Returns the rule for each host name, and the policy.
 
-    Host names are stored in lower case. Any mistake raises RulesError.
+    The policy is the `github` part of the file: which repos the agent may
+    use, and how. It is None only when the file opens no host at all. Host
+    names are stored in lower case. Any mistake raises RulesError.
     """
     try:
         with open(path, encoding="utf-8") as file:
@@ -155,7 +173,7 @@ def load_rules(path: str) -> dict[str, Rule]:
 
     if not isinstance(data, dict):
         raise RulesError("it must start with a `destinations:` list")
-    unknown = set(data) - {"destinations"}
+    unknown = set(data) - {"destinations", "github"}
     if unknown:
         raise RulesError(f"unknown top-level key: {sorted(map(str, unknown))[0]}")
     destinations = data.get("destinations")
@@ -233,7 +251,16 @@ def load_rules(path: str) -> dict[str, Rule]:
                 )
 
         rules[host] = Rule(frozenset(ports), inspect, token)
-    return rules
+
+    # The broker adds the token to what it lets through to an opened host,
+    # so there must be rules for what that may be. See github_request.py.
+    try:
+        policy = github_request.load_policy(
+            data, [host for host, rule in rules.items() if rule.inspect]
+        )
+    except github_policy.PolicyError as error:
+        raise RulesError(str(error)) from error
+    return rules, policy
 
 
 class HandoverError(Exception):
@@ -340,9 +367,31 @@ REFUSALS = {
         "the request asks to switch to another protocol (an Upgrade header), "
         "such as WebSocket, which the broker does not pass on."
     ),
+    "body-not-read": (
+        "this request to {host} has a body that is larger than the broker "
+        "reads (1 MiB), or that does not say how long it is. The broker "
+        "has to read the body of a request to the GitHub API to decide "
+        "about it, so it does not pass on one it cannot read."
+    ),
+    "no-policy": (
+        "the broker has no rules for what may be sent to {host}. This is a "
+        "mistake in how it was started on the host."
+    ),
+    "odd-method": (
+        "the request's method is not written in capital letters, as in GET "
+        "or POST. The broker passes a request on as it was sent, so it does "
+        "not guess what a method in another spelling is meant to be."
+    ),
+    "odd-connection-header": (
+        "the request has a Connection header that says more than `close` or "
+        "`keep-alive`. Such a header can tell a server to drop other headers "
+        "of the request, after the broker has looked at them."
+    ),
     "odd-header": (
         "one of the request's header lines is split over several lines, or "
-        "holds a line-break character. The broker does not pass that on."
+        "holds a character outside plain ASCII, such as a line break, a "
+        "control character or an accented letter. The broker does not pass "
+        "that on."
     ),
     "names-another-host": (
         "the request names another site than {host}, the one its connection "
@@ -378,6 +427,37 @@ REFUSAL_HELP = (
 
 def is_http1(request: http.Request) -> bool:
     return request.is_http10 or request.is_http11
+
+
+def as_sent(request: http.Request) -> tuple[str, str]:
+    """A request's method and target, exactly as they were sent.
+
+    The target is what followed the method in the first line: the path, with
+    the query string if there is one.
+
+    mitmproxy offers these as `request.method` and `request.path`, but those
+    are for convenience, not for judging: `request.method` is in upper case
+    whatever arrived, while the bytes that mitmproxy sends on keep their
+    spelling. A request sent as `delete /repos/...` would be judged as
+    DELETE and reach GitHub as `delete`. So the broker reads the bytes
+    themselves, `request.data`, which is what mitmproxy sends on, and reads
+    each byte as one character, so that no two byte strings look alike.
+    """
+    return request.data.method.decode("latin-1"), request.data.path.decode("latin-1")
+
+
+def settings_problems() -> list[str]:
+    """What is wrong with the settings mitmproxy runs with. See settings.py."""
+    problems = [
+        f"{path} is a settings file for mitmproxy, which reads it without "
+        "being asked. Remove it"
+        for path in settings.config_files(ctx.options.confdir)
+    ]
+    names = list(ctx.options.keys())
+    return problems + settings.unreviewed(
+        {name: getattr(ctx.options, name) for name in names},
+        {name: ctx.options.default(name) for name in names},
+    )
 
 
 def limit_passed(reason: str, context: object, from_vm: bool) -> None:
@@ -437,7 +517,15 @@ def _stop_nothing(broker: "Broker", data: object) -> None:
     """For hooks that decide nothing: they only note or log."""
 
 
+def _stop_broker(broker: "Broker", data: object) -> None:
+    """Refuse every connection from now on, and end the broker."""
+    broker.blocked = True
+    ctx.master.shutdown()
+
+
 ON_FAILURE = {
+    "running": _stop_broker,
+    "configure": _stop_broker,
     "client_connected": _stop_client,
     "client_disconnected": _stop_nothing,
     "http_connect": _stop_flow,
@@ -466,9 +554,12 @@ def _place(data: object) -> tuple[object, object]:
 
 def _guarded(name: str, hook, stop):
     @functools.wraps(hook)
-    def guarded(self, data):
+    def guarded(self, *arguments):
+        # Most hooks are given one thing to decide about. `running` is
+        # given nothing.
+        data = arguments[0] if arguments else None
         try:
-            return hook(self, data)
+            return hook(self, *arguments)
         except Exception as error:
             # First stop it, then say so: writing the log line may be the
             # very thing that fails.
@@ -512,9 +603,18 @@ def fail_closed(cls):
 
 @fail_closed
 class Broker:
-    def __init__(self, rules: dict[str, Rule], tokens: dict[str, swap.Secret]) -> None:
+    def __init__(
+        self,
+        rules: dict[str, Rule],
+        policy: github_policy.Policy | None,
+        tokens: dict[str, swap.Secret],
+    ) -> None:
         self.rules = rules
+        self.policy = policy
         self.tokens = tokens
+        # True when the broker has found that it must not run: it then
+        # refuses every connection until it has ended.
+        self.blocked = False
         # The connections from the VM that are open now.
         self.clients: set[str] = set()
         # For each connection from the VM that holds a tunnel: the host and
@@ -534,11 +634,20 @@ class Broker:
             return "port-not-listed"
         return None
 
-    def refuse(self, flow: http.HTTPFlow, how: str, reason: str, *details: object) -> None:
+    def refuse(
+        self,
+        flow: http.HTTPFlow,
+        how: str,
+        reason: str,
+        *details: object,
+        message: str | None = None,
+    ) -> None:
         """Log a refusal, and answer the request with a 403 that explains it.
 
         `details` are extra log fields that go before the reason: for an
-        opened request, its method and path.
+        opened request, its method and path. `message` is the whole text
+        for the VM when the policy wrote one; it is never logged, because it
+        can repeat part of the request.
 
         A request whose body is large, or of unknown size, gets no answer.
         Its connection is closed instead, which the program in the VM sees
@@ -555,26 +664,35 @@ class Broker:
         host, port = flow.request.host, flow.request.port
         log("refused", host, port, how, *details, reason)
         flow.metadata[STATE] = "refused"
+        # mitmproxy may have decided, before the broker was asked, to pass
+        # this request's body on in pieces as it arrives, which means
+        # sending the request's first lines to the server at once. A
+        # refused request must not go anywhere.
+        flow.request.stream = False
 
-        if flow.request.method != "CONNECT" and not self.body_is_small(flow):
+        method, target = as_sent(flow.request)
+        if method != "CONNECT" and not self.body_is_small(flow):
             flow.kill()
             return
 
-        if reason == "port-not-listed":
-            allowed = ", ".join(map(str, sorted(self.rules[host.lower()].ports)))
-            what = (
-                f"{host} is an allowed destination, but not on port {port}. "
-                f"Allowed on this host: port {allowed}."
-            )
+        if message is None:
+            if reason == "port-not-listed":
+                allowed = ", ".join(map(str, sorted(self.rules[host.lower()].ports)))
+                what = (
+                    f"{host} is an allowed destination, but not on port {port}. "
+                    f"Allowed on this host: port {allowed}."
+                )
+            else:
+                what = REFUSALS.get(reason, "this request to {host} is not allowed ({reason}).")
+                what = what.format(host=host, port=port, reason=reason)
+            message = f"Refused by the sandbox broker: {what}\n\n{REFUSAL_HELP}"
+        if how == "https":
+            # A request to an opened host. For the API the text is wrapped
+            # the way `gh` expects an error, or `gh` would not show it.
+            status, body, content_type = github_request.refusal_answer(host, target, message)
         else:
-            # A reason without a text of its own comes from the policy.
-            what = REFUSALS.get(reason, "this request to {host} is not allowed ({reason}).")
-            what = what.format(host=host, port=port, reason=reason)
-        flow.response = http.Response.make(
-            403,
-            f"Refused by the sandbox broker: {what}\n\n{REFUSAL_HELP}",
-            {"Content-Type": "text/plain; charset=utf-8"},
-        )
+            status, body, content_type = 403, message.encode("utf-8"), "text/plain; charset=utf-8"
+        flow.response = http.Response.make(status, body, {"Content-Type": content_type})
         # Many programs show only the first line of a refused CONNECT, so the
         # short version goes there as well.
         flow.response.reason = "Refused by the sandbox broker"
@@ -599,8 +717,26 @@ class Broker:
             has_transfer_encoding="transfer-encoding" in request.headers,
         )
 
+    def stopping(self, flow: http.HTTPFlow, how: str) -> bool:
+        """End a request when the broker has found that it must not run.
+
+        A broker that is stopping refuses new connections. This is for the
+        requests that were under way on a connection it already had: they
+        must not be finished under settings that the broker does not allow.
+        """
+        if not self.blocked:
+            return False
+        log("refused", flow.request.host, flow.request.port, how, "broker-stopping")
+        flow.metadata[STATE] = "refused"
+        flow.request.stream = False
+        if flow.killable:
+            flow.kill()
+        return True
+
     def http_connect(self, flow: http.HTTPFlow) -> None:
         """A program in the VM asks for a tunnel to host:port."""
+        if self.stopping(flow, "connect"):
+            return
         if flow.client_conn.id in self.tunnels:
             # A tunnel asked for inside a tunnel. Nothing honest does that,
             # and it would change where the outer tunnel leads.
@@ -613,8 +749,53 @@ class Broker:
                 flow.request.port,
             )
 
+    def check_settings(self) -> None:
+        """Stop the broker if mitmproxy's settings are not what it allows.
+
+        start() below makes the same check before the broker listens, and
+        does not start it if the check fails. This is for what happens
+        after that. From here the broker cannot simply not start, so it
+        refuses every connection from now on and tells mitmproxy to end.
+        """
+        problems = settings_problems()
+        if problems:
+            self.blocked = True
+            print(
+                "broker: stopping, because mitmproxy runs with settings the "
+                "broker does not allow.",
+                *(f"broker: {problem}" for problem in problems),
+                sep="\n",
+                file=sys.stderr,
+                flush=True,
+            )
+            ctx.master.shutdown()
+
+    def running(self) -> None:
+        """mitmproxy has started. Check its settings once more.
+
+        By now mitmproxy has read everything it reads at start, so this is
+        the check of what it really runs with. A settings file that appeared
+        in its folder after start() looked is found here. See settings.py.
+        """
+        self.check_settings()
+
+    def configure(self, updated: set[str]) -> None:
+        """One of mitmproxy's settings was changed. Check them again.
+
+        mitmproxy calls this whenever a setting changes, also long after
+        the start: another script, or a command given to mitmproxy while it
+        runs, can change one. A setting such as `modify_headers`, turned on
+        an hour in, would rewrite requests after the broker judged them
+        just as it would from the start.
+        """
+        self.check_settings()
+
     def client_connected(self, client: connection.Client) -> None:
         """A program in the VM connects. Refuse it when there are too many."""
+        if self.blocked:
+            log("refused", "-", 0, "connection", "broker-stopping")
+            client.error = REFUSED_OUTGOING
+            return
         if len(self.clients) >= MAX_CLIENTS:
             log("refused", "-", 0, "connection", "too-many-connections")
             client.error = REFUSED_OUTGOING
@@ -647,6 +828,15 @@ class Broker:
         for name, value in request.headers.fields:
             if any(mark in part for part in (name, value) for mark in (b"\r", b"\n")):
                 return "odd-header"
+        # Nor any other byte outside plain ASCII: programs disagree about
+        # what such a byte in a header means. See swap.headers_are_plain.
+        if not swap.headers_are_plain(
+            [
+                (name.decode("latin-1"), value.decode("latin-1"))
+                for name, value in request.headers.fields
+            ]
+        ):
+            return "odd-header"
         if "trailer" in request.headers:
             return "trailers"
         if "upgrade" in request.headers:
@@ -676,6 +866,8 @@ class Broker:
         with a body that never ends. The first lines themselves are bounded
         before this method is called, by limits.py.
         """
+        if self.stopping(flow, "http"):
+            return
         tunnel = self.tunnels.get(flow.client_conn.id)
         if tunnel is None:
             host, port = flow.request.host, flow.request.port
@@ -713,8 +905,8 @@ class Broker:
         request = flow.request
         host, port = request.host.lower(), request.port
         rule = self.rules.get(host)
-        method = request.method
-        path, _ = swap.split_path(request.path)
+        method, target = as_sent(request)
+        path, _ = swap.split_path(target)
 
         if (
             rule is None
@@ -733,14 +925,27 @@ class Broker:
             # Someone started the broker with certificate checks off. Then
             # nothing proves where a token would go.
             reason = "upstream-not-checked"
-        elif method.upper() == "TRACE":
+        elif not re.fullmatch(r"[A-Z]+", method):
+            # A method in lower or mixed case, such as `delete`. Servers
+            # differ on whether that is DELETE, an unknown method, or an
+            # error, and the broker passes on what it was sent. No real
+            # program writes a method that way, so it is refused.
+            reason = "odd-method"
+        elif method == "TRACE":
             # A TRACE request asks the server to send the request back,
             # and that would include the real token.
             reason = "method-not-passed-on"
+        elif not swap.connection_is_plain(request.headers.get_all("connection")):
+            reason = "odd-connection-header"
         elif self.unwanted(request) is not None:
             reason = self.unwanted(request)
         elif not swap.names_the_host(
-            request.authority, request.headers.get_all("host"), host, port
+            # The bytes, not `request.authority`, which mitmproxy decodes
+            # from the form that names in other alphabets are sent in.
+            request.data.authority.decode("latin-1"),
+            request.headers.get_all("host"),
+            host,
+            port,
         ):
             reason = "names-another-host"
         else:
@@ -752,9 +957,16 @@ class Broker:
             self.refuse(flow, "https", reason, method, path)
             return
 
-        if self.body_is_small(flow):
-            # Wait for the body, so that the policy can look at it. The
-            # request is passed on from request() below.
+        # Whether the policy needs the body to decide, see github_request.py.
+        when = github_request.when_to_decide(host, self.body_is_small(flow))
+        if when == "refuse":
+            self.refuse(flow, "https", "body-not-read", method, path)
+        elif when == "after-body":
+            # The request is decided on and passed on from request() below.
+            # Nothing of it may be sent before that. mitmproxy may have
+            # chosen to pass the body on in pieces, by a setting of its
+            # own, before the broker was asked; that is undone here.
+            flow.request.stream = False
             flow.metadata[STATE] = "reading"
         elif self.pass_on(flow, body=None):
             flow.request.stream = True
@@ -763,67 +975,72 @@ class Broker:
         """The whole of a request has arrived, body included."""
         if flow.metadata.get(STATE) != "reading":
             return
-        if "content-encoding" in flow.request.headers:
-            # A compressed body. Unpacking it could take far more memory
-            # than its size suggests, so the policy does not get to see it.
-            body = None
-        else:
-            body = flow.request.raw_content or b""
-        self.pass_on(flow, body)
+        # The body as it was sent, not unpacked: the policy must judge the
+        # bytes GitHub will get, and it refuses a compressed body itself.
+        self.pass_on(flow, flow.request.raw_content or b"")
 
     def token_for(self, rule: Rule) -> swap.Secret | None:
         return self.tokens.get(rule.token) if rule.token else None
 
-    def policy(
-        self, method: str, host: str, path: str, query: str, body: bytes | None
-    ) -> str | None:
-        """Whether this request to an opened destination may be passed on.
-
-        PHASE 5 GOES HERE. This is the one place where a request that is
-        about to leave with a token can still be stopped by what it asks
-        for: which repo, which action. Call the decision function of
-        broker/github_policy.py from here.
-
-        Return None to allow the request, or a short reason without spaces,
-        such as "repo-not-listed". The reason goes in the log and in the
-        answer to the VM. Add a text for it to REFUSALS above.
-
-        `path` is the request's path without the query string, and `query`
-        is the query string, both as the VM sent them. `body` is the body
-        when it was at most swap.MAX_READ_BODY long and not compressed.
-        Otherwise it is None: the body is not known here, because it is
-        passed on piece by piece. A large `git push` is one such request. A
-        rule that needs to see the body must refuse when it is None, or a
-        request could avoid the rule by sending its body in pieces.
-        """
-        return None
-
     def pass_on(self, flow: http.HTTPFlow, body: bytes | None) -> bool:
         """The last step for an opened request. True when it may leave.
 
-        Asks the policy, then puts the real token in place of the
-        placeholder. Nothing is changed before the policy has agreed.
+        This is where the policy decides: which repo the request is about,
+        what it does there, and whether that is allowed
+        (github_policy.py, called through github_request.plan). Every
+        request to an opened host comes through here before the token is
+        put in and before anything is sent. `body` is the whole body, or
+        None when it was not read because the policy does not need it.
+
+        What the policy is given is the request as it arrived and as it
+        will be sent on: the method, the path and query string, the headers
+        and the body are handed over unchanged, and nothing about them is
+        changed before the policy has agreed. The host is the one the
+        tunnel was opened for, which opened_request() has checked against
+        the name in the encrypted connection and in the Host header.
         """
+        if self.stopping(flow, "https"):
+            return False
         request = flow.request
         host = request.host.lower()
-        rule = self.rules[host]
-        method = request.method
-        path, query = swap.split_path(request.path)
+        method, target = as_sent(request)
+        path, _ = swap.split_path(target)
+        # The headers as the bytes that arrived, one character per byte,
+        # like the method and the target. See as_sent().
+        headers = [
+            (name.decode("latin-1"), value.decode("latin-1"))
+            for name, value in request.headers.fields
+        ]
+        # The host the request names. opened_request() has made sure that
+        # every Host header names the tunnel's host; with more than one,
+        # the policy is told of none and refuses.
+        named = [value for name, value in headers if name.lower() == "host"]
 
-        reason = self.policy(method, host, path, query, body)
-        if reason is None:
-            credential = swap.swap_authorization(
-                request.headers.get_all("authorization"), self.token_for(rule)
-            )
-            # Checked in opened_request() already; here in case the headers
-            # changed in between.
-            reason = credential.reason if credential.action == "refuse" else None
-        if reason is not None:
-            self.refuse(flow, "https", reason, method, path)
+        plan = github_request.plan(
+            self.policy,
+            self.token_for(self.rules[host]),
+            method=method,
+            host=host,
+            target=target,
+            headers=headers,
+            authority=named[0] if len(named) == 1 else None,
+            body=body,
+        )
+        if not plan.allowed:
+            self.refuse(flow, "https", plan.reason, method, path, message=plan.message)
             return False
 
-        if credential.action == "swap":
-            request.headers["authorization"] = credential.value
+        if plan.authorization is None:
+            # No login was sent, or the policy allows this request only
+            # without the token: it reads a repo that is not listed.
+            request.headers.pop("authorization", None)
+        else:
+            request.headers["authorization"] = plan.authorization
+        if plan.body is not None:
+            # The body written out afresh from what the policy read, so
+            # that GitHub reads exactly what was judged.
+            request.content = plan.body
+        flow.metadata[KIND] = plan.kind if plan.with_token else f"{plan.kind}-without-token"
         # A cookie is a login too: one copied from a browser gives access to
         # the account it was taken from. Nothing in the VM needs GitHub's
         # cookies, so they are left out instead of refused; a program that
@@ -872,10 +1089,10 @@ class Broker:
             response.headers["transfer-encoding"] = "chunked"
         if state == "passed-on":
             request = flow.request
-            path, _ = swap.split_path(request.path)
+            method, target = as_sent(request)
             log(
                 "allowed", request.host, request.port, "https",
-                request.method, path, response.status_code,
+                method, swap.split_path(target)[0], response.status_code, flow.metadata.get(KIND, "-"),
             )  # fmt: skip
             flow.metadata[STATE] = "answered"
 
@@ -888,10 +1105,10 @@ class Broker:
             flow.metadata[STATE] = "refused"
             return
         request = flow.request
-        path, _ = swap.split_path(request.path)
+        method, target = as_sent(request)
         log(
             "failed", request.host, request.port, "https",
-            request.method, path, flow.error.msg if flow.error else "-",
+            method, swap.split_path(target)[0], flow.error.msg if flow.error else "-",
         )  # fmt: skip
         flow.metadata[STATE] = "failed"
 
@@ -970,6 +1187,8 @@ class Broker:
         address = data.server.address
         host, port = (address[0], address[1]) if address else ("-", 0)
         reason = "no-address" if address is None else self.refusal(host, port)
+        if self.blocked:
+            reason = "broker-stopping"
         if reason is None and self.rules[host.lower()].inspect:
             if data.server.tls:
                 data.server.sni = host.lower()
@@ -1044,11 +1263,43 @@ def start() -> Broker:
         # Carrying on would mean a broker whose memory the VM can fill.
         sys.exit(1)
 
+    # The variables this process was started with. mitmproxy has read some
+    # of them already, so all that is left is not to run.
+    problems = settings.unreviewed_environment(os.environ)
+    if problems:
+        print(
+            "broker: not starting, because of what is in its environment.",
+            *(f"broker: {problem}" for problem in problems),
+            "broker: mitmproxy, Python and the TLS library read variables that "
+            "change what they do or make them write data to a file. Start the "
+            "broker with `nix run .#broker`, which gives it an environment of "
+            "its own. broker/settings.py in the nixt3 repo has the list.",
+            sep="\n",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
+
+    problems = settings_problems()
+    if problems:
+        print(
+            "broker: not starting, because mitmproxy would run with settings "
+            "the broker does not allow.",
+            *(f"broker: {problem}" for problem in problems),
+            "broker: broker/settings.py in the nixt3 repo says which settings "
+            "are allowed and why.",
+            sep="\n",
+            file=sys.stderr,
+            flush=True,
+        )
+        # Such a setting can change a request after the broker judged it.
+        sys.exit(1)
+
     path = os.environ.get(RULES_ENV)
     try:
         if not path:
             raise RulesError(f"{RULES_ENV} is not set, so there is no rules file")
-        rules = load_rules(path)
+        rules, policy = load_rules(path)
     except RulesError as error:
         print(
             f"broker: not starting, because the rules file cannot be used.\n"
@@ -1079,9 +1330,10 @@ def start() -> Broker:
         f"destinations={len(rules)}",
         f"opened={sum(rule.inspect for rule in rules.values())}",
         f"tokens={len(tokens)}",
+        f"repos={len(policy.repos) if policy else 0}",
         f"rules={path}",
     )
-    return Broker(rules, tokens)
+    return Broker(rules, policy, tokens)
 
 
 addons = [start()]

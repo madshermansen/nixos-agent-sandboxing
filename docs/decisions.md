@@ -18,7 +18,7 @@ marked **inferred** gives a reason that fits the code but is written down
 nowhere. Add a new entry when a decision is made; do not rewrite old ones,
 add a note to them.
 
-This page describes `main` after phase 4. Words such as "tunnel", "opened"
+This page describes the code after phase 5. Words such as "tunnel", "opened"
 and "fails closed" are explained in the word list at the top of
 [threat-model.md](threat-model.md#words-used-on-this-page).
 
@@ -127,6 +127,8 @@ and "fails closed" are explained in the word list at the top of
 - **Not covered:** `QEMU_OPTS` and the arguments of `nix run .#vm` still
   reach QEMU. Whether they should is not decided. See
   [threat-model.md](threat-model.md).
+- **Note:** decided since. See "The start command ignores QEMU options left
+  in the shell" below.
 - **Where:** `qemu.networkingOptions` in `vm/default.nix`.
 
 ### The way out is a proxy that decides per request
@@ -169,7 +171,12 @@ and "fails closed" are explained in the word list at the top of
   see what is sent or whose account is used. See
   [threat-model.md](threat-model.md).
 - **History:** in phase 3 nothing was opened.
-- **Where:** the comments in [`broker/rules.yaml`](../broker/rules.yaml).
+- **Note, phase 5:** only `github.com` and `api.github.com` *can* be marked
+  now. The broker does not start when another host is, because it has rules
+  for what may be sent to those two only, and adds a token to what it lets
+  through. A second service needs rules of its own first.
+- **Where:** the comments in [`broker/rules.yaml`](../broker/rules.yaml);
+  `load_policy` in `broker/github_request.py`.
 
 ### Opened traffic is read as HTTP/1.1 only
 
@@ -264,6 +271,11 @@ and "fails closed" are explained in the word list at the top of
     by themselves when something fails, and those lines do not pass the
     broker's own code.
   - Why nothing more is logged: reason not recorded.
+- **Note, phase 5:** an allowed request to GitHub is also logged with what
+  the rules found it to be (`git-read`, `api-write`, ...), and a refused one
+  with the rules' reason (`repo-not-listed`, ...). The method is logged in
+  the letters it was sent in. The text that a refusal gives the agent is
+  never logged, because it can repeat part of the request.
 - **Where:** `log` and `scrub_output` in `broker/proxy.py`; `split_path` in
   `broker/swap.py`.
 
@@ -432,19 +444,120 @@ and "fails closed" are explained in the word list at the top of
 
 ### Which GitHub requests go out: allowed if known
 
-> **Update this entry when the rules are put to use.** It is the one place
-> on this page that describes their state.
-
 - **Chosen:** a request to GitHub goes out only when the broker recognises
   it as a kind that is allowed, for a repo that is listed. Everything else
   is refused, including harmless requests nobody thought of.
 - **Not chosen:** refusing only what is known to be bad.
 - **Why, and the choices inside it:** see [github-rules.md](github-rules.md).
-- **State:** built in `broker/github_policy.py` with its own tests, and
-  **not yet enforced**. The broker does not call it; today every request
-  with the placeholder goes out with the token.
-- **Where:** [github-rules.md](github-rules.md); `policy` in
-  `broker/proxy.py`.
+- **State:** in use since phase 5. `broker/github_policy.py` decides, and
+  the broker asks it about every request to GitHub before the token is put
+  in. The rules list one repo, `madshermansen/nixt3`, for writing; merging
+  and reading other repos are off. A broker whose rules open a GitHub host
+  without a `github` part does not start. Not yet run against the real
+  GitHub with a real token.
+- **Where:** [github-rules.md](github-rules.md); `pass_on` in
+  `broker/proxy.py`; `broker/github_request.py`.
+
+### The rules are given the bytes that are sent
+
+- **Chosen:** the rules judge the method, the address and the headers as the
+  bytes that arrived and that are sent on, each byte read as one character.
+  A request in an odd spelling is refused, not put right: a method that is
+  not in capitals, a `#` in the address, `..` in a path.
+- **Not chosen:** the convenient form mitmproxy offers to a script, or
+  tidying a request and passing the tidy form on.
+- **Why:** if the broker judges one thing and sends another, the difference
+  is a way around the rules. mitmproxy's `request.method` is in upper case
+  whatever was sent, so `delete /repos/...` was judged as DELETE and left as
+  `delete`, with the token. A review found it. Refusing is safer than
+  tidying because the broker then never has to guess how GitHub reads an
+  odd request.
+- **The one exception:** a body in JSON is sent as the rules wrote it out
+  again from what they read, so that GitHub reads exactly what was judged.
+  Two programs can read a sloppy JSON text in two ways. A number may change
+  its spelling on the way (`1e2` leaves as `100.0`).
+- **Where:** `as_sent` and `pass_on` in `broker/proxy.py`; `_fresh` in
+  `broker/github_policy.py`.
+
+### A request without a login is not given the token
+
+- **Chosen:** the token goes in only where a request carried the
+  placeholder and the rules allow the token. A request without a login goes
+  out without one. Where the rules allow a request only without the token
+  (reading a repo that is not listed, which is off), the login is removed,
+  placeholder included.
+- **Not chosen:** adding the token to every request the rules allow.
+- **Why:** it keeps what was decided in phase 4: the program in the VM
+  chooses to log in, and the broker does not do it for it. git asks without
+  a login first and logs in when GitHub wants one, which works as before.
+- **Where:** `plan` in `broker/github_request.py`.
+
+### A refusal is worded for the program that gets it
+
+- **Chosen:** the text of a refusal is the same for every program, but it
+  is wrapped three ways. For git: a 403 in plain text. For the REST API: a
+  403 with JSON that has a `message`. For GraphQL: the status 200 with
+  `errors` in place of data, which is how GraphQL itself refuses.
+- **Not chosen:** one plain-text 403 for all.
+- **Why:** the text is where the agent is told what to do instead, and each
+  program shows only what it expects. `gh` showed only the status line of a
+  plain-text 403, and the `gh pr` commands that change something printed
+  the JSON of a 403 as one line with every line break escaped. Each form
+  was tried with the real `gh` (2.102 on the Mac, 2.104 in the VM).
+- **Cost:** a refused GraphQL request has the status 200. Every GraphQL
+  client has to read `errors` anyway, because that is how the real API
+  reports them. The broker's log says `refused` in every case.
+- **Where:** `refusal_answer` in `broker/github_request.py`.
+
+### The broker runs only with settings it knows
+
+- **Chosen:** the broker does not start when mitmproxy's folder holds a
+  settings file, or when one of mitmproxy's settings is not as the broker
+  wants it. The list is short: eight settings must have the value the start
+  command gives them, and five may have any value (the port, the folder,
+  the scripts to load, and which certificate authorities to believe).
+  Every other setting must be untouched. The broker checks again whenever
+  a setting changes while it runs, and then stops. The environment is
+  treated the same way: the start command gives mitmproxy three variables
+  of its own making, and the broker refuses any that is not on its list.
+- **Not chosen:** a list of the settings that are dangerous.
+- **Why:** several of mitmproxy's settings change a request after the
+  broker has judged it (`map_remote`, `modify_headers`, an upstream proxy),
+  and mitmproxy reads `config.yaml` from its folder without being asked. A
+  review sent a listed git read to another repo that way, with the token.
+  "Untouched unless listed" also covers a setting that a later mitmproxy
+  adds. Only a program that already runs as you can write to that folder,
+  which is outside what this project defends against; the check is there
+  so that the broker never runs with settings nobody chose.
+  - The environment is not only a matter of someone hostile.
+    `SSLKEYLOGFILE` is a variable people set for good to use Wireshark,
+    and with it mitmproxy wrote the keys of the connection that carries
+    the token to a file. A second review found that.
+  - `stream_large_bodies` has to be one value, not any: below the size the
+    broker reads in full, mitmproxy passes a body on before the broker is
+    asked. The broker does not rest on the setting alone; it takes the
+    request back from mitmproxy whenever it refuses or reads first.
+- **Cost:** a new `--set` or variable in the start command needs an entry
+  in `broker/settings.py`, or the broker does not start. A unit test
+  compares the two.
+- **Where:** [`broker/settings.py`](../broker/settings.py); `start`,
+  `running` and `configure` in `broker/proxy.py`; the broker run function
+  in `darwin/commands.nix`.
+
+### The stand-in test uses GitHub's real names
+
+- **Chosen:** `tests/github-broker.sh` sends its requests to `github.com`
+  and `api.github.com`, through a broker with this repo's own rules. A
+  script loaded only by the test changes one thing, at the last step: the
+  address the broker's connection goes to.
+- **Not chosen:** a test host name that the broker or the rules would have
+  to know about.
+- **Why:** the rules go by the host's name and refuse every other. A test
+  that taught them a second name would test something that does not run
+  for real. This way the broker and the rules run unchanged. The script
+  refuses every connection it does not redirect, so a mistake in the test
+  cannot reach the real GitHub.
+- **Where:** the top of [`tests/github-broker.sh`](../tests/github-broker.sh).
 
 ### The Claude sign-in lives in the VM (open)
 
@@ -489,6 +602,97 @@ and "fails closed" are explained in the word list at the top of
   `~/.local/state/agent-vm`, readable by you only.
 - **Why:** reason not recorded.
 - **Where:** the comment at the top of `darwin/commands.nix`.
+
+### The start command ignores QEMU options left in the shell
+
+- **Chosen:** `nix run .#vm` drops the variables `QEMU_OPTS` and
+  `NIXPKGS_QEMU_KERNEL_*` before it starts QEMU, and prints a line for each
+  one that was set. Options typed after `nix run .#vm --` are passed on,
+  with a line that names them. `QEMU_KERNEL_PARAMS` needs nothing: the start
+  command sets it itself, which replaces a value from the shell.
+- **Not chosen:** refusing to start when a variable is set; refusing typed
+  options too.
+- **Why:** a variable in a shell can be an accident from hours ago, and it
+  could give the locked VM a shared folder or a second network card. Typed
+  options are a choice made at that moment and are useful for trying things
+  out, so they stay, but are shown. Dropping with a note keeps a harmless
+  leftover from stopping the day's work.
+- **Where:** `vm` in [`darwin/commands.nix`](../darwin/commands.nix).
+
+### SSH to the VM ignores your own SSH configuration
+
+- **Chosen:** every ssh call goes through one command that passes
+  `-F none`, and turns agent, X11 and local-command forwarding off by name.
+- **Not chosen:** leaving `~/.ssh/config` in force.
+- **Why:** a line under `Host *` there, such as `RemoteForward`,
+  `ForwardAgent` or `SendEnv`, would open a way between the VM and the Mac
+  that nobody chose for the VM. An option typed after `nix run .#ssh --`
+  still works.
+- **Where:** `ssh` in [`darwin/commands.nix`](../darwin/commands.nix).
+
+### A throwaway run is a command of its own, on a layer over the disk
+
+- **Chosen:** `nix run .#vm-fresh` starts the VM on an empty qcow2 layer
+  whose backing file is the normal disk, and deletes the layer when the VM
+  stops. The run starts with the Claude sign-in and the T3 pairing, and
+  nothing it writes is kept.
+- **Not chosen:** a variable such as `AGENT_VM_FRESH=1` read by
+  `nix run .#vm`; deleting the state folder; QEMU's `-snapshot` option.
+- **Why:** a variable can stay behind in a shell, and a later normal start
+  would then discard a day's work without saying so; a command has to be
+  typed each time. Deleting the state folder also loses the sign-in and the
+  pairing. `-snapshot` keeps its layer in a temporary file without a name,
+  so nothing could show how large a run has grown.
+- **Where:** `vm` and `vm-fresh` in
+  [`darwin/commands.nix`](../darwin/commands.nix).
+
+### One VM per state folder, kept by a lock that QEMU holds
+
+- **Chosen:** the start command takes a lock on `vm.lock` in the state
+  folder (`flock`) and QEMU inherits it. The normal VM and a throwaway run
+  take the same lock.
+- **Not chosen:** relying on `qemu.pid` alone; a lock folder with a process
+  id in it.
+- **Why:** a throwaway run reads the normal disk the whole time, so the two
+  must never run together, and two starts at the same moment both pass a
+  check of `qemu.pid`. A lock the system keeps is given to one program only
+  and is given back when that program ends, however it ends, so there is
+  nothing stale to tidy up after a crash.
+- **Where:** `vm` and `stop` in
+  [`darwin/commands.nix`](../darwin/commands.nix).
+
+### Stop waits for a VM that is still starting
+
+- **Chosen:** when the lock is held and QEMU is not there yet,
+  `nix run .#stop` waits up to 90 seconds for it and then shuts it down. If
+  the start takes longer, stop fails, and stops nothing, not the broker
+  either.
+- **Not chosen:** saying "a VM is starting" and failing at once; treating it
+  as "not running", which is what the first version did, and which also
+  ended the broker that the start had just launched.
+- **Why:** "stop" should mean that nothing runs afterwards, also when it is
+  typed, or run by an agent, right after a start. A start normally has QEMU
+  up in under a minute. Failing without touching anything is kept for the
+  start that hangs, for example one that waits for a password manager.
+- **Where:** `stop` in [`darwin/commands.nix`](../darwin/commands.nix);
+  checked in [`tests/commands.sh`](../tests/commands.sh).
+
+### Logs are moved aside at a start, not while the broker runs
+
+- **Chosen:** `broker.log` and `console.log` are moved aside when larger
+  than 5 MiB, at the moment the start command is about to open them, and
+  three older parts are kept.
+- **Not chosen:** trimming a log while the broker runs; a helper program
+  between the broker and its log.
+- **Why:** the broker holds its log open and keeps writing to the same file
+  after it is renamed, and cutting the file short while it is written loses
+  lines. Between stopping the old broker and starting the new one, nobody
+  has the file open. A helper in between would be one more program that
+  handles what the VM causes to be written.
+- **Note:** a single long run can still pass the limit. See "Wearing out
+  the Mac" in [threat-model.md](threat-model.md).
+- **Where:** `rotate_log` in
+  [`darwin/commands.nix`](../darwin/commands.nix).
 
 ### The VM is stopped through QEMU's control socket
 

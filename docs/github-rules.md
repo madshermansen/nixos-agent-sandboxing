@@ -6,10 +6,15 @@ out at all. This page says which ones do, which do not, and what the broker
 cannot check.
 
 The deciding is done by [`broker/github_policy.py`](../broker/github_policy.py).
-It takes effect once the broker opens GitHub traffic and asks it about each
-request, which is phase 4 of [PLAN.md](../PLAN.md). Until then the broker
-passes GitHub traffic on unread, as described in
-[architecture.md](architecture.md).
+The broker opens the traffic to GitHub, as described in
+[architecture.md](architecture.md), and asks that module about every request
+before it adds the token and before anything is sent. A refused request
+never leaves the Mac: the program in the VM gets a 403 with a text that says
+what was refused and what to do instead. Each program shows it in its own
+way, and the broker words the answer so that each does show it: `git` as
+lines that start with `remote:`, `gh api` after `gh:` or `HTTP 403:`, and
+the other `gh` commands after `GraphQL:`. A broker whose rules open a GitHub
+host but have no `github` part does not start.
 
 ## Why
 
@@ -332,7 +337,7 @@ repo in the address, where the broker can check it.
 | `gh pr checks` | Refused: reads by id | `gh pr view NUMBER --json statusCheckRollup` |
 | `gh pr comment`, `gh issue comment` | Refused | `gh api repos/OWNER/REPO/issues/NUMBER/comments -f body='TEXT'` |
 | `gh pr comment --edit-last` | Refused | `gh api -X PATCH repos/OWNER/REPO/issues/comments/COMMENT_ID -f body='TEXT'` |
-| `gh pr edit` | Refused | `gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title='TITLE'`, or `-f body='TEXT'`, or both. What is left out stays as it is. |
+| `gh pr edit` | Refused, already at what it reads first: who can be assigned. So its refusal is the one for a read that is not on the list; the broker adds the line on the right to it. | `gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f title='TITLE'`, or `-f body='TEXT'`, or both. What is left out stays as it is. |
 | `gh pr edit --add-label` | Refused | `gh api repos/OWNER/REPO/issues/NUMBER/labels -f 'labels[]=LABEL'` |
 | `gh pr edit --add-reviewer` | Refused | `gh api repos/OWNER/REPO/pulls/NUMBER/requested_reviewers -f 'reviewers[]=LOGIN'` |
 | `gh pr close` | Refused | `gh api -X PATCH repos/OWNER/REPO/pulls/NUMBER -f state=closed` |
@@ -409,8 +414,9 @@ Refused for their spelling, whatever they ask for:
   host that names another in its `Host` header is refused, because GitHub
   goes by that name.
 - **Bodies** that are compressed, larger than 1 MiB, not UTF-8, not one JSON
-  object, without `Content-Type: application/json`, or with a name used
-  twice. Two programs can read such a body in two ways. A body that was
+  object, without `Content-Type: application/json`, with a name used twice,
+  or with the character U+0000 or half a surrogate pair in a name or a
+  text. Two programs can read such a body in two ways. A body that was
   judged is sent on freshly written out from what the broker read, so GitHub
   gets exactly what was judged.
 - **GraphQL** text that cannot be read; a body with several requests in it;

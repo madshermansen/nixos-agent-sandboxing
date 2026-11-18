@@ -49,6 +49,9 @@
           broker
           logs
           check
+          status
+          vm-fresh
+          update-t3
           ;
         default = hostScripts.vm;
       };
