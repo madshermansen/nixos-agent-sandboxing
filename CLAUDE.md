@@ -51,6 +51,8 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `tests/github-live.sh` | The round trip with a real token, run inside the VM |
 | `tests/commands.sh` | The Mac-side commands, checked on the Mac with stand-ins for QEMU and ssh; no VM needed |
 | `tests/unit/` | pytest files for the broker's decisions; no network needed |
+| `tests/default.nix` | What `nix flake check`, `nix develop` and `nix run .#test-broker` are made of |
+| `.github/workflows/ci.yml` | CI: runs `nix flake check` and `nix run .#test-broker` on pull requests and on `main` |
 | `docs/` | Setup, architecture, the threat model (`threat-model.md`), the decision log (`decisions.md`), advice for threads on the Mac (`local-threads.md`), diagrams |
 
 ## Commands
@@ -71,6 +73,9 @@ nix build .#vm --no-link     # build only
 tests/github-broker.sh       # check the token swap and the policy on the Mac, without the VM or a token
 tests/commands.sh            # check the Mac-side commands, without the VM
 nix fmt                      # format the Nix files; run before committing
+nix flake check              # every test that needs no VM; run before pushing
+nix run .#test-broker        # tests/github-broker.sh with the programs it needs
+nix develop                  # a shell with pytest, mitmproxy, shellcheck, ruff and treefmt
 ```
 
 ## Checking that T3 and Claude work in the VM
@@ -362,6 +367,33 @@ The reply should name Linux and the host `agent-vm`.
   the user can start threads in it. `t3 environment link` lets agents on the
   Mac hand work to the VM, and needs Linked environments turned on under
   Settings → Labs in the app.
+
+## Tests
+
+[docs/testing.md](docs/testing.md) describes the layers and what each proves.
+
+- **Run `nix flake check` and `nix run .#test-broker` before pushing.**
+  Neither needs the VM, the Linux builder or a token. The checks inside the
+  VM (`nix run .#check`) are still what proves the sandbox.
+- **Nothing in `checks` may build a part of the VM.** They must pass on a
+  Mac with no Linux builder. The `vm` command is built there with a stand-in
+  for the VM, and the VM's configuration is only evaluated.
+- **New tests are picked up by themselves,** once `git add`ed: every
+  `tests/unit/test_*.py` is run, and every `tests/*.sh` goes through
+  shellcheck.
+- **A skipped unit test fails the check,** and so does one marked as
+  expected to fail. `NIXT3_NO_SKIPS=1` is set there,
+  so that a missing library cannot quietly shrink the set. Plain `pytest`
+  without `ruamel.yaml` skips a whole file and still ends green.
+- **`proxy.py` cannot be imported in a test:** its last line starts the
+  broker. Use the `proxy` fixture in `tests/unit/conftest.py`, which loads
+  the file without that line.
+- **CI runs both on every pull request,** on a Mac runner with no Linux
+  builder and no secrets. It cannot run the checks inside the VM, so a
+  green run does not replace `nix run .#check`. Actions in the workflow are
+  pinned by commit; keep it that way.
+- **Keep the broker test off the internet.** It uses a stand-in server on
+  the same machine. GitHub allows 60 requests an hour without a login.
 
 ## How work is done
 

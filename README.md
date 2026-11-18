@@ -47,3 +47,16 @@ Claude also needs a one-time sign-in inside the VM. The steps are in
 | [docs/local-threads.md](docs/local-threads.md) | Claude Code's own sandbox, for threads that run on the Mac itself |
 | [PLAN.md](PLAN.md) | The phases and the risks |
 | [CLAUDE.md](CLAUDE.md) | Instructions for agents working on this repo |
+| [docs/testing.md](docs/testing.md) | The layers of tests, how to run them, what each can prove |
+
+## Testing
+
+```sh
+nix flake check         # every test that needs no VM
+nix run .#test-broker   # a real broker against a stand-in server, on the Mac
+nix develop             # a shell with the tools for working on the repo
+```
+
+Neither test needs the VM, the Linux builder or a token.
+[docs/testing.md](docs/testing.md) says what each covers, and what only the
+check inside the VM can prove.

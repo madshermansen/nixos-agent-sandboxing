@@ -1,0 +1,17 @@
+# Settings for shellcheck, for the scripts in this folder. shellcheck finds
+# this file by itself, so `shellcheck tests/*.sh` gives the same result by
+# hand, in an editor and in `nix flake check`.
+#
+# Each line turns off one of its notes for all scripts here. Keep the list
+# short: a note that is off here is off for every script added later.
+
+# "A && B || C is not if-then-else." The checks are written
+#     [ ... ] && pass "what" || fail "what"
+# on purpose. `pass` only prints a line, so it cannot fail and set off
+# `fail` as well.
+disable=SC2015
+
+# "Expressions don't expand in single quotes." Some checks hand a small
+# script to a second shell, as `bash -c '...'`. Its variables are meant for
+# that shell, not for this one.
+disable=SC2016

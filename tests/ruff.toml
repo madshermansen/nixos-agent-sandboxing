@@ -1,0 +1,22 @@
+# Settings for ruff, which looks for mistakes in the Python files. Used as:
+#
+#   ruff check --config tests/ruff.toml broker tests/unit
+#
+# Only checks that point at real mistakes are on: a name that is used but
+# never defined, an import that is never used, a line that cannot run. Style
+# is left alone, and nothing is reformatted. The list is written out so that
+# an update of ruff, which may turn on more checks by default, does not
+# change what passes.
+
+[lint]
+select = [
+  "E4", # imports in the wrong place
+  "E7", # statements that are easy to misread, such as `if x == None`
+  "E9", # the file cannot be read as Python at all
+  "F", # pyflakes: undefined names, unused imports and variables
+]
+
+[lint.per-file-ignores]
+# One text there is marked as having values filled in (an "f-string") and has
+# none. It is harmless. Remove this line once the mark is gone.
+"test_swap.py" = ["F541"]

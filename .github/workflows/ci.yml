@@ -1,0 +1,93 @@
+# Runs the tests that need no VM, on every pull request and on every push to
+# main. docs/testing.md says what they cover, and what only the check inside
+# the VM can prove.
+#
+# The job runs on a Mac with an Apple Silicon chip, like the machine nixt3 is
+# made for. It has no Linux builder, so it also proves that nothing in the
+# checks builds a part of the VM.
+#
+# It is safe for pull requests from forks: it runs on `pull_request`, never on
+# `pull_request_target`, so code from a fork gets a token that can only read
+# this repo, and no secrets. The workflow uses no secrets at all.
+#
+# That read-only token is within reach of the code under test, though: the
+# step that installs Nix writes it into Nix's settings, so that Nix is not
+# held back by GitHub's limit on requests without a login. On a public repo
+# it reads nothing that is not public already, and it ends with the job. If
+# the job is ever given a token that can do more, take it out of
+# /etc/nix/nix.conf before any step that runs the repo's code.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# All the job may do with the repo is read it.
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request replaces the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # Named so that GitHub adds `-o pipefail`: a step fails when any part of
+    # a pipeline in it fails.
+    shell: bash
+
+jobs:
+  checks:
+    name: Checks that need no VM
+    # macOS 15 on Apple Silicon (arm64).
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      # Each action is named by the exact commit it was at, not by a version
+      # tag, because a tag can later be moved to other code.
+      - name: Check out the repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not leave the job's token in the checkout's git settings.
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+
+      # Formatting, shellcheck, the Python checks, every unit test, the
+      # Mac-side commands, and whether the VM's configuration still makes
+      # sense. -L prints the output of each check.
+      - name: nix flake check
+        run: nix flake check -L
+
+      # The broker test reaches its stand-in server as "standin.localhost".
+      # A recent macOS reads every name that ends in ".localhost" as the
+      # machine itself. The one on this runner does not, and the broker then
+      # cannot find the stand-in. So if the name does not resolve here, it is
+      # added to the runner's own list of hosts. The runner is thrown away
+      # after the job, which is why `sudo` is fine here and nowhere else in
+      # this repo. The step can go once the test no longer uses such a name.
+      - name: Point the stand-in's name at this machine
+        run: |
+          sw_vers
+          resolves() { python3 -c 'import socket, sys; print(socket.getaddrinfo(sys.argv[1], 443)[0][4][0])' "$1" 2>/dev/null; }
+          if resolves standin.localhost; then
+            echo "standin.localhost resolves by itself"
+          else
+            echo "127.0.0.1 standin.localhost" | sudo tee -a /etc/hosts
+            # Make macOS read the list again.
+            sudo dscacheutil -flushcache
+            sudo killall -HUP mDNSResponder || true
+            resolves standin.localhost
+          fi
+
+      # The tests that are programs of their own, because they start real
+      # programs on this machine, which Nix's checks cannot do. One on each
+      # line; the step stops at the first that fails. Nothing in them leaves
+      # the runner. To add one, add a line.
+      - name: Tests that start real programs
+        run: |
+          nix run .#test-broker
+          tests/commands.sh
