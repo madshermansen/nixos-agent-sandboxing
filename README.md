@@ -22,12 +22,15 @@ changes a repo's settings, secrets or access.
 With the Linux builder on (see [setup](docs/setup.md)):
 
 ```sh
-nix run .#vm     # start the VM and its broker; the terminal becomes the console
-nix run .#stop   # shut both down cleanly, from another terminal
-nix run .#ssh    # open a shell in the VM as the `agent` user
-nix run .#pair   # add the VM to the T3 app as an environment
-nix run .#logs   # watch which destinations the VM asks for
-nix run .#check  # test the network lock from inside the VM
+nix run .#vm         # start the VM and its broker; the terminal becomes the console
+nix run .#stop       # shut both down cleanly, from another terminal
+nix run .#status     # one screen that says whether everything is up
+nix run .#ssh        # open a shell in the VM as the `agent` user
+nix run .#pair       # add the VM to the T3 app as an environment
+nix run .#logs       # watch which destinations the VM asks for
+nix run .#check      # test the network lock from inside the VM
+nix run .#vm-fresh   # a throwaway run: what the VM writes is discarded when it stops
+nix run .#update-t3  # bring the T3 server in the VM to the version of the T3 app
 ```
 
 Claude also needs a one-time sign-in inside the VM. The steps are in

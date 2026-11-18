@@ -49,6 +49,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `tests/network-lock.sh` | Checks run inside the VM by `nix run .#check` |
 | `tests/github-broker.sh` | The token swap and the policy, checked on the Mac through a real broker against a stand-in for GitHub |
 | `tests/github-live.sh` | The round trip with a real token, run inside the VM |
+| `tests/commands.sh` | The Mac-side commands, checked on the Mac with stand-ins for QEMU and ssh; no VM needed |
 | `tests/unit/` | pytest files for the broker's decisions; no network needed |
 | `docs/` | Setup, architecture, the threat model (`threat-model.md`), the decision log (`decisions.md`), advice for threads on the Mac (`local-threads.md`), diagrams |
 
@@ -56,15 +57,19 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 
 ```sh
 nix run .#vm                 # build if needed, start the broker, then the VM in this terminal
+nix run .#vm-fresh           # the same, as a throwaway run: what the VM writes is discarded at stop
 nix run .#stop               # shut the VM down cleanly and stop the broker
+nix run .#status             # one screen: what is up, versions, sign-in, who holds the VM; changes nothing
 nix run .#check              # run tests/network-lock.sh inside the VM
 nix run .#logs               # follow the broker's log
 nix run .#broker             # run the broker in this terminal, replacing the background one
 nix run .#ssh                # shell in the VM as `agent`
 nix run .#ssh -- <command>   # one command in the VM
 nix run .#pair               # add the VM to the T3 app on the Mac
+nix run .#update-t3          # write the T3 app's version and its checksum into vm/t3.nix
 nix build .#vm --no-link     # build only
 tests/github-broker.sh       # check the token swap and the policy on the Mac, without the VM or a token
+tests/commands.sh            # check the Mac-side commands, without the VM
 nix fmt                      # format the Nix files; run before committing
 ```
 
@@ -118,7 +123,10 @@ The reply should name Linux and the host `agent-vm`.
   `broker-foreground.pid` (written by `nix run .#broker`), `broker.log`,
   `broker/` (mitmproxy's files, among them the certificate authority and its
   private key), `console.log` (only when the VM is started detached, as
-  below), and the folder `in-use` while an agent holds the VM.
+  below), the folder `in-use` while an agent holds the VM, `vm.lock` (held
+  by QEMU while a VM runs; the file itself stays), `throwaway.qcow2` during
+  a throwaway run, and `broker.log.1` to `.3` and `console.log.1` to `.3`,
+  older parts of the logs.
 - **The broker runs with the user's rights on the Mac** and is the one Mac
   program the VM can talk to. Treat everything it receives as hostile.
 
@@ -295,9 +303,57 @@ The reply should name Linux and the host `agent-vm`.
   Stop the VM from the Mac with `nix run .#stop`.
 - **`nix run .#vm` holds its terminal.** To start the VM from a tool call,
   detach it and send the console to a file:
-  `nohup nix run .#vm > ~/.local/state/agent-vm/console.log 2>&1 < /dev/null &`.
+  `nohup nix run .#vm >> ~/.local/state/agent-vm/console.log 2>&1 < /dev/null &`.
+  Use `>>`, not `>`: the start command moves a large console.log aside
+  itself, and `>` would empty the file before it can.
   Then wait for SSH with `until nix run .#ssh -- true; do sleep 2; done`,
   which takes about a minute.
+- **`nix run .#status` exits 0 only when everything is up.** 1 means a line
+  says `FAIL`, 2 means the VM is not running or is still starting. `warn`
+  lines do not count.
+- **`nix run .#stop` waits for a VM that is still starting,** up to 90
+  seconds, and then shuts it down. If the start takes longer, stop fails
+  and leaves the broker alone. So after a stop that succeeded, nothing
+  runs.
+- **A `qemu.pid` proves nothing by itself.** After a crash its number can
+  belong to another program. Ask `vm_pid` in `darwin/commands.nix`, which
+  checks that the process is the QEMU of this state folder; never
+  `kill -0 $(cat qemu.pid)`. Whether a VM is starting is told by the lock
+  (`vm_lock_held`), not by a file.
+- **Pick lines out of `broker.log` by their fields, never by a word.** The
+  VM chooses the host and the path that are logged, so a host named
+  `started` gives a line with that word in it. The first field is the time
+  and the second the event; compare those, as `log_lines` in `status` does.
+- **A throwaway run (`nix run .#vm-fresh`) keeps nothing.** It starts from
+  the normal disk, so it is signed in and paired, and its changes are in
+  `throwaway.qcow2`, deleted at stop. It takes the same lock as the normal
+  VM, so the two never run together. A throwaway disk left by a crash is
+  never reused; the next start or stop deletes it.
+- **Logs are moved aside only at a start,** when over 5 MiB: `broker.log`
+  just before a new background broker opens it, `console.log` by the start
+  command. Do not move or cut a log while the broker runs; it keeps writing
+  to the file it opened.
+- **The start command drops `QEMU_OPTS`** and `NIXPKGS_QEMU_KERNEL_*` from
+  the environment and says so. Options after `nix run .#vm --` still reach
+  QEMU, with a note. Keep it that way: either can undo the lock.
+- **Every ssh call goes through `agent-vm-ssh`,** which starts ssh with
+  `-F none` so that the user's `~/.ssh/config` cannot add a forward, and
+  refuses to start without the VM's own key, because ssh would then offer
+  the user's keys to the VM. Do not call `ssh` directly in a new command.
+- **Change `darwin/commands.nix`, then run `tests/commands.sh`.** It builds
+  the real commands with stand-ins for QEMU and ssh on ports of its own.
+  To make something replaceable in it, add an argument to `commands.nix`
+  with the real thing as its default, as `stopWaitSeconds` is.
+- **Avoid `LC_ALL=C command` inside a shell function.** Seen on one Mac on
+  2026-11-17, cause not found: the bash that runs these commands (5.3.20
+  from nixpkgs) ended with a segmentation fault in about one run in six of
+  a script as small as `plain() { LC_ALL=C tr -c 'a-z' '?'; }; echo x | plain`,
+  but only when `LANG` was not set in the environment; with `LANG` set
+  there was no fault in 300 runs, and a reviewer saw none in 300. Tool
+  calls and background services often run without `LANG`. `status` sets
+  `LC_ALL` once at the top instead, which never faulted.
+- **`compgen` does not exist in that bash.** Use `"${!PREFIX@}"` for the
+  names of variables that start with a prefix.
 - **Two QEMU processes may be running.** The Linux builder is one too. Never
   stop the VM with a broad `pkill qemu`; use `nix run .#stop`.
 - **A full VM build takes about 20 minutes.** The default Linux builder does
@@ -324,7 +380,8 @@ The reply should name Linux and the host `agent-vm`.
   succeeds for one agent only. If it fails, someone else has the VM; wait and
   try again. Put a file in the folder saying who you are, and remove the
   folder when you are done. Reading from the VM through `nix run .#ssh` needs
-  no turn, but expect it to restart under you.
+  no turn, but expect it to restart under you. `nix run .#status` shows who
+  holds the VM.
 - **Each agent works in its own checkout** on its own branch, and opens its
   own pull request. Keep to the files your task names, so pull requests do
   not collide.
@@ -374,6 +431,10 @@ Update this section when a phase is finished or a decision is made.
   thread in the VM read a GitHub repo through the broker. Not done yet: the
   final check with a real token, `tests/github-live.sh` (push a branch, open
   a pull request). It waits for the user's token in 1Password.
+- **Everyday commands:** `status`, `vm-fresh`, `update-t3` and the upkeep
+  of the logs are in. Checked on the running system: a throwaway run booted
+  signed in and paired, ran a T3 thread, and left the normal disk unchanged
+  byte for byte; a crashed one was tidied up by the next start.
 - **Phase 5, limits on GitHub:** built, and checked with a made-up token.
   The broker asks `github_policy.py` about every request to GitHub. The
   rules list one repo, `madshermansen/nixt3`, for writing; merging and

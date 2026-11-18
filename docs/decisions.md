@@ -127,6 +127,8 @@ and "fails closed" are explained in the word list at the top of
 - **Not covered:** `QEMU_OPTS` and the arguments of `nix run .#vm` still
   reach QEMU. Whether they should is not decided. See
   [threat-model.md](threat-model.md).
+- **Note:** decided since. See "The start command ignores QEMU options left
+  in the shell" below.
 - **Where:** `qemu.networkingOptions` in `vm/default.nix`.
 
 ### The way out is a proxy that decides per request
@@ -600,6 +602,97 @@ and "fails closed" are explained in the word list at the top of
   `~/.local/state/agent-vm`, readable by you only.
 - **Why:** reason not recorded.
 - **Where:** the comment at the top of `darwin/commands.nix`.
+
+### The start command ignores QEMU options left in the shell
+
+- **Chosen:** `nix run .#vm` drops the variables `QEMU_OPTS` and
+  `NIXPKGS_QEMU_KERNEL_*` before it starts QEMU, and prints a line for each
+  one that was set. Options typed after `nix run .#vm --` are passed on,
+  with a line that names them. `QEMU_KERNEL_PARAMS` needs nothing: the start
+  command sets it itself, which replaces a value from the shell.
+- **Not chosen:** refusing to start when a variable is set; refusing typed
+  options too.
+- **Why:** a variable in a shell can be an accident from hours ago, and it
+  could give the locked VM a shared folder or a second network card. Typed
+  options are a choice made at that moment and are useful for trying things
+  out, so they stay, but are shown. Dropping with a note keeps a harmless
+  leftover from stopping the day's work.
+- **Where:** `vm` in [`darwin/commands.nix`](../darwin/commands.nix).
+
+### SSH to the VM ignores your own SSH configuration
+
+- **Chosen:** every ssh call goes through one command that passes
+  `-F none`, and turns agent, X11 and local-command forwarding off by name.
+- **Not chosen:** leaving `~/.ssh/config` in force.
+- **Why:** a line under `Host *` there, such as `RemoteForward`,
+  `ForwardAgent` or `SendEnv`, would open a way between the VM and the Mac
+  that nobody chose for the VM. An option typed after `nix run .#ssh --`
+  still works.
+- **Where:** `ssh` in [`darwin/commands.nix`](../darwin/commands.nix).
+
+### A throwaway run is a command of its own, on a layer over the disk
+
+- **Chosen:** `nix run .#vm-fresh` starts the VM on an empty qcow2 layer
+  whose backing file is the normal disk, and deletes the layer when the VM
+  stops. The run starts with the Claude sign-in and the T3 pairing, and
+  nothing it writes is kept.
+- **Not chosen:** a variable such as `AGENT_VM_FRESH=1` read by
+  `nix run .#vm`; deleting the state folder; QEMU's `-snapshot` option.
+- **Why:** a variable can stay behind in a shell, and a later normal start
+  would then discard a day's work without saying so; a command has to be
+  typed each time. Deleting the state folder also loses the sign-in and the
+  pairing. `-snapshot` keeps its layer in a temporary file without a name,
+  so nothing could show how large a run has grown.
+- **Where:** `vm` and `vm-fresh` in
+  [`darwin/commands.nix`](../darwin/commands.nix).
+
+### One VM per state folder, kept by a lock that QEMU holds
+
+- **Chosen:** the start command takes a lock on `vm.lock` in the state
+  folder (`flock`) and QEMU inherits it. The normal VM and a throwaway run
+  take the same lock.
+- **Not chosen:** relying on `qemu.pid` alone; a lock folder with a process
+  id in it.
+- **Why:** a throwaway run reads the normal disk the whole time, so the two
+  must never run together, and two starts at the same moment both pass a
+  check of `qemu.pid`. A lock the system keeps is given to one program only
+  and is given back when that program ends, however it ends, so there is
+  nothing stale to tidy up after a crash.
+- **Where:** `vm` and `stop` in
+  [`darwin/commands.nix`](../darwin/commands.nix).
+
+### Stop waits for a VM that is still starting
+
+- **Chosen:** when the lock is held and QEMU is not there yet,
+  `nix run .#stop` waits up to 90 seconds for it and then shuts it down. If
+  the start takes longer, stop fails, and stops nothing, not the broker
+  either.
+- **Not chosen:** saying "a VM is starting" and failing at once; treating it
+  as "not running", which is what the first version did, and which also
+  ended the broker that the start had just launched.
+- **Why:** "stop" should mean that nothing runs afterwards, also when it is
+  typed, or run by an agent, right after a start. A start normally has QEMU
+  up in under a minute. Failing without touching anything is kept for the
+  start that hangs, for example one that waits for a password manager.
+- **Where:** `stop` in [`darwin/commands.nix`](../darwin/commands.nix);
+  checked in [`tests/commands.sh`](../tests/commands.sh).
+
+### Logs are moved aside at a start, not while the broker runs
+
+- **Chosen:** `broker.log` and `console.log` are moved aside when larger
+  than 5 MiB, at the moment the start command is about to open them, and
+  three older parts are kept.
+- **Not chosen:** trimming a log while the broker runs; a helper program
+  between the broker and its log.
+- **Why:** the broker holds its log open and keeps writing to the same file
+  after it is renamed, and cutting the file short while it is written loses
+  lines. Between stopping the old broker and starting the new one, nobody
+  has the file open. A helper in between would be one more program that
+  handles what the VM causes to be written.
+- **Note:** a single long run can still pass the limit. See "Wearing out
+  the Mac" in [threat-model.md](threat-model.md).
+- **Where:** `rotate_log` in
+  [`darwin/commands.nix`](../darwin/commands.nix).
 
 ### The VM is stopped through QEMU's control socket
 

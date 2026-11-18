@@ -257,7 +257,9 @@ The broker writes one line per decision to `broker.log` in the state folder:
 2026-11-16T17:01:12+01:00 allowed github.com 443 connect
 ```
 
-`nix run .#logs` follows it. For a destination that is passed on unread,
+`nix run .#logs` follows it, and `nix run .#status` shows the last refusals.
+A log larger than 5 MiB is moved aside when the broker is next started, and
+three older parts are kept. For a destination that is passed on unread,
 nothing from inside a request can be logged. For GitHub, which the broker
 opens, each request gets a line with its method, its path without the query
 string, and the status of the answer:
@@ -309,6 +311,16 @@ The system (programs, services, settings) comes from the repo on every start,
 so a change to `vm/default.nix` takes effect after a restart. The disk is kept
 between starts. It is the VM's whole root filesystem, and with it
 `/home/agent`: cloned repos, the Claude sign-in and T3's data.
+
+`nix run .#vm-fresh` is a throwaway run. It puts an empty layer on top of the
+disk (`throwaway.qcow2` in the state folder). The VM reads through the layer
+to the disk and writes only to the layer, which is deleted when the VM
+stops. So the run starts signed in and paired, and leaves the disk as it
+was.
+
+Only one VM can run on a state folder at a time, whichever kind. The start
+command takes a lock on the file `vm.lock` there and hands it to QEMU, so
+the system gives it back whenever and however the VM ends.
 
 ## What this does not protect against
 
@@ -395,3 +407,4 @@ GitHub is the first service. Others can be added later as new rules.
 | [`tests/github-broker.sh`](../tests/github-broker.sh) | Checks of the token swap, run on the Mac against a stand-in for GitHub |
 | [`tests/github-live.sh`](../tests/github-live.sh) | The round trip with a real token: clone, push, pull request |
 | [`tests/unit/`](../tests/unit) | Tests of the broker's decisions that need no network |
+| [`tests/commands.sh`](../tests/commands.sh) | Checks of the commands on the Mac, with stand-ins for QEMU and ssh |
