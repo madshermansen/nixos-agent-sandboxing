@@ -64,6 +64,11 @@ script and the path of the rules file in AGENT_BROKER_RULES. The tokens are
 fetched before that, by fetch_tokens.py, and arrive here on an open pipe
 whose number is in AGENT_BROKER_TOKENS_FD. This file runs no other program
 and reads no token from a file or an environment variable.
+
+The start command runs all of this inside a sandbox of macOS, with the
+profile sandbox.sb: a bug here or in mitmproxy then reaches the broker's own
+folder and port 443, not the user's files. The broker asks macOS at start
+whether it is held that way, and does not run if it is not (confinement.py).
 """
 
 import atexit
@@ -86,6 +91,7 @@ from ruamel.yaml.error import YAMLError
 
 # These lie next to this file. mitmproxy puts this file's folder on the
 # search path before loading it.
+import confinement
 import github_policy
 import github_request
 import limits
@@ -1293,6 +1299,25 @@ def start() -> Broker:
             flush=True,
         )
         # Such a setting can change a request after the broker judged it.
+        sys.exit(1)
+
+    # The sandbox. The start command puts it on before this process starts;
+    # here macOS is asked whether it holds. This comes before the rules are
+    # read and the tokens are taken, so a broker that is not confined never
+    # holds a token.
+    problems = confinement.problems(os.getpid(), os.path.expanduser(ctx.options.confdir))
+    if problems:
+        print(
+            "broker: not starting, because it is not confined. The broker reads "
+            "what the VM sends, so it runs only inside the sandbox of "
+            "broker/sandbox.sb.",
+            *(f"broker: {problem}" for problem in problems),
+            "broker: start it with `nix run .#broker` or `nix run .#vm`, which "
+            "put the sandbox on.",
+            sep="\n",
+            file=sys.stderr,
+            flush=True,
+        )
         sys.exit(1)
 
     path = os.environ.get(RULES_ENV)

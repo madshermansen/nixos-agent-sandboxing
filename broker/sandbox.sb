@@ -114,21 +114,28 @@
 
 ;; --- The network ---------------------------------------------------------
 
-;; Listen where the VM's connections arrive: this Mac's own address, the
-;; broker's port. The profile language knows two names for an address,
-;; "localhost" and "*" (any), so "localhost" stands for 127.0.0.1 here.
+;; Listen on the broker's port, where the VM's connections arrive.
+;;
+;; The profile language knows two names for a machine: "*", any machine,
+;; and "localhost", this Mac by any of its addresses. It has no name for
+;; 127.0.0.1 alone. So this rule cannot hold the broker to the address that
+;; only programs on this Mac can reach; mitmproxy's `--listen-host
+;; 127.0.0.1` does that, and proxy.py refuses to run with another value. A
+;; broker that was taken over could listen on this one port on the Mac's
+;; network address as well. See docs/threat-model.md.
 (allow network-bind network-inbound
   (local ip (string-append "localhost:" (param "PORT"))))
 
 ;; Connect out to port 443, the port of HTTPS, on any machine. The profile
 ;; language cannot tell machines apart by name or by address, so which
 ;; hosts the broker connects to stays the job of proxy.py and rules.yaml.
-;; What this rule adds is that other ports are out of reach.
+;; What this rule adds is that every other port is out of reach.
 (allow network-outbound (remote ip "*:443"))
 
-;; But not to programs on this Mac. Many of them trust whatever comes from
-;; the Mac itself. A later rule wins over an earlier one, so this takes
-;; port 443 of the Mac's own address back out of the rule above.
+;; But not to this Mac itself, by any of its addresses. Programs on a Mac
+;; often trust whatever comes from the Mac. A later rule wins over an
+;; earlier one, so this takes the Mac's own port 443 back out of the rule
+;; above.
 (deny network-outbound (remote ip "localhost:*"))
 
 ;; Looking up a host's address. macOS does that in a service of its own,
