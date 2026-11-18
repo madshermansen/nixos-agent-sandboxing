@@ -27,7 +27,7 @@
 
 set -u
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 repo=$PWD
 
 # Ports for this test. They are part of what the commands are built from, so
@@ -313,7 +313,7 @@ wait_for() {
   done
 }
 gone() { ! kill -0 "$1" 2>/dev/null; }
-nothing_runs() { [ -z "$(pgrep -f "$state" 2>/dev/null | grep -vx "$$")" ]; }
+nothing_runs() { ! pgrep -f "$state" 2>/dev/null | grep -vx "$$" >/dev/null; }
 disk_sum() { shasum -a 256 "$state/disk.qcow2" | cut -d' ' -f1; }
 status_of() {
   local got=0

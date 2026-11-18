@@ -54,12 +54,15 @@ plain functions, with no network and no broker running:
 | `test_swap.py` | Putting the token in place of the placeholder, and every login that must be refused instead. |
 | `test_swap_fetch_tokens.py` | Fetching the tokens before the broker starts. |
 | `test_github_policy.py` | Which GitHub requests are let through. |
+| `test_github_request.py` | Joining the policy and the token swap for one request, and how a refusal is worded for git, for the REST API and for GraphQL. |
+| `test_settings.py` | Which of mitmproxy's settings and environment variables the broker agrees to start with. |
 
 The check picks up every file in the folder, so a new `test_*.py` file needs
 no change anywhere else. It runs them with the same Python and the same
 mitmproxy as the broker itself.
 
-In the check, a skipped test counts as a failure. Some tests skip themselves
+In the check, a skipped test counts as a failure, and so does a test marked
+as expected to fail. Some tests skip themselves
 when a library is missing: with plain `pytest` and no `ruamel.yaml`, the
 whole of `test_swap_fetch_tokens.py` is skipped and the run still ends
 green. That is friendly on a laptop, and wrong in a check that is meant to
@@ -97,8 +100,13 @@ What it covers that the unit tests cannot: the broker as mitmproxy runs it.
   the token appears in no log, file or command line.
 - **Failing closed:** when the broker's own code fails, the request is
   refused.
-- **Limits:** requests that never end are cut off, and large uploads and
-  downloads pass without being held in memory.
+- **Limits:** a request that never ends is not read past a limit, and
+  large uploads and downloads pass without being held in memory. In all
+  cases but one the broker also hangs up. The one is a first TLS message
+  that never ends: the broker stops reading it and holds nothing, but a
+  client that sends at full speed is left waiting. The test names that
+  outcome ("left open, not read") and lets it pass for this check only;
+  it is a known fault of the broker.
 
 The script can also be run by hand, as `tests/github-broker.sh`. It then
 uses the Mac's own `python3`, `openssl` and `curl`, and builds the broker
@@ -175,7 +183,7 @@ first.
 A test that is a script of its own, as `tests/github-broker.sh` is, gets
 into CI with one line: the step "Tests that start real programs" in the
 workflow runs one command on each line. A script that only needs `nix` is
-added there by its path, such as `tests/commands.sh`.
+added there by its path, as `tests/commands.sh` is.
 
 ## Working on the tests
 

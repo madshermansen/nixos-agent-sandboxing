@@ -140,7 +140,7 @@ in
       cd ${self}
       export HOME=$TMPDIR
       export PYTHONDONTWRITEBYTECODE=1
-      NIXT3_NO_SKIPS=1 pytest -p no:cacheprovider tests/unit
+      NIXT3_NO_SKIPS=1 pytest -p no:cacheprovider -rsxX tests/unit
       touch $out
     '';
 

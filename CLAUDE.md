@@ -381,7 +381,8 @@ The reply should name Linux and the host `agent-vm`.
 - **New tests are picked up by themselves,** once `git add`ed: every
   `tests/unit/test_*.py` is run, and every `tests/*.sh` goes through
   shellcheck.
-- **A skipped unit test fails the check.** `NIXT3_NO_SKIPS=1` is set there,
+- **A skipped unit test fails the check,** and so does one marked as
+  expected to fail. `NIXT3_NO_SKIPS=1` is set there,
   so that a missing library cannot quietly shrink the set. Plain `pytest`
   without `ruamel.yaml` skips a whole file and still ends green.
 - **`proxy.py` cannot be imported in a test:** its last line starts the

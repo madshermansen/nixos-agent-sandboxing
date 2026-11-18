@@ -75,17 +75,25 @@ def proxy():
 
 
 def pytest_sessionfinish(session, exitstatus):
-    """With NIXT3_NO_SKIPS set, a run that skipped anything fails."""
+    """With NIXT3_NO_SKIPS set, a run that skipped anything fails.
+
+    A test marked as expected to fail counts as skipped as well, whether it
+    failed or passed: either way it did not check anything.
+    """
     if not os.environ.get(NO_SKIPS) or exitstatus != 0:
         return
     reporter = session.config.pluginmanager.get_plugin("terminalreporter")
-    skipped = reporter.stats.get("skipped", []) if reporter else []
+    stats = reporter.stats if reporter else {}
+    skipped = [
+        report for kind in ("skipped", "xfailed", "xpassed") for report in stats.get(kind, [])
+    ]
     if not skipped:
         return
     reporter.write_line("")
     reporter.write_line(
-        f"{len(skipped)} test(s) or file(s) were skipped, and {NO_SKIPS} is set, "
-        "so this run fails. Run pytest with -rs to see which and why.",
+        f"{len(skipped)} test(s) or file(s) were skipped or marked as expected to "
+        f"fail, and {NO_SKIPS} is set, so this run fails. With `pytest -rsxX` the "
+        "summary names each one and says why.",
         red=True,
     )
     session.exitstatus = pytest.ExitCode.TESTS_FAILED

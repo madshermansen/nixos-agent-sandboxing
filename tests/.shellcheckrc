@@ -15,7 +15,3 @@ disable=SC2015
 # script to a second shell, as `bash -c '...'`. Its variables are meant for
 # that shell, not for this one.
 disable=SC2016
-
-# "Use cd ... || exit." tests/github-broker.sh starts with a `cd` to the repo
-# that has no such guard. Remove this line once it has one.
-disable=SC2164

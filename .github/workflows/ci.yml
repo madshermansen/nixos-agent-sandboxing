@@ -9,6 +9,13 @@
 # It is safe for pull requests from forks: it runs on `pull_request`, never on
 # `pull_request_target`, so code from a fork gets a token that can only read
 # this repo, and no secrets. The workflow uses no secrets at all.
+#
+# That read-only token is within reach of the code under test, though: the
+# step that installs Nix writes it into Nix's settings, so that Nix is not
+# held back by GitHub's limit on requests without a login. On a public repo
+# it reads nothing that is not public already, and it ends with the job. If
+# the job is ever given a token that can do more, take it out of
+# /etc/nix/nix.conf before any step that runs the repo's code.
 name: CI
 
 on:
@@ -83,3 +90,4 @@ jobs:
       - name: Tests that start real programs
         run: |
           nix run .#test-broker
+          tests/commands.sh
