@@ -213,6 +213,13 @@ When you end it, the VM has no way out until the next start.
 Every host on the list is a place the agent can send data to, so add only
 what a task needs.
 
+The agent is told to ask for a destination itself, with a pull request in
+this repo that adds the entry and says why; see
+[`vm/agent-instructions.md`](../vm/agent-instructions.md). It does the same
+for a repo or a tool it lacks. Nothing changes until you merge the pull
+request and restart, so read its diff first: the agent's reason is a claim,
+not a proof.
+
 ## Letting the agent use a repo
 
 The agent can use only the repos listed in the `github` part of

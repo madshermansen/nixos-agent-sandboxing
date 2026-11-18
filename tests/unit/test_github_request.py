@@ -145,6 +145,16 @@ def test_the_agent_and_the_checks_are_told_about_the_listed_repos():
     assert f"repo=${{1:-{listed[0]}}}" in (REPO / "tests/github-live.sh").read_text()
 
 
+def test_the_files_the_agent_is_told_to_change_exist():
+    """To ask for more access, the agent in the VM is told which file of
+    this repo to change. A file that was moved would send it looking."""
+    told = (REPO / "vm/agent-instructions.md").read_text()
+    for path in ("broker/rules.yaml", "vm/default.nix", "vm/agent-instructions.md", "CLAUDE.md"):
+        assert f"`{path}`" in told, path
+        assert (REPO / path).is_file(), path
+    assert "environment.systemPackages" in (REPO / "vm/default.nix").read_text()
+
+
 # --- How a refusal is worded for the program that gets it ----------------------
 
 REFUSAL = "Refused by the sandbox broker: no.\n\nUse:\n\n    gh api -X PATCH repos/a/b/pulls/1 -f state=closed\n"

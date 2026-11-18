@@ -490,6 +490,14 @@ change is merged and the broker restarted, the lock is as wide as the change
 made it. Read every change to `broker/`, `darwin/` and `vm/` before merging,
 whoever wrote it. Protect `main` on GitHub.
 
+Such pull requests are now the normal way for the agent to ask for more: it
+is told to open one when a task needs a destination, a repo or a tool, and
+to say why (`vm/agent-instructions.md`). So expect them, and do not take the
+reason given as proof. A hostile program in the VM can open the same pull
+request with a good-sounding reason, or add a second change next to the one
+that is explained. Read the diff, not only the description, and ask whether
+the task you gave needs it.
+
 ### A refusal the agent cannot read
 
 Some refusals carry no explanation: a request with a large body, or an

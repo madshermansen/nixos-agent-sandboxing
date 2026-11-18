@@ -733,6 +733,41 @@ and "fails closed" are explained in the word list at the top of
 - **Note:** this is a help for an honest agent. It is not a protection.
 - **Where:** [`vm/agent-instructions.md`](../vm/agent-instructions.md).
 
+### The same file is the agent's standing memory of the setup
+
+- **Chosen:** the file also says how the machine is set up: which repo it is
+  built from, that the system is built again at every start, and that the
+  home folder is kept except in a throwaway run.
+- **Not chosen:** a readme in the agent's home folder, or Claude Code's own
+  memory folder.
+- **Why:** Claude Code reads `/etc/claude-code/CLAUDE.md` in every session,
+  whatever folder it is started in. The file comes from the repo at every
+  start, so it cannot go out of date against the system, and a program in
+  the VM cannot change it: only `root` may write there, and the next start
+  replaces it. A file in the home folder can be rewritten by anything that
+  runs as `agent`, and the next session would then read it as instructions.
+- **Where:** [`vm/agent-instructions.md`](../vm/agent-instructions.md);
+  `environment.etc` in `vm/default.nix`.
+
+### The agent asks for more access with a pull request
+
+- **Chosen:** when a task needs a destination, a repo or a tool that the VM
+  lacks, the agent is told to open a pull request in this repo with the
+  change (`broker/rules.yaml` or `vm/default.nix`), to say in it what was
+  refused and what the change lets the VM do, and then to tell the user.
+- **Not chosen:** only telling the user what is missing, as the file said
+  before. A way to ask the broker for access while it runs.
+- **Why:** the request becomes a change that can be read line by line, with
+  its reason next to it, and that stays in the history. The user decides by
+  merging, on the Mac, where the agent has no say. Nothing new can be
+  reached until the merge and a restart.
+- **Cost:** the agent now writes changes to its own limits, which makes
+  reading them the one thing that keeps the lock; see "The rules are only
+  as good as their review" in [threat-model.md](threat-model.md). It works
+  only while the agent may push to this repo.
+- **Where:** "When you need more than this machine allows" in
+  [`vm/agent-instructions.md`](../vm/agent-instructions.md).
+
 ### The VM is added to the T3 app with `nix run .#pair`
 
 - **Chosen:** `nix run .#pair` asks the VM's T3 server for a one-time code

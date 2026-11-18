@@ -34,7 +34,7 @@ for how the parts fit. The current phase is recorded at the bottom of this file.
 | `flake.nix` | Entry point: the VM, `nix run` commands, the Mac module |
 | `vm/default.nix` | The VM's NixOS configuration, including the network lock |
 | `vm/t3.nix` | The T3 server package, pinned by version and checksum |
-| `vm/agent-instructions.md` | What the agent in the VM is told about the sandbox; installed as `/etc/claude-code/CLAUDE.md` |
+| `vm/agent-instructions.md` | What the agent in the VM is told in every session: how the machine is set up, its limits, and how to ask for more; installed as `/etc/claude-code/CLAUDE.md` |
 | `broker/rules.yaml` | The destinations the VM may reach |
 | `broker/proxy.py` | The broker: a mitmproxy script that applies the rules |
 | `broker/swap.py` | The decisions about one opened request, among them the token swap; no mitmproxy in it |
@@ -371,6 +371,12 @@ The reply should name Linux and the host `agent-vm`.
   the diff and the goal, not your own conclusions.
 - **Merge only when** the review's findings are fixed and the phase's check
   has been run in the VM. Put the check's result in the pull request.
+- **The agent in the VM asks for more access with a pull request here.**
+  `vm/agent-instructions.md` tells it to: a destination or a repo in
+  `broker/rules.yaml`, a tool in `vm/default.nix`. Such a pull request
+  widens the lock, so the user reads its diff and merges it; an agent never
+  does. Keep that file in step when a path it names moves; a unit test
+  checks that the paths exist.
 
 ## When several agents work at once
 
