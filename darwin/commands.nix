@@ -924,9 +924,10 @@ lib.fix (self: {
     '';
   };
 
-  # Answers "is it working?" on one screen: the VM, the broker, SSH, the T3
-  # server and its version, the Claude sign-in, the tokens, who holds the VM,
-  # what the broker refused last, and how large the files have grown.
+  # Answers "is it working?" on one screen: the VM, the broker and whether
+  # it is confined, SSH, the T3 server and its version, the Claude sign-in,
+  # the tokens, who holds the VM, what the broker refused last, and how
+  # large the files have grown.
   #
   # It changes nothing: it creates no file, takes no lock and runs no token
   # command. Every question it asks has a time limit, so it answers within
@@ -1030,6 +1031,27 @@ lib.fix (self: {
         ' "$state/broker.log" 2>/dev/null || true
       }
 
+      # Says whether macOS holds the broker with process id $1 in its
+      # sandbox. The start command asks for the sandbox; this asks macOS
+      # what the running process may in fact do, with the same questions
+      # the broker asks about itself at start (broker/confinement.py). It
+      # is only a question to the system: nothing is tried, and the broker
+      # is not disturbed.
+      #
+      # A broker that is not confined is a `warn` and not a `FAIL`: it does
+      # its work. It can only be one from a checkout older than the
+      # sandbox, since a broker of this checkout refuses to run that way.
+      confinement() {
+        local found
+        if found=$(timeout 10 ${tokenPython}/bin/python3 -B ${brokerFiles}/confinement.py "$1" "$state/broker" "$HOME" 2>/dev/null </dev/null); then
+          more "confined: macOS holds it in the sandbox of broker/sandbox.sb"
+        else
+          found=$(head -n 1 <<<"$found" | plain | cut -c1-200)
+          warn "" "not confined as this checkout's broker is: ''${found:-macOS could not be asked}"
+          more "a bug in it could reach your files. A restart of the broker confines it"
+        fi
+      }
+
       # Prints the size of the file $1, such as 204MB.
       size_of() { numfmt --to=iec --suffix=B "$(stat -L -c %s "$1" 2>/dev/null || echo 0)"; }
 
@@ -1078,6 +1100,7 @@ lib.fix (self: {
         if broker_port_open; then
           broker_up=yes
           ok Broker "running for $(running_for "$pid") as process $pid in the background, on $address"
+          confinement "$pid"
           started=$(log_lines started | tail -n 1 | plain | cut -c1-200) || true
           if [ -n "$started" ]; then
             more "$started"
@@ -1101,6 +1124,7 @@ lib.fix (self: {
         if broker_port_open; then
           broker_up=yes
           ok Broker "running for $(running_for "$pid") as process $pid in a terminal (\`nix run .#broker\`), on $address"
+          confinement "$pid"
           more "its log is in that terminal, so broker.log below is from an earlier broker"
         elif [ -n "$vm_up" ]; then
           fail Broker "process $pid in a terminal does not answer on $address; the VM has no way out"
