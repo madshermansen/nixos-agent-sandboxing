@@ -272,8 +272,9 @@ in
   # sandbox, how the machine is set up, what a refusal from the broker means
   # and how to ask for more: with a pull request in this repo. Without it an
   # agent tends to retry or look for a way around. It is in /etc, which the
-  # agent cannot write to, so a program in the VM cannot change what the
-  # next session is told.
+  # agent cannot write to, so a program in the VM cannot change this file.
+  # It can still change the other files Claude Code reads, in the home
+  # folder and in a project.
   environment.etc."claude-code/CLAUDE.md".source = ./agent-instructions.md;
 
   # T3 and the tools it downloads are prebuilt Linux programs, which NixOS

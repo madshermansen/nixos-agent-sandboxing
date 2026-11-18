@@ -375,8 +375,9 @@ The reply should name Linux and the host `agent-vm`.
   `vm/agent-instructions.md` tells it to: a destination or a repo in
   `broker/rules.yaml`, a tool in `vm/default.nix`. Such a pull request
   widens the lock, so the user reads its diff and merges it; an agent never
-  does. Keep that file in step when a path it names moves; a unit test
-  checks that the paths exist.
+  does. The file also lists what must never be asked for; it is the copy
+  the agent cannot change, so add to it there. Keep that file in step when
+  a path it names moves; a unit test checks that the paths exist.
 
 ## When several agents work at once
 
@@ -457,5 +458,9 @@ Update this section when a phase is finished or a decision is made.
   every program on the Mac can read.
 - **Decided:** a request to GitHub with a login other than the placeholder
   is refused, not passed on without it.
+- **Decided:** the agent's standing memory is `vm/agent-instructions.md`,
+  installed where the agent cannot change it, and more access is asked for
+  with a pull request in this repo. Built; not yet tried in the VM, which
+  takes a merge, a restart and a thread that is refused a host.
 - **Open decision:** where Claude's own login lives. For now it is signed in
   inside the VM.

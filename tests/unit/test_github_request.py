@@ -152,6 +152,7 @@ def test_the_files_the_agent_is_told_to_change_exist():
     for path in ("broker/rules.yaml", "vm/default.nix", "vm/agent-instructions.md", "CLAUDE.md"):
         assert f"`{path}`" in told, path
         assert (REPO / path).is_file(), path
+    assert "environment.systemPackages" in told
     assert "environment.systemPackages" in (REPO / "vm/default.nix").read_text()
 
 

@@ -746,6 +746,11 @@ and "fails closed" are explained in the word list at the top of
   the VM cannot change it: only `root` may write there, and the next start
   replaces it. A file in the home folder can be rewritten by anything that
   runs as `agent`, and the next session would then read it as instructions.
+- **Cost:** this protects the one file only. Claude Code also reads
+  `~/.claude/CLAUDE.md`, its settings and its memory folder in the home
+  folder, and the `CLAUDE.md` of a project. A program in the VM can write
+  to all of those; see "The attacker can stay" in
+  [threat-model.md](threat-model.md).
 - **Where:** [`vm/agent-instructions.md`](../vm/agent-instructions.md);
   `environment.etc` in `vm/default.nix`.
 
@@ -755,6 +760,8 @@ and "fails closed" are explained in the word list at the top of
   lacks, the agent is told to open a pull request in this repo with the
   change (`broker/rules.yaml` or `vm/default.nix`), to say in it what was
   refused and what the change lets the VM do, and then to tell the user.
+  The file itself lists what is never to be asked for, such as the right
+  to merge, so that the list cannot be changed from inside the VM.
 - **Not chosen:** only telling the user what is missing, as the file said
   before. A way to ask the broker for access while it runs.
 - **Why:** the request becomes a change that can be read line by line, with
@@ -764,7 +771,11 @@ and "fails closed" are explained in the word list at the top of
 - **Cost:** the agent now writes changes to its own limits, which makes
   reading them the one thing that keeps the lock; see "The rules are only
   as good as their review" in [threat-model.md](threat-model.md). It works
-  only while the agent may push to this repo.
+  only while the agent may push to this repo. A pull request in a public
+  repo is public, so the agent is told to keep what is private out of it
+  and, where the name of the host or repo is itself private, to tell the
+  user instead. The broker's refusals still end with "tell the user"; the
+  file says that the pull request is how.
 - **Where:** "When you need more than this machine allows" in
   [`vm/agent-instructions.md`](../vm/agent-instructions.md).
 
