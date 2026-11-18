@@ -1478,7 +1478,10 @@ second "${login[@]}" "${json[@]}" --data-binary "@$work/graphql/read-unlisted.js
   fail "GraphQL, which needs the token, still refuses an unlisted repo"
 
 if grep -q "$standin_token" "$work/second.log"; then fail "the token is not in the second broker's log"; else pass "the token is not in the second broker's log"; fi
+# The third broker below takes over the port. Wait until this one is gone,
+# or the wait for that port is answered by a broker that is on its way out.
 kill "$second_pid" 2>/dev/null
+wait "$second_pid" 2>/dev/null
 second_pid=""
 
 echo "A setting that changes while the broker runs:"
@@ -1520,6 +1523,13 @@ if ! wait_for_port "$third_port"; then
   exit 1
 fi
 broker_pid=$main_pid
+# curl needs the third broker's certificate, which that broker writes when
+# it starts. A newer curl ends at once, with "option --cacert: is badly
+# used here", when the file is not there.
+for _ in $(seq 100); do
+  [ -s "$work/state3/broker/mitmproxy-ca-cert.pem" ] && break
+  sleep 0.1
+done
 [ "$(third "${login[@]}" "$api/repos/$listed" | field authorization)" = "$with_token" ] &&
   pass "before the change, a request goes through as usual" || fail "before the change, a request goes through as usual"
 
